@@ -460,6 +460,10 @@ func (r *Reader) Iterator() *SegmentIterator {
 
 // RegexIterator returns an iterator for regex matching.
 func (r *Reader) RegexIterator(pattern *regexp.Regexp) *SegmentIterator {
+	// Ensure tombstones are loaded before iteration to suppress deleted keys
+	if r.tombstoneSet == nil && r.tombFile != nil {
+		_ = r.loadTombstones()
+	}
 	return &SegmentIterator{
 		reader:  r,
 		pattern: pattern,
@@ -554,6 +558,82 @@ func (r *Reader) MayContain(pattern *regexp.Regexp) bool {
 		}
 	}
 	return true
+}
+
+// StreamKeys provides a streaming closure over keys.dat for k-way merge.
+// The returned advance func yields the next key (copy) and ok=false on end/error.
+func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
+	if r.keysFile == nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	if _, err := r.keysFile.Seek(0, 0); err != nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	hdr, err := ReadCommonHeader(r.keysFile)
+	if err != nil || ValidateHeader(hdr, common.MagicKeys, common.VersionSegment) != nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	var count uint32
+	if err := binary.Read(r.keysFile, binary.LittleEndian, &count); err != nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	var i uint32
+	return func() ([]byte, bool) {
+		if i >= count {
+			return nil, false
+		}
+		var kl uint32
+		if err := binary.Read(r.keysFile, binary.LittleEndian, &kl); err != nil {
+			return nil, false
+		}
+		var k []byte
+		if kl > 0 {
+			k = make([]byte, kl)
+			if _, err := io.ReadFull(r.keysFile, k); err != nil {
+				return nil, false
+			}
+		}
+		i++
+		return k, true
+	}
+}
+
+// StreamTombstones provides a streaming closure over tombstones.dat.
+// The returned advance func yields the next tombstone key (copy) and ok=false on end/error.
+func (r *Reader) StreamTombstones() (advance func() ([]byte, bool)) {
+	if r.tombFile == nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	if _, err := r.tombFile.Seek(0, 0); err != nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	hdr, err := ReadCommonHeader(r.tombFile)
+	if err != nil || ValidateHeader(hdr, common.MagicTombs, common.VersionSegment) != nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	var count uint32
+	if err := binary.Read(r.tombFile, binary.LittleEndian, &count); err != nil {
+		return func() ([]byte, bool) { return nil, false }
+	}
+	var i uint32
+	return func() ([]byte, bool) {
+		if i >= count {
+			return nil, false
+		}
+		var kl uint32
+		if err := binary.Read(r.tombFile, binary.LittleEndian, &kl); err != nil {
+			return nil, false
+		}
+		var k []byte
+		if kl > 0 {
+			k = make([]byte, kl)
+			if _, err := io.ReadFull(r.tombFile, k); err != nil {
+				return nil, false
+			}
+		}
+		i++
+		return k, true
+	}
 }
 
 // SegmentIterator iterates over keys in a segment.

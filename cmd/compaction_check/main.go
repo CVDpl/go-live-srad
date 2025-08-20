@@ -4,9 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"io/fs"
 	"regexp"
 	"time"
 
@@ -108,6 +108,19 @@ func main() {
 		panic(err)
 	}
 	cancel()
+
+	// Measure after inserts (before any deletes)
+	liveBeforeDeletes := *n
+	if *verifyScan {
+		ctx, cancel = context.WithTimeout(context.Background(), *phaseTimeout)
+		lbd, err := countLive(ctx, store)
+		if err != nil {
+			panic(err)
+		}
+		cancel()
+		liveBeforeDeletes = lbd
+	}
+	tombBeforeDeletes := *n - liveBeforeDeletes
 
 	// 2) Deletes: delete first m keys (bounded)
 	if *m > *n {
@@ -245,13 +258,14 @@ func main() {
 
 	// Report
 	fmt.Printf("n=%d m=%d k=%d\n", *n, *m, *k)
-	fmt.Printf("live before: %d, tombstones (logical) before: %d\n", liveBefore, tombBefore)
-	fmt.Printf("live after:  %d, tombstones (logical) after:  %d\n", liveAfter, tombAfter)
+	fmt.Printf("live before deletes: %d, tombstones (logical) before deletes: %d\n", liveBeforeDeletes, tombBeforeDeletes)
+	fmt.Printf("live before compaction (post-deletes): %d, tombstones (logical) before compaction: %d\n", liveBefore, tombBefore)
+	fmt.Printf("live after compaction:  %d, tombstones (logical) after compaction:  %d\n", liveAfter, tombAfter)
 	// Also show active manifest bytes vs filesystem bytes
 	fsAfter, _ := dirSize(segDir)
-	fmt.Printf("active size before: %d bytes\n", beforeActive)
-	fmt.Printf("active size after:  %d bytes\n", afterActive)
-	fmt.Printf("fs size (raw) after: %d bytes\n", fsAfter)
+	fmt.Printf("active size before compaction: %d bytes\n", beforeActive)
+	fmt.Printf("active size after compaction:  %d bytes\n", afterActive)
+	fmt.Printf("fs size (raw) after compaction: %d bytes\n", fsAfter)
 	if beforeActive > 0 {
 		reduction := float64(beforeActive-afterActive) / float64(beforeActive) * 100.0
 		fmt.Printf("reduction: %.2f%%\n", reduction)

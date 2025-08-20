@@ -344,9 +344,10 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	// Preload tombstones from all readers to suppress older duplicates
 	preSeen := make(map[string]struct{}, 1024)
 	for _, reader := range s.readers {
-		for _, tk := range reader.Tombstones() {
+		_, _ = reader.IterateTombstones(func(tk []byte) bool {
 			preSeen[string(tk)] = struct{}{}
-		}
+			return true
+		})
 	}
 
 	// If no segments, return simple iterator
@@ -752,22 +753,95 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		return common.ErrReadOnly
 	}
 
+	// Prepare inputs under lock
 	s.mu.Lock()
 	if len(s.readers) == 0 {
 		if err := s.loadSegments(); err != nil {
 			s.logger.Warn("failed to load segments before compaction", "error", err)
 		}
 	}
-	segmentID := atomic.AddUint64(&s.nextSegmentID, 1)
 	segmentsDir := filepath.Join(s.dir, common.DirSegments)
-	builder := segment.NewBuilder(segmentID, common.LevelL0, segmentsDir, s.logger)
 	readersSnapshot := append([]*segment.Reader(nil), s.readers...)
 	s.mu.Unlock()
 
+	// Dedup set across all inputs (newest wins)
 	seen := make(map[[32]byte]struct{}, 1024)
-	liveAdded := false
 
-	// Memtable
+	// Chunked building to cap memory/size
+	const chunkTargetBytes = int64(512 * 1024 * 1024)
+	type chunkState struct {
+		builder       *segment.Builder
+		id            uint64
+		approxBytes   int64
+		acceptedCount uint64
+		liveAdded     bool
+	}
+	var cur chunkState
+	newReaders := make([]*segment.Reader, 0, 8)
+	ensureBuilder := func() {
+		if cur.builder != nil {
+			return
+		}
+		cur.id = atomic.AddUint64(&s.nextSegmentID, 1)
+		cur.builder = segment.NewBuilder(cur.id, common.LevelL0, segmentsDir, s.logger)
+		cur.approxBytes = 0
+		cur.acceptedCount = 0
+		cur.liveAdded = false
+	}
+	finalizeChunk := func() error {
+		if cur.builder == nil {
+			return nil
+		}
+		if !cur.liveAdded {
+			cur.builder.DropAllTombstones()
+		}
+		md, err := cur.builder.Build()
+		if err != nil {
+			s.logger.Warn("compaction built minimal segment", "error", err)
+			cur.builder = nil
+			cur.id = 0
+			cur.approxBytes = 0
+			cur.acceptedCount = 0
+			cur.liveAdded = false
+			return nil
+		}
+		// Open reader for the compacted chunk and stage it
+		reader, rerr := segment.NewReader(cur.id, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+		if rerr == nil {
+			newReaders = append(newReaders, reader)
+		} else {
+			s.logger.Warn("failed to open reader for compacted chunk", "id", cur.id, "error", rerr)
+		}
+		// Add to manifest if available
+		if s.manifest != nil {
+			info := manifest.SegmentInfo{ID: cur.id, Level: common.LevelL0, NumKeys: md.Counts.Accepted}
+			info.Size = s.computeSegmentSize(cur.id)
+			if minb, err := md.GetMinKey(); err == nil {
+				info.MinKeyHex = fmt.Sprintf("%x", minb)
+			}
+			if maxb, err := md.GetMaxKey(); err == nil {
+				info.MaxKeyHex = fmt.Sprintf("%x", maxb)
+			}
+			if err := s.manifest.AddSegment(info); err != nil {
+				s.logger.Warn("failed to add compacted segment to manifest", "error", err)
+			}
+		}
+		// Reset state
+		cur.builder = nil
+		cur.id = 0
+		cur.approxBytes = 0
+		cur.acceptedCount = 0
+		cur.liveAdded = false
+		return nil
+	}
+	maybeFlush := func() error {
+		if cur.approxBytes >= chunkTargetBytes {
+			return finalizeChunk()
+		}
+		return nil
+	}
+
+	// Memtable first
 	snapshot := s.memtable.Snapshot()
 	all := memtable.NewAllIterator(snapshot)
 	for all.Next() {
@@ -776,66 +850,199 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		if _, ok := seen[h]; ok {
 			continue
 		}
+		ensureBuilder()
 		if all.IsTombstone() {
-			builder.AddTombstone(k)
+			cur.builder.AddTombstone(k)
+			cur.approxBytes += int64(len(k))
 		} else {
-			if err := builder.Add(k, k, false); err != nil {
+			if err := cur.builder.Add(k, k, false); err != nil {
 				return fmt.Errorf("builder add: %w", err)
 			}
-			liveAdded = true
+			cur.approxBytes += int64(len(k))
+			cur.acceptedCount++
+			cur.liveAdded = true
 		}
 		seen[h] = struct{}{}
+		if err := maybeFlush(); err != nil {
+			return err
+		}
 	}
 
-	// Readers newest -> oldest
-	for i := len(readersSnapshot) - 1; i >= 0; i-- {
-		r := readersSnapshot[i]
-		_, _ = r.IterateTombstones(func(tk []byte) bool {
-			h := blake3.Sum256(tk)
-			if _, ok := seen[h]; ok {
-				return true
-			}
-			builder.AddTombstone(tk)
-			seen[h] = struct{}{}
-			return true
-		})
-		_, _ = r.IterateKeys(func(k []byte) bool {
-			h := blake3.Sum256(k)
-			if _, ok := seen[h]; ok {
-				return true
-			}
-			if err := builder.Add(k, k, false); err != nil {
-				s.logger.Warn("builder add failed during compaction", "error", err)
-				seen[h] = struct{}{}
-				return true
-			}
-			seen[h] = struct{}{}
-			liveAdded = true
-			return true
-		})
+	// K-way merge state for sorted sources
+	type srcIter struct {
+		key   []byte
+		ok    bool
+		next  func() ([]byte, bool)
+		order int // higher = newer
+	}
+	less := func(a, b *srcIter) bool {
+		cmp := bytes.Compare(a.key, b.key)
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return a.order > b.order // for equal keys, newer first
+	}
+	// Build source iterators: memtable (posortowany) + segments keys; tombstones heap to suppress
+	srcs := make([]*srcIter, 0, len(readersSnapshot)+1)
+	type tsIter struct {
+		key  []byte
+		ok   bool
+		next func() ([]byte, bool)
+	}
+	tsHeap := make([]*tsIter, 0, len(readersSnapshot)+1)
+	tsLess := func(i, j int) bool { return bytes.Compare(tsHeap[i].key, tsHeap[j].key) < 0 }
+	pushTS := func(ti *tsIter) {
+		if ti.ok {
+			tsHeap = append(tsHeap, ti)
+			sort.Slice(tsHeap, tsLess)
+		}
+	}
+	popTS := func() *tsIter {
+		if len(tsHeap) == 0 {
+			return nil
+		}
+		x := tsHeap[0]
+		tsHeap = tsHeap[1:]
+		return x
 	}
 
-	if !liveAdded {
-		builder.DropAllTombstones()
+	// memtable iterator
+	{
+		it := memtable.NewAllIterator(snapshot)
+		advance := func() ([]byte, bool) {
+			if it.Next() {
+				if it.IsTombstone() {
+					return nil, true
+				} // memtable tombs handled by deletes phase; ignore here
+				return it.Key(), true
+			}
+			return nil, false
+		}
+		k, ok := advance()
+		srcs = append(srcs, &srcIter{key: k, ok: ok, next: advance, order: len(readersSnapshot) + 1})
 	}
-	metadata, err := builder.Build()
-	if err != nil {
-		s.logger.Warn("compaction built minimal segment", "error", err)
-		return nil
+	// segments
+	for idx := len(readersSnapshot) - 1; idx >= 0; idx-- { // newest first gets wyższy priorytet
+		r := readersSnapshot[idx]
+		advance := r.StreamKeys()
+		k, ok := advance()
+		srcs = append(srcs, &srcIter{key: k, ok: ok, next: advance, order: idx + 1})
+		// tombstones stream
+		advT := r.StreamTombstones()
+		if tk, tok := advT(); tok {
+			pushTS(&tsIter{key: tk, ok: tok, next: advT})
+		}
+	}
+	// Min-heap
+	h := make([]*srcIter, 0, len(srcs))
+	push := func(si *srcIter) {
+		if si.ok {
+			h = append(h, si)
+			sort.Slice(h, func(i, j int) bool { return less(h[i], h[j]) })
+		}
+	}
+	pop := func() *srcIter {
+		if len(h) == 0 {
+			return nil
+		}
+		x := h[0]
+		h = h[1:]
+		return x
+	}
+	for _, siter := range srcs {
+		push(siter)
 	}
 
-	reader, rerr := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
-	if rerr != nil {
-		s.logger.Warn("failed to open reader for compacted segment", "id", segmentID, "error", rerr)
-	} else {
-		s.mu.Lock()
+	var curKey []byte
+	for len(h) > 0 {
+		si := pop()
+		if si.key == nil && si.ok { // skip empty
+			if k, ok := si.next(); ok {
+				si.key = k
+				si.ok = true
+				push(si)
+			}
+			continue
+		}
+		// New key or same key but older
+		emit := false
+		if curKey == nil || bytes.Compare(si.key, curKey) != 0 {
+			// finalize duplicate run: nothing to do
+			curKey = append([]byte(nil), si.key...)
+			_ = si.order
+			// check tombstone in newer sources? For simplicity: we don't carry tombstones in memtable iterator; deletions are handled earlier
+			emit = true
+		} else {
+			// same key; newer already chosen; skip
+			emit = false
+		}
+		if emit {
+			// advance tombstone heap to current key (drop any ts < curKey)
+			for {
+				if len(tsHeap) == 0 {
+					break
+				}
+				if bytes.Compare(tsHeap[0].key, curKey) < 0 {
+					ti := popTS()
+					if nk, ok := ti.next(); ok {
+						ti.key = nk
+						ti.ok = true
+						pushTS(ti)
+					}
+					continue
+				}
+				break
+			}
+			// if tombstone equals current key, suppress emit and advance that tombstone
+			if len(tsHeap) > 0 && bytes.Equal(tsHeap[0].key, curKey) {
+				ti := popTS()
+				if nk, ok := ti.next(); ok {
+					ti.key = nk
+					ti.ok = true
+					pushTS(ti)
+				}
+				// do not emit this key
+			} else {
+				ensureBuilder()
+				if err := cur.builder.Add(curKey, curKey, false); err != nil {
+					return fmt.Errorf("builder add: %w", err)
+				}
+				cur.approxBytes += int64(len(curKey))
+				cur.acceptedCount++
+				cur.liveAdded = true
+				if err := maybeFlush(); err != nil {
+					return err
+				}
+			}
+		}
+		if k, ok := si.next(); ok {
+			si.key = k
+			si.ok = true
+			push(si)
+		}
+	}
+
+	// Finalize last chunk
+	if err := finalizeChunk(); err != nil {
+		return err
+	}
+
+	// Replace readers: if produced new segments, swap in; if none, clear readers entirely
+	s.mu.Lock()
+	if len(newReaders) > 0 {
 		for _, old := range s.readers {
 			_ = old.Close()
 		}
-		s.readers = []*segment.Reader{reader}
-		s.mu.Unlock()
+		s.readers = newReaders
+	} else {
+		for _, old := range s.readers {
+			_ = old.Close()
+		}
+		s.readers = nil
 	}
+	s.mu.Unlock()
 
+	// Remove old segments from manifest
 	if s.manifest != nil {
 		if len(s.segments) > 0 {
 			oldIDs := make([]uint64, 0, len(s.segments))
@@ -844,22 +1051,15 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 			}
 			_ = s.manifest.RemoveSegments(oldIDs)
 		}
-		info := manifest.SegmentInfo{ID: segmentID, Level: common.LevelL0, NumKeys: metadata.Counts.Accepted}
-		info.Size = s.computeSegmentSize(segmentID)
-		if minb, err := metadata.GetMinKey(); err == nil {
-			info.MinKeyHex = fmt.Sprintf("%x", minb)
-		}
-		if maxb, err := metadata.GetMaxKey(); err == nil {
-			info.MaxKeyHex = fmt.Sprintf("%x", maxb)
-		}
-		if err := s.manifest.AddSegment(info); err != nil {
-			s.logger.Warn("failed to add compacted segment to manifest", "error", err)
-		}
 	}
-	s.updateStatsFromManifest()
+
+	// Replace in-memory segments metadata with none for now
 	s.mu.Lock()
-	s.segments = []*segment.Metadata{metadata}
+	s.segments = nil
 	s.mu.Unlock()
+
+	// Refresh stats after compaction
+	s.updateStatsFromManifest()
 	return nil
 }
 

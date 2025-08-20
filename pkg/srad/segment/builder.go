@@ -110,11 +110,9 @@ func (b *Builder) Add(key, value []byte, tombstone bool) error {
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-
+	// Avoid holding full values in memory; store an empty (non-nil) marker slice
 	b.keys = append(b.keys, keyCopy)
-	b.values = append(b.values, valueCopy)
+	b.values = append(b.values, []byte{})
 	b.tombstones = append(b.tombstones, tombstone)
 
 	// Update min/max keys
@@ -167,6 +165,11 @@ func (b *Builder) Build() (*Metadata, error) {
 			b.minKey = b.keys[0]
 			b.maxKey = b.keys[len(b.keys)-1]
 		}
+	}
+
+	// Ensure tombstones are sorted to allow streaming merge
+	if len(b.tombstoneKeys) > 1 {
+		sort.Slice(b.tombstoneKeys, func(i, j int) bool { return bytes.Compare(b.tombstoneKeys[i], b.tombstoneKeys[j]) < 0 })
 	}
 
 	// Create segment directory
