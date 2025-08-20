@@ -753,25 +753,21 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if len(s.readers) == 0 {
-		// Attempt to load existing segments/readers from disk
 		if err := s.loadSegments(); err != nil {
 			s.logger.Warn("failed to load segments before compaction", "error", err)
 		}
 	}
-
-	// Prepare new segment artifacts
 	segmentID := atomic.AddUint64(&s.nextSegmentID, 1)
 	segmentsDir := filepath.Join(s.dir, common.DirSegments)
 	builder := segment.NewBuilder(segmentID, common.LevelL0, segmentsDir, s.logger)
+	readersSnapshot := append([]*segment.Reader(nil), s.readers...)
+	s.mu.Unlock()
 
-	// Streaming, low-memory dedupe via BLAKE3 hash set (newest wins)
 	seen := make(map[[32]byte]struct{}, 1024)
 	liveAdded := false
 
-	// Memtable first (newest)
+	// Memtable
 	snapshot := s.memtable.Snapshot()
 	all := memtable.NewAllIterator(snapshot)
 	for all.Next() {
@@ -791,10 +787,9 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		seen[h] = struct{}{}
 	}
 
-	// Readers from newest to oldest
-	for i := len(s.readers) - 1; i >= 0; i-- {
-		r := s.readers[i]
-		// Emit tombstones first (streaming)
+	// Readers newest -> oldest
+	for i := len(readersSnapshot) - 1; i >= 0; i-- {
+		r := readersSnapshot[i]
 		_, _ = r.IterateTombstones(func(tk []byte) bool {
 			h := blake3.Sum256(tk)
 			if _, ok := seen[h]; ok {
@@ -804,7 +799,6 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 			seen[h] = struct{}{}
 			return true
 		})
-		// Stream keys; skip if overshadowed
 		_, _ = r.IterateKeys(func(k []byte) bool {
 			h := blake3.Sum256(k)
 			if _, ok := seen[h]; ok {
@@ -821,33 +815,27 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		})
 	}
 
-	// If no live keys were added (min/max unset), omit tombstones file to avoid
-	// retaining large deletion lists in an otherwise empty segment.
 	if !liveAdded {
 		builder.DropAllTombstones()
 	}
-
 	metadata, err := builder.Build()
 	if err != nil {
-		// If only tombstones, allow empty live set by writing minimal segment
-		// (builder already wrote files; treat error as non-fatal)
 		s.logger.Warn("compaction built minimal segment", "error", err)
 		return nil
 	}
 
-	// Open reader for compacted segment
 	reader, rerr := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
 	if rerr != nil {
 		s.logger.Warn("failed to open reader for compacted segment", "id", segmentID, "error", rerr)
 	} else {
-		// Replace readers set with only the compacted one (simple strategy)
+		s.mu.Lock()
 		for _, old := range s.readers {
 			_ = old.Close()
 		}
 		s.readers = []*segment.Reader{reader}
+		s.mu.Unlock()
 	}
 
-	// Update manifest: mark old segments deleted and add new
 	if s.manifest != nil {
 		if len(s.segments) > 0 {
 			oldIDs := make([]uint64, 0, len(s.segments))
@@ -858,7 +846,6 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		}
 		info := manifest.SegmentInfo{ID: segmentID, Level: common.LevelL0, NumKeys: metadata.Counts.Accepted}
 		info.Size = s.computeSegmentSize(segmentID)
-		// Populate min/max HEX from metadata
 		if minb, err := metadata.GetMinKey(); err == nil {
 			info.MinKeyHex = fmt.Sprintf("%x", minb)
 		}
@@ -869,12 +856,10 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 			s.logger.Warn("failed to add compacted segment to manifest", "error", err)
 		}
 	}
-	// Refresh stats after compaction
 	s.updateStatsFromManifest()
-
-	// Track metadata
+	s.mu.Lock()
 	s.segments = []*segment.Metadata{metadata}
-
+	s.mu.Unlock()
 	return nil
 }
 

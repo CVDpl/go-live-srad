@@ -141,6 +141,34 @@ func (b *Builder) Build() (*Metadata, error) {
 		return nil, fmt.Errorf("no keys to build segment")
 	}
 
+	// Normalize: sort keys and deduplicate adjacent duplicates to reduce size and enable linear merges
+	if len(b.keys) > 1 {
+		idx := make([]int, len(b.keys))
+		for i := range idx {
+			idx[i] = i
+		}
+		sort.Slice(idx, func(i, j int) bool { return bytes.Compare(b.keys[idx[i]], b.keys[idx[j]]) < 0 })
+		dedupKeys := make([][]byte, 0, len(b.keys))
+		dedupVals := make([][]byte, 0, len(b.values))
+		for _, id := range idx {
+			k := b.keys[id]
+			if len(dedupKeys) == 0 || bytes.Compare(dedupKeys[len(dedupKeys)-1], k) != 0 {
+				dedupKeys = append(dedupKeys, k)
+				if id < len(b.values) {
+					dedupVals = append(dedupVals, b.values[id])
+				} else {
+					dedupVals = append(dedupVals, nil)
+				}
+			}
+		}
+		b.keys = dedupKeys
+		b.values = dedupVals
+		if len(b.keys) > 0 {
+			b.minKey = b.keys[0]
+			b.maxKey = b.keys[len(b.keys)-1]
+		}
+	}
+
 	// Create segment directory
 	segmentDir := filepath.Join(b.dir, fmt.Sprintf("%016d", b.segmentID))
 	if err := os.MkdirAll(segmentDir, 0755); err != nil {

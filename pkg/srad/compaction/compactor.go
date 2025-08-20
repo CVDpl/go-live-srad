@@ -13,6 +13,7 @@ import (
 	"github.com/CVDpl/go-live-srad/internal/common"
 	"github.com/CVDpl/go-live-srad/pkg/srad/manifest"
 	"github.com/CVDpl/go-live-srad/pkg/srad/segment"
+	blake3 "lukechampine.com/blake3"
 )
 
 // Compactor manages LSM compaction.
@@ -171,8 +172,18 @@ func (c *Compactor) scheduleLeveledCompaction(level int, segments []manifest.Seg
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Select segments with overlapping key ranges
-	// For simplicity, just take all segments at this level
+	// Prefer smaller segments first to keep job size bounded
+	sort.Slice(segments, func(i, j int) bool { return segments[i].Size < segments[j].Size })
+
+	// Select segments with overlapping key ranges (simplified: take a limited batch)
+	maxBatch := c.maxL0Files * 3
+	if maxBatch < 4 {
+		maxBatch = 4
+	}
+	if len(segments) > maxBatch {
+		segments = segments[:maxBatch]
+	}
+
 	segmentIDs := make([]uint64, len(segments))
 	for i, seg := range segments {
 		segmentIDs[i] = seg.ID
@@ -210,9 +221,187 @@ func (c *Compactor) runPendingCompaction(ctx context.Context) {
 	c.mu.Unlock()
 
 	// Run compaction
-	if err := c.runCompaction(ctx, job); err != nil {
+	if err := c.runCompactionLegacy(ctx, job); err != nil {
 		c.logger.Error("compaction failed", "job", job.ID, "error", err)
 	}
+}
+
+// runCompactionLegacy runs a single compaction job using a legacy approach.
+func (c *Compactor) runCompactionLegacy(ctx context.Context, job CompactionJob) error {
+	startTime := time.Now()
+
+	c.logger.Info("starting compaction", "job", job.ID, "level", job.Level, "inputs", len(job.Inputs))
+
+	segmentsDir := filepath.Join(c.dir, common.DirSegments)
+	var readers []*segment.Reader
+	for _, segID := range job.Inputs {
+		reader, err := segment.NewReader(segID, segmentsDir, c.logger, false)
+		if err != nil {
+			c.logger.Warn("failed to open segment", "id", segID, "error", err)
+			continue
+		}
+		readers = append(readers, reader)
+		defer reader.Close()
+	}
+	if len(readers) == 0 {
+		return fmt.Errorf("no segments to compact")
+	}
+
+	// newest first, so newest wins
+	sort.Slice(readers, func(i, j int) bool {
+		mi := readers[i].GetMetadata()
+		mj := readers[j].GetMetadata()
+		if mi == nil || mj == nil {
+			return false
+		}
+		return mi.CreatedAtUnix > mj.CreatedAtUnix
+	})
+
+	targetLevel := job.Level + 1
+	if job.Level == 0 && len(job.Inputs) < c.maxL0Files*2 {
+		targetLevel = 1
+	}
+
+	seen := make(map[[32]byte]struct{}, 1024)
+	type chunkState struct {
+		builder       *segment.Builder
+		id            uint64
+		approxBytes   int64
+		acceptedCount int64
+	}
+	var cur chunkState
+	outputs := make([]uint64, 0, 8)
+
+	ensureBuilder := func() {
+		if cur.builder != nil {
+			return
+		}
+		cur.id = uint64(time.Now().UnixNano())
+		cur.builder = segment.NewBuilder(cur.id, targetLevel, segmentsDir, c.logger)
+		cur.approxBytes = 0
+		cur.acceptedCount = 0
+	}
+	finalizeChunk := func() error {
+		if cur.builder == nil {
+			return nil
+		}
+		md, err := cur.builder.Build()
+		if err != nil {
+			return fmt.Errorf("build segment: %w", err)
+		}
+		info := manifest.SegmentInfo{ID: cur.id, Level: targetLevel, NumKeys: md.Counts.Accepted}
+		if minb, err := md.GetMinKey(); err == nil {
+			info.MinKeyHex = fmt.Sprintf("%x", minb)
+		}
+		if maxb, err := md.GetMaxKey(); err == nil {
+			info.MaxKeyHex = fmt.Sprintf("%x", maxb)
+		}
+		if md2, err := segment.LoadFromFile(filepath.Join(segmentsDir, fmt.Sprintf("%016d", cur.id), "segment.json")); err == nil {
+			var total int64
+			files := []string{md2.Files.Louds, md2.Files.Edges, md2.Files.Accept, md2.Files.TMap, md2.Files.Tails}
+			for _, f := range files {
+				if f == "" {
+					continue
+				}
+				p := filepath.Join(segmentsDir, fmt.Sprintf("%016d", cur.id), f)
+				if st, err := os.Stat(p); err == nil {
+					total += st.Size()
+				}
+			}
+			for _, f := range []string{"filters/prefix.bf", "filters/tri.bits", "keys.dat", "tombstones.dat"} {
+				p := filepath.Join(segmentsDir, fmt.Sprintf("%016d", cur.id), f)
+				if st, err := os.Stat(p); err == nil {
+					total += st.Size()
+				}
+			}
+			info.Size = total
+		}
+		if err := c.manifest.AddSegment(info); err != nil {
+			return fmt.Errorf("add segment to manifest: %w", err)
+		}
+		outputs = append(outputs, cur.id)
+		cur.builder = nil
+		cur.id = 0
+		cur.approxBytes = 0
+		cur.acceptedCount = 0
+		return nil
+	}
+	maybeFlush := func() error {
+		if cur.approxBytes >= c.maxSegmentSize {
+			return finalizeChunk()
+		}
+		return nil
+	}
+
+	for _, r := range readers {
+		_, _ = r.IterateTombstones(func(tk []byte) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+			h := blake3.Sum256(tk)
+			if _, ok := seen[h]; ok {
+				return true
+			}
+			ensureBuilder()
+			cur.builder.AddTombstone(tk)
+			seen[h] = struct{}{}
+			cur.approxBytes += int64(len(tk))
+			if err := maybeFlush(); err != nil {
+				return false
+			}
+			return true
+		})
+		_, _ = r.IterateKeys(func(k []byte) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+			h := blake3.Sum256(k)
+			if _, ok := seen[h]; ok {
+				return true
+			}
+			ensureBuilder()
+			if err := cur.builder.Add(k, k, false); err != nil {
+				c.logger.Warn("builder add failed during streaming compaction", "error", err)
+				seen[h] = struct{}{}
+				return true
+			}
+			seen[h] = struct{}{}
+			cur.approxBytes += int64(len(k))
+			cur.acceptedCount++
+			if err := maybeFlush(); err != nil {
+				return false
+			}
+			return true
+		})
+	}
+	if err := finalizeChunk(); err != nil {
+		return err
+	}
+	if len(outputs) == 0 {
+		c.logger.Info("compaction produced no output segments", "job", job.ID)
+		return nil
+	}
+	if err := c.manifest.RemoveSegments(job.Inputs); err != nil {
+		return fmt.Errorf("remove old segments from manifest: %w", err)
+	}
+	compactionInfo := manifest.CompactionInfo{
+		ID:        job.ID,
+		Level:     job.Level,
+		Inputs:    job.Inputs,
+		Outputs:   outputs,
+		StartTime: startTime.Unix(),
+		EndTime:   time.Now().Unix(),
+		Reason:    job.Reason,
+	}
+	if err := c.manifest.RecordCompaction(compactionInfo); err != nil {
+		c.logger.Warn("failed to record compaction", "error", err)
+	}
+	c.logger.Info("compaction completed", "job", job.ID, "inputs", len(job.Inputs), "outputs", len(outputs), "level", fmt.Sprintf("L%d->L%d", job.Level, targetLevel))
+	return nil
 }
 
 // runCompaction runs a single compaction job.
