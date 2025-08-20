@@ -1,0 +1,328 @@
+# SRAD - String Storage with Regex Search
+
+SRAD is a high-performance string storage engine with regex search support, implementing LSM-tree architecture, immutable segments, WAL durability, parallel queries, RCU without downtime, tuning hooks, and lightweight statistics.
+
+## Features
+
+- **LSM-tree Architecture**: Efficient write performance with background compaction
+- **Regex Search**: Full regex support using Go's regexp package
+- **WAL Durability**: Write-ahead logging for crash recovery
+- **Immutable Segments**: Once written, segments are never modified
+- **Parallel Queries**: Concurrent segment searching with configurable parallelism
+- **RCU Support**: Read-Copy-Update for lock-free reads during updates
+- **Tuning**: Manual tuning via APIs with persisted `tuning.json`
+- **Statistics**: Lightweight stats via API (no Prometheus export)
+
+## Installation
+
+```bash
+go get github.com/CVDpl/go-live-srad
+```
+
+## Quick Start
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "regexp"
+    
+    "github.com/CVDpl/go-live-srad/pkg/srad"
+)
+
+func main() {
+    // Open a store
+    opts := srad.DefaultOptions()
+    store, err := srad.Open("./mystore", opts)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer store.Close()
+    
+    // Insert data
+    store.Insert([]byte("apple"))
+    store.Insert([]byte("application"))
+    store.Insert([]byte("banana"))
+    
+    // Search with regex
+    re := regexp.MustCompile("^app.*")
+    iter, err := store.RegexSearch(context.Background(), re, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer iter.Close()
+    
+    // Iterate results
+    for iter.Next(context.Background()) {
+        fmt.Printf("Found: %s\n", iter.String())
+    }
+}
+```
+
+## API Reference
+
+### Store Interface
+
+```go
+type Store interface {
+    Close() error
+    Insert(s []byte) error
+    InsertWithTTL(s []byte, ttl time.Duration) error
+    Delete(s []byte) error
+    RegexSearch(ctx context.Context, re *regexp.Regexp, q *QueryOptions) (Iterator, error)
+    PrefixScan(ctx context.Context, prefix []byte, q *QueryOptions) (Iterator, error)
+    RangeScan(ctx context.Context, start, end []byte, q *QueryOptions) (Iterator, error)
+    Stats() Stats
+    RefreshStats()
+    Tune(params TuningParams)
+    CompactNow(ctx context.Context) error
+    Flush(ctx context.Context) error
+    RCUEnabled() bool
+    AdvanceRCU(ctx context.Context) error
+    VacuumPrefix(ctx context.Context, prefix []byte) error
+    SetAutotunerEnabled(enabled bool)
+    // Delete obsolete WAL files older than current WAL sequence
+    PruneWAL() error
+}
+```
+
+### Options
+
+```go
+type Options struct {
+    ReadOnly                bool
+    Parallelism            int
+    VerifyChecksumsOnLoad  bool
+    MemtableTargetBytes    int64
+    CacheLabelAdvanceBytes int64
+    CacheNFATransitionBytes int64
+    EnableRCU              bool
+    RCUCleanupInterval     time.Duration
+    Logger                 Logger
+    DisableAutotuner       bool
+    DisableAutoFlush       bool
+    DefaultTTL              time.Duration
+    DisableBackgroundCompaction bool
+    RotateWALOnFlush        bool
+    WALRotateSize           int64
+    WALMaxFileSize          int64
+    WALBufferSize           int
+}
+```
+
+### Query Options
+
+```go
+type QueryOptions struct {
+    Limit           int
+    Mode            QueryMode
+    Order           TraversalOrder
+    MaxParallelism  int
+    FilterThreshold float64
+    CachePolicy     CachePolicy
+}
+```
+
+## Architecture
+
+### Storage Layout
+
+```
+store_directory/
+├── wal/                    # Write-ahead log files
+│   ├── 1.log
+│   └── 2.log
+├── segments/               # Immutable segment files
+│   ├── <segmentID>/
+│   │   ├── index.louds    # LOUDS-encoded trie
+│   │   ├── index.edges    # Edge labels and topology
+│   │   ├── index.accept   # Accept states
+│   │   ├── index.tmap     # Tail mapping
+│   │   ├── tails.dat      # Tail data
+│   │   ├── segment.json   # Segment metadata
+│   │   └── filters/       # Bloom and trigram filters
+│   │       ├── prefix.bf
+│   │       └── tri.bits
+├── manifest/              # Manifest files
+│   └── <generation>
+├── CURRENT               # Points to current manifest
+└── tuning.json          # Tuning parameters
+```
+
+### Components
+
+1. **WAL (Write-Ahead Log)**: Ensures durability by logging all operations before applying them
+2. **Memtable**: In-memory Patricia tree for recent writes
+3. **Segments**: Immutable on-disk structures with LOUDS-encoded tries
+4. **Manifest**: Tracks all segments and their metadata
+5. **Compactor**: Merges segments to maintain read performance
+6. **Query Engine**: Regex via Go's regexp with literal-prefix and NFA prefix pruning; advanced NFA automaton product implemented
+
+## Performance
+
+- **Inserts**: 100k+ ops/sec on modern hardware
+- **Queries**: P95 < 10ms for typical regex patterns
+- **Memory**: Configurable cache sizes and memtable limits
+- **Parallelism**: Automatic scaling based on CPU cores
+
+## Configuration
+
+### Default Values
+
+- Memtable Target: 512MB
+- Cache Label Advance: 32MB
+- Cache NFA Transition: 32MB
+- RCU Cleanup Interval: 30s
+- Compaction Priority: 3
+- WAL Rotation Size: 128MB
+- WAL Max File Size: 1GB
+- WAL Buffer Size: 256KB
+
+### Logging
+
+By default, SRAD uses a JSON structured logger to stderr. To disable logging entirely, set a null logger in options before opening the store:
+
+```go
+opts := srad.DefaultOptions()
+opts.Logger = srad.NewNullLogger() // disables all logs
+store, err := srad.Open("./mystore", opts)
+```
+
+You can also provide your own implementation of the `Logger` interface if you prefer a different format.
+
+### Tuning Parameters
+
+```go
+params := srad.TuningParams{
+    MemtableTargetBytes:     &memSize,
+    CacheLabelAdvanceBytes:  &cacheSize,
+    CacheNFATransitionBytes: &nfaCacheSize,
+    CompactionPriority:      &priority,
+}
+store.Tune(params)
+```
+
+## Development Status
+
+### ✅ Core Features (Completed)
+- **Storage Engine**: Full LSM-tree with immutable segments
+- **WAL**: Write-Ahead Log with rotation and crash recovery
+- **Memtable**: Canonical Patricia tree with regex support
+- **Segments**: LOUDS encoding with bitvector and rank/select operations
+- **Manifest**: Atomic updates and version history management
+- **Compaction**: Background LSM compaction with leveled strategy
+- **Concurrency**: RCU (Read-Copy-Update) for lock-free reads
+- **Filters**: Bloom filters for prefix queries and trigram substring filter
+- **Persistence**: Segment persistence and recovery
+- **Performance**: Parallel search with NFA prefix pruning and trigram-based pruning
+
+### ✅ API & Utilities (Completed)
+- **Store Interface**: Complete public API with context support
+- **Iterators**: Merged iterator for memtable + segments; Prefix and Range scans
+- **Statistics**: Performance metrics and monitoring
+- **Examples**: Basic, large dataset, and advanced usage examples
+- **Testing**: Comprehensive test suite with benchmarks
+- **TTL**: Expiration on read; permanent removal during compaction
+
+### Architecture Highlights
+- **LSM-tree**: Log-structured merge tree with multiple levels
+- **Immutable segments**: Once written, segments are never modified
+- **Atomic updates**: Manifest ensures consistency during compaction
+- **Lock-free reads**: RCU allows concurrent reads without blocking
+- **Crash recovery**: WAL ensures durability, manifest tracks segments
+
+## Testing
+
+```bash
+# Run all tests
+go test ./...
+
+# Run with verbose output
+go test -v ./pkg/srad
+
+# Run specific test
+go test -v -run TestStoreBasicOperations ./pkg/srad
+
+# Run benchmarks
+go test -bench=. ./pkg/srad
+```
+
+### Verify compaction size reduction
+Use the helper at `cmd/compaction_check` to measure live keys and segment sizes before/after compaction.
+
+```bash
+# Default: n=10000 inserts, m=5000 deletes, k=0 overwrites
+go run ./cmd/compaction_check
+
+# Custom scenario: 10k inserts, 5k deletes, 2k overwrites among survivors
+go run ./cmd/compaction_check -n 10000 -m 5000 -k 2000
+```
+
+- **n**: initial inserts
+- **m**: deletes (from the first m keys)
+- **k**: overwrites (re-insert among surviving keys)
+
+The program prints live keys and active size from the manifest before and after compaction. Old segment directories may
+still exist briefly due to RCU grace period; you can pass `-wait_rcu 40s` to wait, or `-purge` to delete obsolete
+segment directories immediately (dangerous). Use `-verify` to do a full scan for live counts (slow), `-keep` to keep the
+output directory, `-out` to provide a custom directory, `-timeout` per phase, and `-prune_wal` to delete older WAL files.
+
+### Clean sweep (compact + WAL prune)
+
+To fully compact, prune WAL files, and assert that no live entries remain:
+
+```bash
+go run ./cmd/compaction_check \
+  -n 4000000 -m 4000000 -k 0 \
+  -rotate_wal \
+  -prune_wal \
+  -wait_rcu 45s \
+  -verify \
+  -assert_empty
+```
+
+- **-rotate_wal**: rotate WAL on each flush to make older files eligible for pruning.
+- **-prune_wal**: delete WAL files older than the current sequence.
+- **-wait_rcu**: allow RCU cleanup to remove obsolete segment directories before measuring.
+- **-verify**: perform a full scan to count live entries precisely.
+- **-assert_empty**: exit non-zero if any live entries remain after compaction.
+
+Note: `-purge` is available but dangerous; it physically removes non-active segment directories immediately, bypassing
+RCU safety. Prefer `-wait_rcu` for production.
+
+### Segment sanity check (segcheck)
+
+Use the `segcheck` tool to validate the on-disk format of a single segment directory (magic + version headers and
+optional BLAKE3 from `segment.json`).
+
+```bash
+go build ./cmd/segcheck
+./segcheck -dir /path/to/store/segments/0000000000000003
+```
+
+It verifies `index.louds` (required) and, if present, `index.edges`, `index.accept`, `index.tmap`, `filters/prefix.bf`,
+`filters/tri.bits`, `keys.dat`, and `tombstones.dat`. If `segment.json` contains BLAKE3 entries, it recomputes and
+compares them.
+
+## Examples
+
+See the `cmd/example` directory for usage examples:
+
+```bash
+go run ./cmd/example
+```
+
+## Contributing
+
+Contributions are welcome! Please ensure:
+- All tests pass
+- Code follows Go conventions
+- New features include tests
+- Documentation is updated
+
+## License
+
+This project is licensed under the BSD 3-Clause License. See the `LICENSE` file for details.
