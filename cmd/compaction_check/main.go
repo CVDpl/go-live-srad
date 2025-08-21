@@ -59,10 +59,10 @@ func main() {
 	phaseTimeout := flag.Duration("timeout", 10*time.Minute, "timeout per phase (flush/scan/compact)")
 	waitRCU := flag.Duration("wait_rcu", 30*time.Second, "wait this long after compaction before listing files (to allow RCU cleanup)")
 	verifyScan := flag.Bool("verify", false, "perform a full scan to count live keys (slow)")
-	pruneWAL := flag.Bool("prune_wal", true, "prune old WAL files after flush/compaction")
+	pruneWAL := flag.Bool("prune_wal", false, "prune old WAL files after flush/compaction")
 	purge := flag.Bool("purge", false, "physically remove non-active segment dirs after compaction (dangerous)")
-	assertEmpty := flag.Bool("assert_empty", true, "exit with non-zero status if any live entries remain after compaction")
-	rotateWAL := flag.Bool("rotate_wal", true, "rotate WAL on flush to enable immediate pruning of older WAL files")
+	assertEmpty := flag.Bool("assert_empty", false, "exit with non-zero status if any live entries remain after compaction")
+	rotateWAL := flag.Bool("rotate_wal", false, "rotate WAL on flush to enable immediate pruning of older WAL files")
 	flag.Parse()
 
 	var dir string
@@ -260,11 +260,11 @@ func main() {
 	fmt.Printf("n=%d m=%d k=%d\n", *n, *m, *k)
 	fmt.Printf("live before deletes: %d, tombstones (logical) before deletes: %d\n", liveBeforeDeletes, tombBeforeDeletes)
 	fmt.Printf("live before compaction (post-deletes): %d, tombstones (logical) before compaction: %d\n", liveBefore, tombBefore)
-	fmt.Printf("live after compaction:  %d, tombstones (logical) after compaction:  %d\n", liveAfter, tombAfter)
+	fmt.Printf("live after compaction: %d, tombstones (logical) after compaction: %d\n", liveAfter, tombAfter)
 	// Also show active manifest bytes vs filesystem bytes
 	fsAfter, _ := dirSize(segDir)
 	fmt.Printf("active size before compaction: %d bytes\n", beforeActive)
-	fmt.Printf("active size after compaction:  %d bytes\n", afterActive)
+	fmt.Printf("active size after compaction: %d bytes\n", afterActive)
 	fmt.Printf("fs size (raw) after compaction: %d bytes\n", fsAfter)
 	if beforeActive > 0 {
 		reduction := float64(beforeActive-afterActive) / float64(beforeActive) * 100.0

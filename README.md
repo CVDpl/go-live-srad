@@ -84,7 +84,10 @@ type Store interface {
     AdvanceRCU(ctx context.Context) error
     VacuumPrefix(ctx context.Context, prefix []byte) error
     SetAutotunerEnabled(enabled bool)
-    // Delete obsolete WAL files older than current WAL sequence
+    // Delete obsolete WAL files older than the current WAL sequence.
+    // Note: pruning is not automatic; call this explicitly. Pruning removes only
+    // files with sequence < current and never truncates the active WAL. Enabling
+    // RotateWALOnFlush makes older files eligible for pruning immediately.
     PruneWAL() error
 }
 ```
@@ -180,6 +183,11 @@ store_directory/
 - WAL Rotation Size: 128MB
 - WAL Max File Size: 1GB
 - WAL Buffer Size: 256KB
+
+Note on WAL lifecycle:
+- WAL pruning is manual via `PruneWAL()` and does not run automatically after flush/compaction.
+- Set `RotateWALOnFlush` to `true` to rotate WAL after each flush so older WAL files become immediately eligible for pruning.
+- `PruneWAL()` only deletes WAL files with sequence number lower than the current active file; the active file is never truncated.
 
 ### Logging
 

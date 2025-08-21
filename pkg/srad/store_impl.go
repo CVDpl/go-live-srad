@@ -966,7 +966,7 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		}
 		// New key or same key but older
 		emit := false
-		if curKey == nil || bytes.Compare(si.key, curKey) != 0 {
+		if curKey == nil || !bytes.Equal(si.key, curKey) {
 			// finalize duplicate run: nothing to do
 			curKey = append([]byte(nil), si.key...)
 			_ = si.order

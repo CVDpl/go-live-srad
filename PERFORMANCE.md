@@ -157,6 +157,7 @@ go test -bench=. ./pkg/srad
 - Monitor segment count per level
 - Run manual compaction during low traffic
 - Rotate WAL files periodically
+- After flush/compaction, consider calling `PruneWAL()` to remove obsolete WAL files. Enabling `RotateWALOnFlush` makes older files eligible for immediate pruning.
 
 ### 5. Resource Management
 - Set appropriate file descriptor limits

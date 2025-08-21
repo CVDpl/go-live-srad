@@ -150,7 +150,7 @@ func (b *Builder) Build() (*Metadata, error) {
 		dedupVals := make([][]byte, 0, len(b.values))
 		for _, id := range idx {
 			k := b.keys[id]
-			if len(dedupKeys) == 0 || bytes.Compare(dedupKeys[len(dedupKeys)-1], k) != 0 {
+			if len(dedupKeys) == 0 || !bytes.Equal(dedupKeys[len(dedupKeys)-1], k) {
 				dedupKeys = append(dedupKeys, k)
 				if id < len(b.values) {
 					dedupVals = append(dedupVals, b.values[id])
