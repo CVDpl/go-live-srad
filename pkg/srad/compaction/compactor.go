@@ -21,6 +21,8 @@ type Compactor struct {
 	dir      string
 	manifest *manifest.Manifest
 
+	alloc func() uint64
+
 	// Configuration
 	levelRatio     int   // Size ratio between levels (default 10)
 	maxL0Files     int   // Max files in L0 before compaction (default 4)
@@ -47,9 +49,13 @@ type CompactionJob struct {
 }
 
 // NewCompactor creates a new compactor.
-func NewCompactor(dir string, m *manifest.Manifest, logger common.Logger) *Compactor {
+func NewCompactor(dir string, m *manifest.Manifest, logger common.Logger, alloc func() uint64) *Compactor {
 	if logger == nil {
 		logger = &NullLogger{}
+	}
+
+	if alloc == nil {
+		alloc = func() uint64 { return uint64(time.Now().UnixNano()) }
 	}
 
 	return &Compactor{
@@ -59,6 +65,7 @@ func NewCompactor(dir string, m *manifest.Manifest, logger common.Logger) *Compa
 		maxL0Files:     8,
 		maxSegmentSize: 512 * 1024 * 1024, // 512MB
 		logger:         logger,
+		alloc:          alloc,
 	}
 }
 
@@ -275,7 +282,7 @@ func (c *Compactor) runCompactionLegacy(ctx context.Context, job CompactionJob) 
 		if cur.builder != nil {
 			return
 		}
-		cur.id = uint64(time.Now().UnixNano())
+		cur.id = c.alloc()
 		cur.builder = segment.NewBuilder(cur.id, targetLevel, segmentsDir, c.logger)
 		cur.approxBytes = 0
 		cur.acceptedCount = 0

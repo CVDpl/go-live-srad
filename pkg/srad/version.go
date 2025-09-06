@@ -10,4 +10,4 @@ package srad
 //	go test -ldflags "-X github.com/CVDpl/go-live-srad/pkg/srad.Version=1.0.1" ./...
 //
 // Default value follows SemVer.
-var Version = "1.0.1"
+var Version = "1.0.2"

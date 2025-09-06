@@ -199,7 +199,8 @@ func Open(dir string, opts *Options) (Store, error) {
 
 	// Initialize compactor
 	if s.manifest != nil && !s.readonly {
-		s.compactor = compaction.NewCompactor(dir, s.manifest, s.logger)
+		alloc := func() uint64 { return atomic.AddUint64(&s.nextSegmentID, 1) }
+		s.compactor = compaction.NewCompactor(dir, s.manifest, s.logger, alloc)
 	}
 
 	// Load tuning parameters
