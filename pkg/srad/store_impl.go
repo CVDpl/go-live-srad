@@ -19,7 +19,7 @@ import (
 	"github.com/CVDpl/go-live-srad/pkg/srad/memtable"
 	"github.com/CVDpl/go-live-srad/pkg/srad/segment"
 	"github.com/CVDpl/go-live-srad/pkg/srad/wal"
-	blake3 "lukechampine.com/blake3"
+	blake3 "github.com/zeebo/blake3"
 )
 
 // segItem is an item produced by parallel segment workers.

@@ -12,7 +12,7 @@ import (
 	"github.com/CVDpl/go-live-srad/internal/common"
 	"github.com/CVDpl/go-live-srad/pkg/srad/manifest"
 	"github.com/CVDpl/go-live-srad/pkg/srad/segment"
-	blake3 "lukechampine.com/blake3"
+	blake3 "github.com/zeebo/blake3"
 )
 
 // Compactor manages LSM compaction.
