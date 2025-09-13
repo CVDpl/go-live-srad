@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -313,60 +314,71 @@ func (b *Builder) Build() (*Metadata, error) {
 }
 
 func (b *Builder) writeKeysFile(path string) error {
-	f, err := os.Create(path)
+	af, err := utils.NewAtomicFile(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer af.Close()
+
+	// Buffered writer to reduce syscall count
+	bw := bufio.NewWriterSize(af, 256*1024)
 
 	// Write common header with magic and version
-	if err := WriteCommonHeader(f, common.MagicKeys, common.VersionSegment); err != nil {
+	if err := WriteCommonHeader(bw, common.MagicKeys, common.VersionSegment); err != nil {
 		return err
 	}
 
 	// Write count
 	count := uint32(len(b.keys))
-	if err := binary.Write(f, binary.LittleEndian, count); err != nil {
+	if err := binary.Write(bw, binary.LittleEndian, count); err != nil {
 		return err
 	}
 	// Write each key (len + bytes)
 	for _, k := range b.keys {
 		kl := uint32(len(k))
-		if err := binary.Write(f, binary.LittleEndian, kl); err != nil {
+		if err := binary.Write(bw, binary.LittleEndian, kl); err != nil {
 			return err
 		}
-		if _, err := f.Write(k); err != nil {
+		if _, err := bw.Write(k); err != nil {
 			return err
 		}
 	}
-	return f.Sync()
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	return af.Commit()
 }
 
 func (b *Builder) writeTombstonesFile(path string) error {
-	f, err := os.Create(path)
+	af, err := utils.NewAtomicFile(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer af.Close()
+
+	bw := bufio.NewWriterSize(af, 256*1024)
 
 	// Write common header with magic and version
-	if err := WriteCommonHeader(f, common.MagicTombs, common.VersionSegment); err != nil {
+	if err := WriteCommonHeader(bw, common.MagicTombs, common.VersionSegment); err != nil {
 		return err
 	}
 	count := uint32(len(b.tombstoneKeys))
-	if err := binary.Write(f, binary.LittleEndian, count); err != nil {
+	if err := binary.Write(bw, binary.LittleEndian, count); err != nil {
 		return err
 	}
 	for _, k := range b.tombstoneKeys {
 		kl := uint32(len(k))
-		if err := binary.Write(f, binary.LittleEndian, kl); err != nil {
+		if err := binary.Write(bw, binary.LittleEndian, kl); err != nil {
 			return err
 		}
-		if _, err := f.Write(k); err != nil {
+		if _, err := bw.Write(k); err != nil {
 			return err
 		}
 	}
-	return nil
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	return af.Commit()
 }
 
 // trieNode represents a node in the trie.
