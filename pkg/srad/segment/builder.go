@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"github.com/CVDpl/go-live-srad/internal/filters"
 	"github.com/CVDpl/go-live-srad/pkg/srad/memtable"
 	"github.com/CVDpl/go-live-srad/pkg/srad/utils"
+	blake3 "github.com/zeebo/blake3"
 )
 
 // Builder creates immutable segment files from sorted key-value pairs.
@@ -35,6 +37,8 @@ type Builder struct {
 
 	// Options controlling emission
 	dropTombstones bool
+	// Hint that keys were added in sorted order (e.g., via AddFromMemtable)
+	alreadySorted bool
 
 	// Options
 	logger common.Logger
@@ -45,6 +49,10 @@ type Builder struct {
 	filterBloomFPR      float64
 	filterTrigramBits   uint64
 	filterTrigramScheme string
+	// Precomputed BLAKE3 hex sums (to avoid rereads)
+	filterBloomBlake3   string
+	filterTrigramBlake3 string
+	keysBlake3          string
 }
 
 // NewBuilder creates a new segment builder.
@@ -80,13 +88,12 @@ func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
 	}
 	sort.SliceStable(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
 
+	// Input is now sorted; allow Build() to skip resort/dedup
+	b.alreadySorted = true
+
 	// Add entries: drop tombstones from values, but record keys for future policies
 	for _, p := range pairs {
-		val := snapshot.GetValue(p.k)
-		if val == nil || val.IsExpired() {
-			continue
-		}
-		if val.Tombstone() {
+		if p.t {
 			kc := make([]byte, len(p.k))
 			copy(kc, p.k)
 			b.tombstoneKeys = append(b.tombstoneKeys, kc)
@@ -141,7 +148,7 @@ func (b *Builder) Build() (*Metadata, error) {
 	}
 
 	// Normalize: sort keys and deduplicate adjacent duplicates to reduce size and enable linear merges
-	if len(b.keys) > 1 {
+	if len(b.keys) > 1 && !b.alreadySorted {
 		idx := make([]int, len(b.keys))
 		for i := range idx {
 			idx[i] = i
@@ -287,13 +294,19 @@ func (b *Builder) Build() (*Metadata, error) {
 	if h, err := utils.ComputeBLAKE3File(tailsPath); err == nil {
 		metadata.Blake3["tails.dat"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(filtersDir, "prefix.bf")); err == nil {
+	if b.filterBloomBlake3 != "" {
+		metadata.Blake3["filters/prefix.bf"] = b.filterBloomBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(filtersDir, "prefix.bf")); err == nil {
 		metadata.Blake3["filters/prefix.bf"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(filtersDir, "tri.bits")); err == nil {
+	if b.filterTrigramBlake3 != "" {
+		metadata.Blake3["filters/tri.bits"] = b.filterTrigramBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(filtersDir, "tri.bits")); err == nil {
 		metadata.Blake3["filters/tri.bits"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(keysPath); err == nil {
+	if b.keysBlake3 != "" {
+		metadata.Blake3["keys.dat"] = b.keysBlake3
+	} else if h, err := utils.ComputeBLAKE3File(keysPath); err == nil {
 		metadata.Blake3["keys.dat"] = h
 	}
 	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
@@ -322,30 +335,34 @@ func (b *Builder) writeKeysFile(path string) error {
 
 	// Buffered writer to reduce syscall count
 	bw := bufio.NewWriterSize(af, 256*1024)
+	// Compute BLAKE3 while writing
+	hasher := blake3.New()
+	out := io.MultiWriter(bw, hasher)
 
 	// Write common header with magic and version
-	if err := WriteCommonHeader(bw, common.MagicKeys, common.VersionSegment); err != nil {
+	if err := WriteCommonHeader(out, common.MagicKeys, common.VersionSegment); err != nil {
 		return err
 	}
 
 	// Write count
 	count := uint32(len(b.keys))
-	if err := binary.Write(bw, binary.LittleEndian, count); err != nil {
+	if err := binary.Write(out, binary.LittleEndian, count); err != nil {
 		return err
 	}
 	// Write each key (len + bytes)
 	for _, k := range b.keys {
 		kl := uint32(len(k))
-		if err := binary.Write(bw, binary.LittleEndian, kl); err != nil {
+		if err := binary.Write(out, binary.LittleEndian, kl); err != nil {
 			return err
 		}
-		if _, err := bw.Write(k); err != nil {
+		if _, err := out.Write(k); err != nil {
 			return err
 		}
 	}
 	if err := bw.Flush(); err != nil {
 		return err
 	}
+	b.keysBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return af.Commit()
 }
 
@@ -637,9 +654,16 @@ func (b *Builder) buildBloomFilter(path string) error {
 	// Create Bloom filter with estimated size using default FPR
 	bloom := filters.NewBloomFilter(uint64(len(b.keys)), common.DefaultBloomFPR)
 
-	// Add all keys and their prefixes
+	// Add all keys and their prefixes (adaptive)
+	prefixLen := int(common.DefaultPrefixBloomLength)
+	if len(b.keys) > 10_000_000 && prefixLen > 4 {
+		prefixLen = prefixLen / 2
+		if prefixLen < 4 {
+			prefixLen = 4
+		}
+	}
 	for _, key := range b.keys {
-		bloom.AddPrefix(key, int(common.DefaultPrefixBloomLength)) // Add prefixes up to configured length
+		bloom.AddPrefix(key, prefixLen)
 	}
 
 	// Marshal the filter
@@ -652,18 +676,21 @@ func (b *Builder) buildBloomFilter(path string) error {
 		b.filterBloomFPR = common.DefaultBloomFPR
 	}
 
-	// Write 6B header + payload (no CRC/padding)
+	// Write 6B header + payload (no CRC/padding) with streaming hash
 	file, err := utils.NewAtomicFile(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	if err := WriteCommonHeader(file, common.MagicBloom, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicBloom, common.VersionSegment); err != nil {
 		return err
 	}
-	if _, err := file.Write(bloomData); err != nil {
+	if _, err := out.Write(bloomData); err != nil {
 		return err
 	}
+	b.filterBloomBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
@@ -680,18 +707,21 @@ func (b *Builder) buildTrigramFilter(path string) error {
 	b.filterTrigramBits = uint64(len(data)) * 8
 	b.filterTrigramScheme = "bitset"
 
-	// Write 6B header + payload (no CRC/padding)
+	// Write 6B header + payload (no CRC/padding) with streaming hash
 	file, err := utils.NewAtomicFile(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	if err := WriteCommonHeader(file, common.MagicTrigram, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicTrigram, common.VersionSegment); err != nil {
 		return err
 	}
-	if _, err := file.Write(data); err != nil {
+	if _, err := out.Write(data); err != nil {
 		return err
 	}
+	b.filterTrigramBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
