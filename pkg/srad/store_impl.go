@@ -1365,6 +1365,10 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		enableTri := s.opts.EnableTrigramFilter
 		b.ConfigureFilters(bloomFPR, prefixLen, enableTri)
 		b.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
+		// If AsyncFilterBuild is enabled, skip inline filter generation to shorten Flush wall-clock
+		if s.opts.AsyncFilterBuild {
+			b.SetSkipFilters(true)
+		}
 	}
 
 	type partResult struct {

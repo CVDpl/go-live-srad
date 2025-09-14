@@ -174,11 +174,35 @@ This fallback only affects how work is split during Flush/Compaction. It does no
 ### AsyncFilterBuild
 
 - `AsyncFilterBuild = true` enables building missing filters (`filters/prefix.bf`, `filters/tri.bits`) in the background after flush/compaction.
+- When enabled, the builder skips inline filter generation during Flush/Compact to shorten the critical path; filters are produced shortly after by a background task that scans active segments.
 - Queries are correct even without filters; filters only accelerate reads.
 
 ```go
 opts := srad.DefaultOptions()
-opts.AsyncFilterBuild = true
+opts.AsyncFilterBuild = true // skip inline filter build, do it in background
+```
+
+Behavior and guidance:
+
+- Inline filter build is entirely skipped during Flush/Compact when `AsyncFilterBuild` is true. Background filter build starts after segments are persisted and added to the manifest.
+- If `EnableTrigramFilter` is false, only `prefix.bf` is produced (less CPU and disk).
+- For bulk imports, combine with range partitions and higher shard counts to maximize CPU and reduce elapsed time of the critical path.
+
+Bulk import example:
+
+```go
+opts := srad.DefaultOptions()
+opts.DisableBackgroundCompaction = true // compact later, outside critical path
+opts.AsyncFilterBuild = true             // filters in background, not inline
+opts.EnableTrigramFilter = false         // optional: less CPU during filter build
+opts.PrefixBloomFPR = 0.03
+opts.PrefixBloomMaxPrefixLen = 8
+opts.BuildRangePartitions = 12           // or runtime.NumCPU()/2
+opts.BuildMaxShards = runtime.NumCPU()
+store, _ := srad.Open(dir, opts)
+// ... bulk load ...
+store.Flush(ctx)       // writes segments fast; filters will follow asynchronously
+// Optionally run compaction later, then allow background filter builder to finish
 ```
 
 ### Flush behavior

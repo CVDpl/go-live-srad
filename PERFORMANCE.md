@@ -149,7 +149,13 @@ Guidance:
 ### 8. AsyncFilterBuild
 
 - Enable `AsyncFilterBuild` to build missing filters in the background after flush/compaction.
+- When enabled, inline filter generation is skipped during Flush/Compact; CPU is spent asynchronously after segments are persisted and registered in the manifest. This shortens wall-clock of the critical phase (bulk import) at the cost of background CPU shortly after.
 - Largest benefit in batch workloads: prioritize flush time, and let read-accelerating filters catch up shortly after.
+
+Tips:
+- Set `EnableTrigramFilter = false` if substring search acceleration is not immediately needed.
+- Reduce `PrefixBloomMaxPrefixLen` (e.g., 4–8) or increase `PrefixBloomFPR` (e.g., 0.03) to further reduce filter build time.
+- Filters are optional for correctness; queries work without them, just slower.
 
 ### 7. Flush strategy
 

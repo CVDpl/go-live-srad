@@ -74,6 +74,9 @@ type Builder struct {
 	maxShards         int
 	shardMinKeys      int
 	bloomAdaptMinKeys int
+
+	// When true, Build() skips generating filter files; caller can build them later asynchronously.
+	skipFilterBuild bool
 }
 
 // pair holds key and tombstone flag used during snapshot sorting.
@@ -224,6 +227,10 @@ func (b *Builder) ConfigureBuild(maxShards, shardMinKeys, bloomAdaptMinKeys int)
 	}
 }
 
+// SetSkipFilters controls whether Build() should skip generating filter files.
+// When set to true, filters can be generated later via BuildBloomOnly/BuildTrigramOnly.
+func (b *Builder) SetSkipFilters(skip bool) { b.skipFilterBuild = skip }
+
 // Build creates the segment files.
 func (b *Builder) Build() (*Metadata, error) {
 	if len(b.keys) == 0 && len(b.tombstoneKeys) == 0 {
@@ -283,13 +290,15 @@ func (b *Builder) Build() (*Metadata, error) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 8)
 	// filters
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := b.buildFilters(filtersDir); err != nil {
-			errCh <- err
-		}
-	}()
+	if !b.skipFilterBuild {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.buildFilters(filtersDir); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 	// keys.dat
 	wg.Add(1)
 	go func() {
