@@ -120,6 +120,18 @@ type Options struct {
 
 	// WALBufferSize overrides the WAL write buffer size in bytes (0 = default).
 	WALBufferSize int
+
+	// PrefixBloomFPR sets Bloom filter target false positive rate (0 => default).
+	PrefixBloomFPR float64
+	// PrefixBloomMaxPrefixLen limits prefix length added to Bloom (0 => default).
+	PrefixBloomMaxPrefixLen int
+	// EnableTrigramFilter toggles trigram filter generation (default: true).
+	EnableTrigramFilter bool
+
+	// Build parallelization knobs (0 => auto defaults)
+	BuildMaxShards       int // cap parallel shards for builder tasks (Bloom/Trigram)
+	BuildShardMinKeys    int // below this key count, disable sharding (use 1 shard)
+	BloomAdaptiveMinKeys int // above this, reduce Bloom prefix work
 }
 
 // QueryOptions configures query execution.
@@ -298,6 +310,12 @@ func DefaultOptions() *Options {
 		WALRotateSize:               0,
 		WALMaxFileSize:              0,
 		WALBufferSize:               0,
+		PrefixBloomFPR:              common.DefaultBloomFPR,
+		PrefixBloomMaxPrefixLen:     int(common.DefaultPrefixBloomLength),
+		EnableTrigramFilter:         true,
+		BuildMaxShards:              8,
+		BuildShardMinKeys:           200000,
+		BloomAdaptiveMinKeys:        10000000,
 	}
 }
 

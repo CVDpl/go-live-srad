@@ -38,8 +38,11 @@ type storeImpl struct {
 	logger common.Logger
 
 	// Core components
-	wal      *wal.WAL
-	memtable *memtable.Memtable
+	wal         *wal.WAL
+	memtablePtr atomic.Pointer[memtable.Memtable]
+
+	// Guard to serialize memtable swap with in-flight writes
+	mtGuard sync.RWMutex
 
 	// State
 	closed   int32 // atomic
@@ -171,7 +174,7 @@ func Open(dir string, opts *Options) (Store, error) {
 	}
 
 	// Initialize memtable
-	s.memtable = memtable.New()
+	s.memtablePtr.Store(memtable.New())
 
 	// Replay WAL to restore memtable
 	if s.wal != nil {
@@ -230,9 +233,11 @@ func (s *storeImpl) Close() error {
 	s.stopBackgroundTasks()
 
 	// Flush memtable if not read-only
-	if !s.readonly && s.memtable.Count() > 0 {
-		if err := s.Flush(context.Background()); err != nil {
-			s.logger.Error("failed to flush on close", "error", err)
+	if !s.readonly {
+		if mt := s.memtablePtr.Load(); mt != nil && mt.Count() > 0 {
+			if err := s.Flush(context.Background()); err != nil {
+				s.logger.Error("failed to flush on close", "error", err)
+			}
 		}
 	}
 
@@ -268,8 +273,16 @@ func (s *storeImpl) InsertWithTTL(key []byte, ttl time.Duration) error {
 		return fmt.Errorf("write to WAL: %w", err)
 	}
 
-	// Insert into memtable
-	if err := s.memtable.InsertWithTTL(key, ttl); err != nil {
+	// Insert into current memtable (atomic load) under read guard
+	s.mtGuard.RLock()
+	mt := s.memtablePtr.Load()
+	if mt == nil {
+		s.mtGuard.RUnlock()
+		return fmt.Errorf("memtable not initialized")
+	}
+	err := mt.InsertWithTTL(key, ttl)
+	s.mtGuard.RUnlock()
+	if err != nil {
 		return fmt.Errorf("insert to memtable: %w", err)
 	}
 
@@ -299,8 +312,16 @@ func (s *storeImpl) Delete(key []byte) error {
 		return fmt.Errorf("write to WAL: %w", err)
 	}
 
-	// Mark as deleted in memtable (tombstone)
-	if err := s.memtable.Delete(key); err != nil {
+	// Mark as deleted in memtable (tombstone) under read guard
+	s.mtGuard.RLock()
+	mt := s.memtablePtr.Load()
+	if mt == nil {
+		s.mtGuard.RUnlock()
+		return fmt.Errorf("memtable not initialized")
+	}
+	err := mt.Delete(key)
+	s.mtGuard.RUnlock()
+	if err != nil {
 		return fmt.Errorf("delete from memtable: %w", err)
 	}
 
@@ -340,8 +361,12 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	}
 	defer s.mu.RUnlock()
 
-	memIter := s.memtable.RegexSearch(re)
-
+	// Use a snapshot to avoid racing with concurrent writers
+	var memIter *memtable.Iterator
+	if mt := s.memtablePtr.Load(); mt != nil {
+		snap := mt.Snapshot()
+		memIter = snap.RegexSearch(re)
+	}
 	// Preload tombstones from all readers to suppress older duplicates
 	preSeen := make(map[string]struct{}, 1024)
 	for _, reader := range s.readers {
@@ -350,7 +375,6 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			return true
 		})
 	}
-
 	// If no segments, return simple iterator
 	if len(s.readers) == 0 {
 		return &simpleIterator{
@@ -843,7 +867,7 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	}
 
 	// Memtable first
-	snapshot := s.memtable.Snapshot()
+	snapshot := s.memtablePtr.Load().Snapshot()
 	all := memtable.NewAllIterator(snapshot)
 	for all.Next() {
 		k := all.Key()
@@ -1082,48 +1106,76 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		return common.ErrReadOnly
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.memtable.Count() == 0 {
-		// If there are no inserts but there are tombstones, still flush to persist deletions
-		if s.memtable.DeletedCount() == 0 {
-			return nil // Nothing to flush
-		}
-	}
-
 	start := time.Now()
-	s.logger.Info("starting flush", "entries", s.memtable.Count())
 
-	// Create a snapshot of the memtable
-	snapshot := s.memtable.Snapshot()
-
-	// Build segment from memtable
+	// Freeze-and-swap memtable under a short lock
+	s.mu.Lock()
+	s.mtGuard.Lock()
+	oldMem := s.memtablePtr.Swap(memtable.New())
+	if oldMem == nil {
+		s.mu.Unlock()
+		s.mtGuard.Unlock()
+		return nil // Nothing to flush
+	}
+	oldCount := oldMem.Count()
+	oldDeleted := oldMem.DeletedCount()
+	if oldCount == 0 && oldDeleted == 0 {
+		s.mu.Unlock()
+		s.mtGuard.Unlock()
+		return nil // Nothing to flush
+	}
+	// Reserve a new segment ID and cache dir while under lock
 	segmentID := atomic.AddUint64(&s.nextSegmentID, 1)
 	segmentsDir := filepath.Join(s.dir, common.DirSegments)
+	s.mu.Unlock()
 
+	s.logger.Info("starting flush", "entries", oldCount)
+
+	// Snapshot the frozen memtable after swap; this will include any in-flight writes to old memtable
+	snapshot := oldMem.Snapshot()
+	s.mtGuard.Unlock()
+
+	// Build segment from snapshot (outside of store lock)
 	builder := segment.NewBuilder(segmentID, common.LevelL0, segmentsDir, s.logger)
+	// Configure filters from options
+	bloomFPR := s.opts.PrefixBloomFPR
+	if bloomFPR <= 0 {
+		bloomFPR = common.DefaultBloomFPR
+	}
+	prefixLen := s.opts.PrefixBloomMaxPrefixLen
+	if prefixLen <= 0 {
+		prefixLen = int(common.DefaultPrefixBloomLength)
+	}
+	enableTri := s.opts.EnableTrigramFilter
+	builder.ConfigureFilters(bloomFPR, prefixLen, enableTri)
+	// Configure build sharding/adaptive
+	builder.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
 	if err := builder.AddFromMemtable(snapshot); err != nil {
+		// Rollback: reinsert snapshot into current memtable to avoid data loss
+		s.rollbackSnapshotIntoMemtable(snapshot)
 		return fmt.Errorf("add memtable to builder: %w", err)
 	}
 
 	metadata, err := builder.Build()
 	if err != nil {
+		// Rollback to preserve data
+		s.rollbackSnapshotIntoMemtable(snapshot)
 		return fmt.Errorf("build segment: %w", err)
 	}
-
-	// Add segment to list
-	s.segments = append(s.segments, metadata)
 
 	// Open reader for the new segment so queries can see it immediately
 	reader, rerr := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
 	if rerr != nil {
-		// Non-fatal: log and continue
+		// Non-fatal: log and continue (we still register the segment in manifest)
 		s.logger.Warn("failed to open reader for new segment", "id", segmentID, "error", rerr)
-	} else {
-		s.readers = append(s.readers, reader)
 	}
 
+	// Update in-memory state and manifest under lock
+	s.mu.Lock()
+	s.segments = append(s.segments, metadata)
+	if rerr == nil {
+		s.readers = append(s.readers, reader)
+	}
 	// Add to manifest if available
 	if s.manifest != nil {
 		info := manifest.SegmentInfo{
@@ -1143,17 +1195,14 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			s.logger.Warn("failed to add segment to manifest", "error", err)
 		}
 	}
-
 	// Refresh stats after flush
 	s.updateStatsFromManifest()
+	s.mu.Unlock()
 
-	// Sync WAL
+	// Sync WAL after persisting the segment
 	if err := s.wal.Sync(); err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
 	}
-
-	// Create new memtable
-	s.memtable = memtable.New()
 
 	// Rotate WAL to start a fresh file after flush
 	if s.wal != nil && s.opts.RotateWALOnFlush {
@@ -1169,6 +1218,24 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	s.logger.Info("flush completed", "duration", time.Since(start), "segmentID", segmentID)
 
 	return nil
+}
+
+// rollbackSnapshotIntoMemtable reinserts snapshot data back into the active memtable on flush failure.
+func (s *storeImpl) rollbackSnapshotIntoMemtable(snapshot *memtable.Snapshot) {
+	if snapshot == nil {
+		return
+	}
+	// Best-effort reinsertion (no WAL writes; WAL already contains original ops)
+	keys, tombs := snapshot.GetAllWithTombstones()
+	for i := range keys {
+		if mt := s.memtablePtr.Load(); mt != nil {
+			if tombs[i] {
+				_ = mt.Delete(keys[i])
+			} else {
+				_ = mt.InsertWithTTL(keys[i], 0)
+			}
+		}
+	}
 }
 
 // RCUEnabled returns whether RCU is enabled.
@@ -1229,12 +1296,20 @@ func (s *storeImpl) replayWAL() error {
 	err := s.wal.Replay(func(op uint8, key []byte, ttl time.Duration) error {
 		switch op {
 		case common.OpInsert:
-			if err := s.memtable.InsertWithTTL(key, ttl); err != nil {
-				return err
+			if mt := s.memtablePtr.Load(); mt != nil {
+				if err := mt.InsertWithTTL(key, ttl); err != nil {
+					return err
+				}
+			} else {
+				return fmt.Errorf("memtable not initialized")
 			}
 		case common.OpDelete:
-			if err := s.memtable.Delete(key); err != nil {
-				return err
+			if mt := s.memtablePtr.Load(); mt != nil {
+				if err := mt.Delete(key); err != nil {
+					return err
+				}
+			} else {
+				return fmt.Errorf("memtable not initialized")
 			}
 		default:
 			s.logger.Warn("unknown operation in WAL", "op", op)
@@ -1253,7 +1328,10 @@ func (s *storeImpl) replayWAL() error {
 
 // shouldFlush checks if the memtable should be flushed.
 func (s *storeImpl) shouldFlush() bool {
-	return s.memtable.Size() >= s.opts.MemtableTargetBytes
+	if mt := s.memtablePtr.Load(); mt != nil {
+		return mt.Size() >= s.opts.MemtableTargetBytes
+	}
+	return false
 }
 
 // triggerFlush triggers an asynchronous flush.

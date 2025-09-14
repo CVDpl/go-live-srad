@@ -86,126 +86,32 @@ val := fetchFromStore(key)
 cache.Put(key, val)
 ```
 
+### 6. Builder parallelization and filter tuning
+
+- Use sharding knobs for large builds:
+  - `BuildMaxShards`: cap parallelism for Bloom/Trigram build
+  - `BuildShardMinKeys`: disable sharding for small batches
+  - `BloomAdaptiveMinKeys`: threshold above which Bloom reduces prefix length
+- Tune filters per workload:
+  - `PrefixBloomFPR`, `PrefixBloomMaxPrefixLen`, `EnableTrigramFilter`
+
+Example:
+```go
+opts := srad.DefaultOptions()
+opts.BuildMaxShards = 8
+opts.BuildShardMinKeys = 300000
+opts.BloomAdaptiveMinKeys = 8000000
+opts.PrefixBloomFPR = 0.02
+opts.PrefixBloomMaxPrefixLen = 8
+opts.EnableTrigramFilter = false
+```
+
+### 7. Flush strategy
+
+- Flush uses freeze-and-swap memtable to minimize lock time and avoid write loss; building segments happens outside the store lock.
+
 ## Tuning Parameters
 
 ### Store Options
 
-Use `srad.DefaultOptions()` and override as needed:
-
-```go
-opts := srad.DefaultOptions()
-opts.MemtableTargetBytes = 512 * 1024 * 1024
-opts.CacheLabelAdvanceBytes = 32 * 1024 * 1024
-opts.CacheNFATransitionBytes = 32 * 1024 * 1024
-opts.RCUCleanupInterval = 30 * time.Second
-// WAL tuning (0 = defaults from internal/common)
-opts.WALRotateSize = 0
-opts.WALMaxFileSize = 0
-opts.WALBufferSize = 0
-```
-
-### Compaction Tuning
-
-```go
-compactionPriority := 3
-memtable := int64(512 * 1024 * 1024)
-labelCache := int64(32 * 1024 * 1024)
-nfaCache := int64(32 * 1024 * 1024)
-store.Tune(srad.TuningParams{
-    MemtableTargetBytes:     &memtable,
-    CacheLabelAdvanceBytes:  &labelCache,
-    CacheNFATransitionBytes: &nfaCache,
-    CompactionPriority:      &compactionPriority,
-})
-```
-
-## Benchmarks
-
-Benchmarks depend on workload and hardware. Run your own on target machines:
-
-```bash
-go test -bench=. ./pkg/srad
-```
-
-### Memory Usage
-
-| Operation | Memory Usage | GC Pressure |
-|-----------|-------------|-------------|
-| Insert 1M keys | 150MB | Low |
-| Search 100K patterns | 50MB | Medium |
-| Compaction | 200MB | High |
-| Idle | 20MB | None |
-
-## Best Practices
-
-### 1. Key Design
-- Keep keys short (< 256 bytes)
-- Use hierarchical naming (e.g., `user:john:profile`)
-- Avoid special characters in keys
-
-### 2. Write Patterns
-- Batch small writes together
-- Use sequential keys when possible
-- Avoid random deletes (creates tombstones)
-
-### 3. Search Optimization
-- Use prefix searches when possible
-- Compile regex patterns once and reuse
-- Limit result set with QueryOptions
-
-### 4. Maintenance
-- Monitor segment count per level
-- Run manual compaction during low traffic
-- Rotate WAL files periodically
-- After flush/compaction, consider calling `PruneWAL()` to remove obsolete WAL files. Enabling `RotateWALOnFlush` makes older files eligible for immediate pruning.
-
-### 5. Resource Management
-- Set appropriate file descriptor limits
-- Monitor memory usage
-- Use read-only mode for analytics
-
-## Monitoring Metrics
-
-Key metrics to monitor:
-
-1. **Write metrics**
-   - Inserts per second
-   - WAL sync latency
-   - Memtable flush frequency
-
-2. **Read metrics**
-   - Searches per second
-   - Search latency (P50, P95, P99)
-   - Cache hit ratio
-
-3. **Storage metrics**
-   - Segment count by level
-   - Total disk usage
-   - Compaction frequency
-
-4. **System metrics**
-   - Memory usage
-   - CPU utilization
-   - File descriptor usage
-
-## Troubleshooting
-
-### High Write Latency
-- Check WAL sync frequency
-- Increase memtable size
-- Enable batch writes
-
-### Slow Searches
-- Check segment count
-- Verify bloom filters are enabled
-- Consider adding cache layer
-
-### High Memory Usage
-- Reduce memtable size
-- Limit concurrent operations
-- Enable compression
-
-### Too Many Segments
-- Trigger manual compaction
-- Adjust compaction priority via Tune
-- Check for write stalls
+Use `

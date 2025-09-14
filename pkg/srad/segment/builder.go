@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 
 	"github.com/CVDpl/go-live-srad/internal/common"
 	"github.com/CVDpl/go-live-srad/internal/encoding"
@@ -53,6 +55,16 @@ type Builder struct {
 	filterBloomBlake3   string
 	filterTrigramBlake3 string
 	keysBlake3          string
+
+	// Filter configuration (0/false => defaults)
+	customBloomFPR  float64
+	customPrefixLen int
+	enableTrigram   bool
+
+	// Build parallelization config
+	maxShards         int
+	shardMinKeys      int
+	bloomAdaptMinKeys int
 }
 
 // NewBuilder creates a new segment builder.
@@ -62,10 +74,11 @@ func NewBuilder(segmentID uint64, level int, dir string, logger common.Logger) *
 	}
 
 	return &Builder{
-		segmentID: segmentID,
-		level:     level,
-		dir:       dir,
-		logger:    logger,
+		segmentID:     segmentID,
+		level:         level,
+		dir:           dir,
+		logger:        logger,
+		enableTrigram: true,
 	}
 }
 
@@ -86,7 +99,7 @@ func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
 	for i := range allKeys {
 		pairs[i] = pair{k: allKeys[i], t: tombs[i]}
 	}
-	sort.SliceStable(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
+	sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
 
 	// Input is now sorted; allow Build() to skip resort/dedup
 	b.alreadySorted = true
@@ -141,6 +154,30 @@ func (b *Builder) AddTombstone(key []byte) {
 	b.tombstoneKeys = append(b.tombstoneKeys, kc)
 }
 
+// ConfigureFilters sets filter-related options for this builder.
+func (b *Builder) ConfigureFilters(bloomFPR float64, prefixLen int, enableTrigram bool) {
+	if bloomFPR > 0 {
+		b.customBloomFPR = bloomFPR
+	}
+	if prefixLen > 0 {
+		b.customPrefixLen = prefixLen
+	}
+	b.enableTrigram = enableTrigram
+}
+
+// ConfigureBuild sets parallelization and adaptive thresholds.
+func (b *Builder) ConfigureBuild(maxShards, shardMinKeys, bloomAdaptMinKeys int) {
+	if maxShards > 0 {
+		b.maxShards = maxShards
+	}
+	if shardMinKeys > 0 {
+		b.shardMinKeys = shardMinKeys
+	}
+	if bloomAdaptMinKeys > 0 {
+		b.bloomAdaptMinKeys = bloomAdaptMinKeys
+	}
+}
+
 // Build creates the segment files.
 func (b *Builder) Build() (*Metadata, error) {
 	if len(b.keys) == 0 && len(b.tombstoneKeys) == 0 {
@@ -192,51 +229,55 @@ func (b *Builder) Build() (*Metadata, error) {
 		return nil, fmt.Errorf("create filters directory: %w", err)
 	}
 
+	// Kick off parallel tasks that don't depend on trie
+	keysPath := filepath.Join(segmentDir, "keys.dat")
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := b.buildFilters(filtersDir); err != nil {
+			errCh <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := b.writeKeysFile(keysPath); err != nil {
+			errCh <- err
+		}
+	}()
+
 	b.logger.Info("building segment", "id", b.segmentID, "keys", len(b.keys))
 
 	// Build trie structure (simplified for now)
 	trie := b.buildTrie()
 
-	// Build LOUDS representation
-	loudsPath := filepath.Join(segmentDir, "index.louds")
-	if err := b.buildLOUDS(trie, loudsPath); err != nil {
+	// Build LOUDS/Edges/Accept/TMap/Tails sequentially (depend on trie)
+	if err := b.buildLOUDS(trie, filepath.Join(segmentDir, "index.louds")); err != nil {
 		return nil, fmt.Errorf("build LOUDS: %w", err)
 	}
-
-	// Build edges
-	edgesPath := filepath.Join(segmentDir, "index.edges")
-	if err := b.buildEdges(trie, edgesPath); err != nil {
+	if err := b.buildEdges(trie, filepath.Join(segmentDir, "index.edges")); err != nil {
 		return nil, fmt.Errorf("build edges: %w", err)
 	}
-
-	// Build accept states
-	acceptPath := filepath.Join(segmentDir, "index.accept")
-	if err := b.buildAccept(trie, acceptPath); err != nil {
+	if err := b.buildAccept(trie, filepath.Join(segmentDir, "index.accept")); err != nil {
 		return nil, fmt.Errorf("build accept: %w", err)
 	}
-
-	// Build tail mapping (simplified - no tails for now)
-	tmapPath := filepath.Join(segmentDir, "index.tmap")
-	if err := b.buildTMap(tmapPath); err != nil {
+	if err := b.buildTMap(filepath.Join(segmentDir, "index.tmap")); err != nil {
 		return nil, fmt.Errorf("build tmap: %w", err)
 	}
-
-	// Build tails data (simplified - no tails for now)
-	tailsPath := filepath.Join(segmentDir, "tails.dat")
-	if err := b.buildTails(tailsPath); err != nil {
+	if err := b.buildTails(filepath.Join(segmentDir, "tails.dat")); err != nil {
 		return nil, fmt.Errorf("build tails: %w", err)
 	}
 
-	// Build filters
-	if err := b.buildFilters(filtersDir); err != nil {
-		return nil, fmt.Errorf("build filters: %w", err)
+	// Wait for parallel tasks
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		if e != nil {
+			return nil, e
+		}
 	}
 
-	// Write keys file for simple iteration
-	keysPath := filepath.Join(segmentDir, "keys.dat")
-	if err := b.writeKeysFile(keysPath); err != nil {
-		return nil, fmt.Errorf("write keys.dat: %w", err)
-	}
 	// Optionally write tombstones file (can be omitted when unnecessary)
 	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
 		tombPath := filepath.Join(segmentDir, "tombstones.dat")
@@ -244,6 +285,7 @@ func (b *Builder) Build() (*Metadata, error) {
 			return nil, fmt.Errorf("write tombstones.dat: %w", err)
 		}
 	}
+
 	// Create metadata
 	metadata := NewMetadata(b.segmentID, b.level)
 	// Ensure key range is populated even for tombstone-only segments
@@ -279,19 +321,19 @@ func (b *Builder) Build() (*Metadata, error) {
 	}
 	// Compute BLAKE3 for key files we generate here
 	metadata.Blake3 = map[string]string{}
-	if h, err := utils.ComputeBLAKE3File(loudsPath); err == nil {
+	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.louds")); err == nil {
 		metadata.Blake3["index.louds"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(edgesPath); err == nil {
+	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.edges")); err == nil {
 		metadata.Blake3["index.edges"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(acceptPath); err == nil {
+	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.accept")); err == nil {
 		metadata.Blake3["index.accept"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(tmapPath); err == nil {
+	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.tmap")); err == nil {
 		metadata.Blake3["index.tmap"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(tailsPath); err == nil {
+	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "tails.dat")); err == nil {
 		metadata.Blake3["tails.dat"] = h
 	}
 	if b.filterBloomBlake3 != "" {
@@ -334,7 +376,7 @@ func (b *Builder) writeKeysFile(path string) error {
 	defer af.Close()
 
 	// Buffered writer to reduce syscall count
-	bw := bufio.NewWriterSize(af, 256*1024)
+	bw := bufio.NewWriterSize(af, 2<<20)
 	// Compute BLAKE3 while writing
 	hasher := blake3.New()
 	out := io.MultiWriter(bw, hasher)
@@ -373,7 +415,7 @@ func (b *Builder) writeTombstonesFile(path string) error {
 	}
 	defer af.Close()
 
-	bw := bufio.NewWriterSize(af, 256*1024)
+	bw := bufio.NewWriterSize(af, 2<<20)
 
 	// Write common header with magic and version
 	if err := WriteCommonHeader(bw, common.MagicTombs, common.VersionSegment); err != nil {
@@ -641,9 +683,11 @@ func (b *Builder) buildFilters(dir string) error {
 	}
 
 	// Build trigram filter
-	trigramPath := filepath.Join(dir, "tri.bits")
-	if err := b.buildTrigramFilter(trigramPath); err != nil {
-		return fmt.Errorf("build trigram filter: %w", err)
+	if b.enableTrigram {
+		trigramPath := filepath.Join(dir, "tri.bits")
+		if err := b.buildTrigramFilter(trigramPath); err != nil {
+			return fmt.Errorf("build trigram filter: %w", err)
+		}
 	}
 
 	return nil
@@ -651,29 +695,78 @@ func (b *Builder) buildFilters(dir string) error {
 
 // buildBloomFilter builds the prefix bloom filter.
 func (b *Builder) buildBloomFilter(path string) error {
-	// Create Bloom filter with estimated size using default FPR
-	bloom := filters.NewBloomFilter(uint64(len(b.keys)), common.DefaultBloomFPR)
-
-	// Add all keys and their prefixes (adaptive)
-	prefixLen := int(common.DefaultPrefixBloomLength)
-	if len(b.keys) > 10_000_000 && prefixLen > 4 {
+	// Resolve parameters
+	fpr := b.customBloomFPR
+	if fpr <= 0 {
+		fpr = common.DefaultBloomFPR
+	}
+	prefixLen := b.customPrefixLen
+	if prefixLen <= 0 {
+		prefixLen = int(common.DefaultPrefixBloomLength)
+	}
+	// Adaptively reduce prefix work for very large inputs
+	adaptMin := b.bloomAdaptMinKeys
+	if adaptMin <= 0 {
+		adaptMin = 10_000_000
+	}
+	if len(b.keys) > adaptMin && prefixLen > 4 {
 		prefixLen = prefixLen / 2
 		if prefixLen < 4 {
 			prefixLen = 4
 		}
 	}
-	for _, key := range b.keys {
-		bloom.AddPrefix(key, prefixLen)
+
+	// Sharded build for parallelism
+	shards := runtime.GOMAXPROCS(0)
+	cap := b.maxShards
+	if cap <= 0 {
+		cap = 8
+	}
+	if shards > cap {
+		shards = cap
+	}
+	minKeys := b.shardMinKeys
+	if minKeys <= 0 {
+		minKeys = 200_000
+	}
+	if len(b.keys) < minKeys {
+		shards = 1
+	}
+	local := make([]*filters.BloomFilter, shards)
+	var wg sync.WaitGroup
+	wg.Add(shards)
+	for sidx := 0; sidx < shards; sidx++ {
+		s := sidx
+		go func() {
+			defer wg.Done()
+			bf := filters.NewBloomFilter(uint64(len(b.keys)), fpr)
+			start := (len(b.keys) * s) / shards
+			end := (len(b.keys) * (s + 1)) / shards
+			for i := start; i < end; i++ {
+				bf.AddPrefix(b.keys[i], prefixLen)
+			}
+			local[s] = bf
+		}()
+	}
+	wg.Wait()
+	// Merge shards
+	var bloom *filters.BloomFilter
+	for _, bf := range local {
+		if bloom == nil {
+			bloom = bf
+			continue
+		}
+		_ = bloom.Merge(bf)
 	}
 
 	// Marshal the filter
 	bloomData := bloom.Marshal()
 
-	// Capture bloom params by reading header of bloomData
+	// Capture bloom params
 	if len(bloomData) >= 16 {
 		b.filterBloomBits = binary.LittleEndian.Uint64(bloomData[0:8])
 		b.filterBloomK = binary.LittleEndian.Uint32(bloomData[8:12])
-		b.filterBloomFPR = common.DefaultBloomFPR
+		b.filterBloomFPR = fpr
 	}
 
 	// Write 6B header + payload (no CRC/padding) with streaming hash
@@ -696,12 +789,54 @@ func (b *Builder) buildBloomFilter(path string) error {
 
 // buildTrigramFilter builds the trigram filter.
 func (b *Builder) buildTrigramFilter(path string) error {
-	// Build trigram filter from keys
-	tri := filters.NewTrigramFilter()
-	for _, k := range b.keys {
-		tri.AddString(k)
+	// Build trigram filter from keys using sharded OR
+	shards := runtime.GOMAXPROCS(0)
+	cap := b.maxShards
+	if cap <= 0 {
+		cap = 8
 	}
-	data := tri.Marshal()
+	if shards > cap {
+		shards = cap
+	}
+	minKeys := b.shardMinKeys
+	if minKeys <= 0 {
+		minKeys = 200_000
+	}
+	if len(b.keys) < minKeys {
+		shards = 1
+	}
+	tmp := make([][]byte, shards)
+	var wg sync.WaitGroup
+	wg.Add(shards)
+	for sidx := 0; sidx < shards; sidx++ {
+		s := sidx
+		go func() {
+			defer wg.Done()
+			tri := filters.NewTrigramFilter()
+			start := (len(b.keys) * s) / shards
+			end := (len(b.keys) * (s + 1)) / shards
+			for i := start; i < end; i++ {
+				tri.AddString(b.keys[i])
+			}
+			tmp[s] = tri.Marshal()
+		}()
+	}
+	wg.Wait()
+	// OR all shards
+	var data []byte
+	for _, part := range tmp {
+		if len(part) == 0 {
+			continue
+		}
+		if data == nil {
+			data = make([]byte, len(part))
+			copy(data, part)
+			continue
+		}
+		for i := range data {
+			data[i] |= part[i]
+		}
+	}
 
 	// Store trigram metadata
 	b.filterTrigramBits = uint64(len(data)) * 8

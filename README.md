@@ -96,25 +96,60 @@ type Store interface {
 
 ```go
 type Options struct {
-    ReadOnly                bool
-    Parallelism            int
-    VerifyChecksumsOnLoad  bool
-    MemtableTargetBytes    int64
-    CacheLabelAdvanceBytes int64
-    CacheNFATransitionBytes int64
-    EnableRCU              bool
-    RCUCleanupInterval     time.Duration
-    Logger                 Logger
-    DisableAutotuner       bool
-    DisableAutoFlush       bool
-    DefaultTTL              time.Duration
+    ReadOnly                 bool
+    Parallelism              int
+    VerifyChecksumsOnLoad    bool
+    MemtableTargetBytes      int64
+    CacheLabelAdvanceBytes   int64
+    CacheNFATransitionBytes  int64
+    EnableRCU                bool
+    RCUCleanupInterval       time.Duration
+    Logger                   Logger
+    DisableAutotuner         bool
+    DisableAutoFlush         bool
+    DefaultTTL               time.Duration
     DisableBackgroundCompaction bool
-    RotateWALOnFlush        bool
-    WALRotateSize           int64
-    WALMaxFileSize          int64
-    WALBufferSize           int
+    RotateWALOnFlush         bool
+    WALRotateSize            int64
+    WALMaxFileSize           int64
+    WALBufferSize            int
+    PrefixBloomFPR           float64 // default 0.01
+    PrefixBloomMaxPrefixLen  int     // default 16
+    EnableTrigramFilter      bool    // default true
+
+    // Build parallelization knobs (0 => auto)
+    BuildMaxShards           int
+    BuildShardMinKeys        int
+    BloomAdaptiveMinKeys     int
 }
 ```
+
+Przykład strojenia budowy dużych segmentów:
+```go
+opts := srad.DefaultOptions()
+opts.BuildMaxShards = 8          // limit równoległych shardów
+opts.BuildShardMinKeys = 300000  // poniżej progu nie dziel na shardy
+opts.BloomAdaptiveMinKeys = 8_000_000 // wcześniej redukuj prefiksy Blooma
+```
+
+### Filters
+
+- Prefix Bloom: controls FPR and maks. długość prefiksu dodawaną do filtra.
+- Trigram: można wyłączyć dla bardzo dużych wsadów lub gdy nie korzystasz z wyszukiwań podciągów.
+
+Przykład:
+```go
+opts := srad.DefaultOptions()
+opts.PrefixBloomFPR = 0.02            // szybsza budowa, mniejszy filtr
+opts.PrefixBloomMaxPrefixLen = 8      // mniej pracy na klucz
+opts.EnableTrigramFilter = false      // pominąć tri.bits
+store, _ := srad.Open(dir, opts)
+```
+
+### Flush behavior
+
+- Flush używa strategii freeze-and-swap: najpierw zamiana `memtable` na nową pod krótką blokadą, a następnie budowa segmentu ze „starej” zamrożonej kopii poza lockiem. Nowe inserty nie blokują się długo i nie znikają z widoku.
+- Budowa artefaktów jest równoległa: `keys.dat` i filtry lecą w goroutines równolegle do łańcucha LOUDS.
 
 ### Query Options
 
