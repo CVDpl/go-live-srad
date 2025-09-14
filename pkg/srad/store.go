@@ -132,6 +132,11 @@ type Options struct {
 	BuildMaxShards       int // cap parallel shards for builder tasks (Bloom/Trigram)
 	BuildShardMinKeys    int // below this key count, disable sharding (use 1 shard)
 	BloomAdaptiveMinKeys int // above this, reduce Bloom prefix work
+
+	// Range-partitioned build (1 = disabled)
+	BuildRangePartitions int
+	// Build filters asynchronously after flush (may increase memory)
+	AsyncFilterBuild bool
 }
 
 // QueryOptions configures query execution.
@@ -316,6 +321,8 @@ func DefaultOptions() *Options {
 		BuildMaxShards:              8,
 		BuildShardMinKeys:           200000,
 		BloomAdaptiveMinKeys:        10000000,
+		BuildRangePartitions:        1,
+		AsyncFilterBuild:            false,
 	}
 }
 

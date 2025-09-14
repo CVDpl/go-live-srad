@@ -124,32 +124,59 @@ type Options struct {
 }
 ```
 
-Przykład strojenia budowy dużych segmentów:
+Example tuning for building large segments:
 ```go
 opts := srad.DefaultOptions()
-opts.BuildMaxShards = 8          // limit równoległych shardów
-opts.BuildShardMinKeys = 300000  // poniżej progu nie dziel na shardy
-opts.BloomAdaptiveMinKeys = 8_000_000 // wcześniej redukuj prefiksy Blooma
+opts.BuildMaxShards = 8          // limit concurrent shards
+opts.BuildShardMinKeys = 300000  // below threshold, do not shard
+opts.BloomAdaptiveMinKeys = 8_000_000 // reduce Bloom prefixes earlier
 ```
 
 ### Filters
 
-- Prefix Bloom: controls FPR and maks. długość prefiksu dodawaną do filtra.
-- Trigram: można wyłączyć dla bardzo dużych wsadów lub gdy nie korzystasz z wyszukiwań podciągów.
+- Prefix Bloom: controls FPR and the maximum prefix length added to the filter.
+- Trigram: can be disabled for very large batches or when you do not use substring searches.
 
-Przykład:
+Example:
 ```go
 opts := srad.DefaultOptions()
-opts.PrefixBloomFPR = 0.02            // szybsza budowa, mniejszy filtr
-opts.PrefixBloomMaxPrefixLen = 8      // mniej pracy na klucz
-opts.EnableTrigramFilter = false      // pominąć tri.bits
+opts.PrefixBloomFPR = 0.02            // faster build, smaller filter
+opts.PrefixBloomMaxPrefixLen = 8      // less work per key
+opts.EnableTrigramFilter = false      // skip tri.bits
 store, _ := srad.Open(dir, opts)
+```
+
+### Flush/Compaction parallelism (range partitions)
+
+- `BuildRangePartitions` (>1) splits the key range into N partitions (heuristic by first byte) and builds N segments in parallel during Flush/Compact.
+- Combined with `BuildMaxShards`, this fully utilizes the CPU (N partitions × internal shards).
+
+Batch example:
+```go
+opts := srad.DefaultOptions()
+opts.DisableAutotuner = true
+opts.MemtableTargetBytes = 256 * 1024 * 1024
+opts.EnableTrigramFilter = false
+opts.PrefixBloomFPR = 0.03
+opts.PrefixBloomMaxPrefixLen = 8
+opts.BuildMaxShards = runtime.NumCPU()
+opts.BuildRangePartitions = runtime.NumCPU()/2 // e.g., 8–16
+```
+
+### AsyncFilterBuild
+
+- `AsyncFilterBuild = true` enables building missing filters (`filters/prefix.bf`, `filters/tri.bits`) in the background after flush/compaction.
+- Queries are correct even without filters; filters only accelerate reads.
+
+```go
+opts := srad.DefaultOptions()
+opts.AsyncFilterBuild = true
 ```
 
 ### Flush behavior
 
-- Flush używa strategii freeze-and-swap: najpierw zamiana `memtable` na nową pod krótką blokadą, a następnie budowa segmentu ze „starej” zamrożonej kopii poza lockiem. Nowe inserty nie blokują się długo i nie znikają z widoku.
-- Budowa artefaktów jest równoległa: `keys.dat` i filtry lecą w goroutines równolegle do łańcucha LOUDS.
+- Flush uses a freeze-and-swap strategy: first swap the `memtable` for a new one under a short lock, then build the segment from the frozen copy outside the lock. New inserts are minimally blocked and never lost from view.
+- Artifact construction is parallelized: `keys.dat` and filters are built in goroutines alongside the LOUDS chain.
 
 ### Query Options
 

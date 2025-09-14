@@ -68,6 +68,7 @@ type Files struct {
 	Accept string `json:"accept"`
 	TMap   string `json:"tmap,omitempty"`
 	Tails  string `json:"tails,omitempty"`
+	Expiry string `json:"expiry,omitempty"`
 }
 
 // NewMetadata creates a new segment metadata.

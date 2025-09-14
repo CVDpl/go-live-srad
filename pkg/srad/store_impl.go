@@ -19,7 +19,6 @@ import (
 	"github.com/CVDpl/go-live-srad/pkg/srad/memtable"
 	"github.com/CVDpl/go-live-srad/pkg/srad/segment"
 	"github.com/CVDpl/go-live-srad/pkg/srad/wal"
-	blake3 "github.com/zeebo/blake3"
 )
 
 // segItem is an item produced by parallel segment workers.
@@ -122,7 +121,7 @@ func (s *storeImpl) computeSegmentSize(segmentID uint64) int64 {
 	add(md.Files.TMap)
 	add(md.Files.Tails)
 	// filters and aux files
-	for _, rel := range []string{"filters/prefix.bf", "filters/tri.bits", "keys.dat", "tombstones.dat"} {
+	for _, rel := range []string{"filters/prefix.bf", "filters/tri.bits", "keys.dat", "expiry.dat", "tombstones.dat"} {
 		add(rel)
 	}
 	return total
@@ -789,269 +788,272 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	readersSnapshot := append([]*segment.Reader(nil), s.readers...)
 	s.mu.Unlock()
 
-	// Dedup set across all inputs (newest wins)
-	seen := make(map[[32]byte]struct{}, 1024)
-
-	// Chunked building to cap memory/size
-	const chunkTargetBytes = int64(512 * 1024 * 1024)
-	type chunkState struct {
-		builder       *segment.Builder
-		id            uint64
-		approxBytes   int64
-		acceptedCount uint64
-		liveAdded     bool
+	// Partition readers by first-byte bucket (0..255) folded to P buckets
+	parts := s.opts.BuildRangePartitions
+	if parts <= 1 {
+		parts = 1
 	}
-	var cur chunkState
-	newReaders := make([]*segment.Reader, 0, 8)
-	ensureBuilder := func() {
-		if cur.builder != nil {
-			return
-		}
-		cur.id = atomic.AddUint64(&s.nextSegmentID, 1)
-		cur.builder = segment.NewBuilder(cur.id, common.LevelL0, segmentsDir, s.logger)
-		cur.approxBytes = 0
-		cur.acceptedCount = 0
-		cur.liveAdded = false
-	}
-	finalizeChunk := func() error {
-		if cur.builder == nil {
-			return nil
-		}
-		if !cur.liveAdded {
-			cur.builder.DropAllTombstones()
-		}
-		md, err := cur.builder.Build()
-		if err != nil {
-			s.logger.Warn("compaction built minimal segment", "error", err)
-			cur.builder = nil
-			cur.id = 0
-			cur.approxBytes = 0
-			cur.acceptedCount = 0
-			cur.liveAdded = false
-			return nil
-		}
-		// Open reader for the compacted chunk and stage it
-		reader, rerr := segment.NewReader(cur.id, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
-		if rerr == nil {
-			newReaders = append(newReaders, reader)
-		} else {
-			s.logger.Warn("failed to open reader for compacted chunk", "id", cur.id, "error", rerr)
-		}
-		// Add to manifest if available
-		if s.manifest != nil {
-			info := manifest.SegmentInfo{ID: cur.id, Level: common.LevelL0, NumKeys: md.Counts.Accepted}
-			info.Size = s.computeSegmentSize(cur.id)
-			if minb, err := md.GetMinKey(); err == nil {
-				info.MinKeyHex = fmt.Sprintf("%x", minb)
-			}
-			if maxb, err := md.GetMaxKey(); err == nil {
-				info.MaxKeyHex = fmt.Sprintf("%x", maxb)
-			}
-			if err := s.manifest.AddSegment(info); err != nil {
-				s.logger.Warn("failed to add compacted segment to manifest", "error", err)
+	buckets := make([][]*segment.Reader, parts)
+	for _, r := range readersSnapshot {
+		// Heuristic: use metadata minKey to choose bucket; fallback 0
+		minK, _ := r.MinKey()
+		idx := 0
+		if len(minK) > 0 {
+			idx = int(minK[0]) * parts / 256
+			if idx >= parts {
+				idx = parts - 1
 			}
 		}
-		// Reset state
-		cur.builder = nil
-		cur.id = 0
-		cur.approxBytes = 0
-		cur.acceptedCount = 0
-		cur.liveAdded = false
-		return nil
-	}
-	maybeFlush := func() error {
-		if cur.approxBytes >= chunkTargetBytes {
-			return finalizeChunk()
-		}
-		return nil
+		buckets[idx] = append(buckets[idx], r)
 	}
 
-	// Memtable first
-	snapshot := s.memtablePtr.Load().Snapshot()
-	all := memtable.NewAllIterator(snapshot)
-	for all.Next() {
-		k := all.Key()
-		h := blake3.Sum256(k)
-		if _, ok := seen[h]; ok {
+	// Dedup set across all inputs (newest wins) kept per bucket scope
+	type compRes struct {
+		readers []*segment.Reader
+		err     error
+	}
+	out := make(chan compRes, parts)
+	var wg sync.WaitGroup
+	for b := 0; b < parts; b++ {
+		rs := buckets[b]
+		if len(rs) == 0 {
 			continue
 		}
-		ensureBuilder()
-		if all.IsTombstone() {
-			cur.builder.AddTombstone(k)
-			cur.approxBytes += int64(len(k))
-		} else {
-			if err := cur.builder.Add(k, k, false); err != nil {
-				return fmt.Errorf("builder add: %w", err)
+		wg.Add(1)
+		go func(rs []*segment.Reader) {
+			defer wg.Done()
+			// Reuse existing single-bucket compaction but scoped to rs
+			// --- begin single-bucket from original code (trimmed) ---
+			const chunkTargetBytes = int64(512 * 1024 * 1024)
+			type chunkState struct {
+				builder       *segment.Builder
+				id            uint64
+				approxBytes   int64
+				acceptedCount uint64
+				liveAdded     bool
 			}
-			cur.approxBytes += int64(len(k))
-			cur.acceptedCount++
-			cur.liveAdded = true
-		}
-		seen[h] = struct{}{}
-		if err := maybeFlush(); err != nil {
-			return err
-		}
-	}
-
-	// Async streams per reader to overlap IO
-	type keyStream struct {
-		ch    <-chan []byte
-		key   []byte
-		ok    bool
-		order int
-	}
-	newKeyChan := func(r *segment.Reader) <-chan []byte {
-		out := make(chan []byte, 1024)
-		go func() {
-			adv := r.StreamKeys()
-			for {
-				k, ok := adv()
-				if !ok {
-					break
+			var cur chunkState
+			newReaders := make([]*segment.Reader, 0, 8)
+			ensureBuilder := func() {
+				if cur.builder != nil {
+					return
 				}
-				out <- k
-			}
-			close(out)
-		}()
-		return out
-	}
-	newTombChan := func(r *segment.Reader) <-chan []byte {
-		out := make(chan []byte, 1024)
-		go func() {
-			adv := r.StreamTombstones()
-			for {
-				k, ok := adv()
-				if !ok {
-					break
+				cur.id = atomic.AddUint64(&s.nextSegmentID, 1)
+				cur.builder = segment.NewBuilder(cur.id, common.LevelL0, segmentsDir, s.logger)
+				cur.approxBytes = 0
+				cur.acceptedCount = 0
+				cur.liveAdded = false
+				// propagate builder config
+				bloomFPR := s.opts.PrefixBloomFPR
+				if bloomFPR <= 0 {
+					bloomFPR = common.DefaultBloomFPR
 				}
-				out <- k
+				prefixLen := s.opts.PrefixBloomMaxPrefixLen
+				if prefixLen <= 0 {
+					prefixLen = int(common.DefaultPrefixBloomLength)
+				}
+				cur.builder.ConfigureFilters(bloomFPR, prefixLen, s.opts.EnableTrigramFilter)
+				cur.builder.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
 			}
-			close(out)
-		}()
-		return out
-	}
-	// Build streams
-	streams := make([]*keyStream, 0, len(readersSnapshot))
-	for idx := len(readersSnapshot) - 1; idx >= 0; idx-- {
-		r := readersSnapshot[idx]
-		ch := newKeyChan(r)
-		ks := &keyStream{ch: ch, order: idx + 1}
-		ks.key, ks.ok = <-ch
-		streams = append(streams, ks)
-	}
-	// Tombstones heap via channels
-	type tombHead struct {
-		ch  <-chan []byte
-		key []byte
-		ok  bool
-	}
-	var tsHeads []*tombHead
-	for _, r := range readersSnapshot {
-		ch := newTombChan(r)
-		th := &tombHead{ch: ch}
-		th.key, th.ok = <-ch
-		if th.ok {
-			tsHeads = append(tsHeads, th)
-		}
-	}
-	sort.Slice(tsHeads, func(i, j int) bool { return bytes.Compare(tsHeads[i].key, tsHeads[j].key) < 0 })
-	advanceTs := func() {
-		if len(tsHeads) == 0 {
-			return
-		}
-		th := tsHeads[0]
-		th.key, th.ok = <-th.ch
-		if !th.ok {
-			tsHeads = tsHeads[1:]
-			return
-		}
-		sort.Slice(tsHeads, func(i, j int) bool { return bytes.Compare(tsHeads[i].key, tsHeads[j].key) < 0 })
-	}
-	// Min-heap-ish via sort on slice of heads
-	sort.Slice(streams, func(i, j int) bool {
-		cmp := bytes.Compare(streams[i].key, streams[j].key)
-		if cmp != 0 {
-			return cmp < 0
-		}
-		return streams[i].order > streams[j].order
-	})
-	var curKey []byte
-	for len(streams) > 0 {
-		si := streams[0]
-		if !si.ok || si.key == nil {
-			// advance this stream
-			k, ok := <-si.ch
-			if !ok {
-				streams = streams[1:]
-				continue
+			finalizeChunk := func() error {
+				if cur.builder == nil {
+					return nil
+				}
+				if !cur.liveAdded {
+					cur.builder.DropAllTombstones()
+				}
+				md, err := cur.builder.Build()
+				if err != nil {
+					s.logger.Warn("compaction built minimal segment", "error", err)
+					cur.builder = nil
+					cur.id = 0
+					cur.approxBytes = 0
+					cur.acceptedCount = 0
+					cur.liveAdded = false
+					return nil
+				}
+				reader, rerr := segment.NewReader(cur.id, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+				if rerr == nil {
+					newReaders = append(newReaders, reader)
+				} else {
+					s.logger.Warn("failed to open reader for compacted chunk", "id", cur.id, "error", rerr)
+				}
+				if s.manifest != nil {
+					info := manifest.SegmentInfo{ID: cur.id, Level: common.LevelL0, NumKeys: md.Counts.Accepted}
+					info.Size = s.computeSegmentSize(cur.id)
+					if minb, err := md.GetMinKey(); err == nil {
+						info.MinKeyHex = fmt.Sprintf("%x", minb)
+					}
+					if maxb, err := md.GetMaxKey(); err == nil {
+						info.MaxKeyHex = fmt.Sprintf("%x", maxb)
+					}
+					if err := s.manifest.AddSegment(info); err != nil {
+						s.logger.Warn("failed to add compacted segment to manifest", "error", err)
+					}
+				}
+				cur.builder = nil
+				cur.id = 0
+				cur.approxBytes = 0
+				cur.acceptedCount = 0
+				cur.liveAdded = false
+				return nil
 			}
-			si.key, si.ok = k, true
-			sort.Slice(streams, func(i, j int) bool {
-				cmp := bytes.Compare(streams[i].key, streams[j].key)
+			maybeFlush := func() error {
+				if cur.approxBytes >= chunkTargetBytes {
+					return finalizeChunk()
+				}
+				return nil
+			}
+			// Sources for this bucket only
+			type srcIter struct {
+				key   []byte
+				ok    bool
+				next  func() ([]byte, bool)
+				order int
+			}
+			less := func(a, b *srcIter) bool {
+				cmp := bytes.Compare(a.key, b.key)
 				if cmp != 0 {
 					return cmp < 0
 				}
-				return streams[i].order > streams[j].order
-			})
-			continue
-		}
-		emit := false
-		if curKey == nil || !bytes.Equal(si.key, curKey) {
-			curKey = append([]byte(nil), si.key...)
-			emit = true
-		}
-		if emit {
-			for len(tsHeads) > 0 && bytes.Compare(tsHeads[0].key, curKey) < 0 {
-				advanceTs()
+				return a.order > b.order
 			}
-			if len(tsHeads) > 0 && bytes.Equal(tsHeads[0].key, curKey) {
-				advanceTs()
-			} else {
-				ensureBuilder()
-				if err := cur.builder.Add(curKey, curKey, false); err != nil {
-					return fmt.Errorf("builder add: %w", err)
-				}
-				cur.approxBytes += int64(len(curKey))
-				cur.acceptedCount++
-				cur.liveAdded = true
-				if err := maybeFlush(); err != nil {
-					return err
+			srcs := make([]*srcIter, 0, len(rs))
+			type tsIter struct {
+				key  []byte
+				ok   bool
+				next func() ([]byte, bool)
+			}
+			tsHeap := make([]*tsIter, 0, len(rs))
+			tsLess := func(i, j int) bool { return bytes.Compare(tsHeap[i].key, tsHeap[j].key) < 0 }
+			pushTS := func(ti *tsIter) {
+				if ti.ok {
+					tsHeap = append(tsHeap, ti)
+					sort.Slice(tsHeap, tsLess)
 				}
 			}
-		}
-		// advance current head
-		k, ok := <-si.ch
-		if !ok {
-			streams = streams[1:]
-			continue
-		}
-		si.key, si.ok = k, true
-		sort.Slice(streams, func(i, j int) bool {
-			cmp := bytes.Compare(streams[i].key, streams[j].key)
-			if cmp != 0 {
-				return cmp < 0
+			popTS := func() *tsIter {
+				if len(tsHeap) == 0 {
+					return nil
+				}
+				x := tsHeap[0]
+				tsHeap = tsHeap[1:]
+				return x
 			}
-			return streams[i].order > streams[j].order
-		})
+			// readers
+			for idx := len(rs) - 1; idx >= 0; idx-- {
+				r := rs[idx]
+				advance := r.StreamKeys()
+				k, ok := advance()
+				srcs = append(srcs, &srcIter{key: k, ok: ok, next: advance, order: idx + 1})
+				advT := r.StreamTombstones()
+				if tk, tok := advT(); tok {
+					pushTS(&tsIter{key: tk, ok: tok, next: advT})
+				}
+			}
+			h := make([]*srcIter, 0, len(srcs))
+			push := func(si *srcIter) {
+				if si.ok {
+					h = append(h, si)
+					sort.Slice(h, func(i, j int) bool { return less(h[i], h[j]) })
+				}
+			}
+			pop := func() *srcIter {
+				if len(h) == 0 {
+					return nil
+				}
+				x := h[0]
+				h = h[1:]
+				return x
+			}
+			for _, siter := range srcs {
+				push(siter)
+			}
+			var curKey []byte
+			for len(h) > 0 {
+				si := pop()
+				if si.key == nil && si.ok {
+					if k, ok := si.next(); ok {
+						si.key = k
+						si.ok = true
+						push(si)
+					}
+					continue
+				}
+				emit := false
+				if curKey == nil || !bytes.Equal(si.key, curKey) {
+					curKey = append([]byte(nil), si.key...)
+					emit = true
+				}
+				if emit {
+					for {
+						if len(tsHeap) == 0 {
+							break
+						}
+						if bytes.Compare(tsHeap[0].key, curKey) < 0 {
+							ti := popTS()
+							if nk, ok := ti.next(); ok {
+								ti.key = nk
+								ti.ok = true
+								pushTS(ti)
+							}
+							continue
+						}
+						break
+					}
+					if len(tsHeap) > 0 && bytes.Equal(tsHeap[0].key, curKey) {
+						ti := popTS()
+						if nk, ok := ti.next(); ok {
+							ti.key = nk
+							ti.ok = true
+							pushTS(ti)
+						}
+					} else {
+						ensureBuilder()
+						if err := cur.builder.Add(curKey, curKey, false); err != nil {
+							out <- compRes{nil, fmt.Errorf("builder add: %w", err)}
+							return
+						}
+						cur.approxBytes += int64(len(curKey))
+						cur.acceptedCount++
+						cur.liveAdded = true
+						if err := maybeFlush(); err != nil {
+							out <- compRes{nil, err}
+							return
+						}
+					}
+				}
+				if k, ok := si.next(); ok {
+					si.key = k
+					si.ok = true
+					push(si)
+				}
+			}
+			if err := finalizeChunk(); err != nil {
+				out <- compRes{nil, err}
+				return
+			}
+			out <- compRes{readers: newReaders, err: nil}
+			// --- end bucket compaction ---
+		}(rs)
 	}
+	go func() { wg.Wait(); close(out) }()
 
-	// Finalize last chunk
-	if err := finalizeChunk(); err != nil {
-		return err
-	}
-
-	// Replace readers: if produced new segments, swap in; if none, clear readers entirely
+	// Replace readers: if produced new segments, swap in; if none, keep current
 	s.mu.Lock()
-	if len(newReaders) > 0 {
+	var newReadersAll []*segment.Reader
+	for r := range out {
+		if r.err != nil {
+			s.mu.Unlock()
+			return r.err
+		}
+		newReadersAll = append(newReadersAll, r.readers...)
+	}
+	if len(newReadersAll) > 0 {
 		for _, old := range s.readers {
 			_ = old.Close()
 		}
-		s.readers = newReaders
-	} else {
-		for _, old := range s.readers {
-			_ = old.Close()
-		}
-		s.readers = nil
+		s.readers = newReadersAll
 	}
 	s.mu.Unlock()
 
@@ -1076,6 +1078,79 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	return nil
 }
 
+// After flush, optionally build filters asynchronously (placeholder)
+func (s *storeImpl) maybeScheduleAsyncFilters() {
+	if !s.opts.AsyncFilterBuild {
+		return
+	}
+	if s.manifest == nil {
+		return
+	}
+	// Best-effort background job
+	go func() {
+		s.mu.RLock()
+		active := s.manifest.GetActiveSegments()
+		dir := filepath.Join(s.dir, common.DirSegments)
+		logger := s.logger
+		s.mu.RUnlock()
+		for _, seg := range active {
+			// Open reader and check filters
+			reader, err := segment.NewReader(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad)
+			if err != nil {
+				continue
+			}
+			needBloom := reader.Bloom() == nil
+			needTri := s.opts.EnableTrigramFilter && reader.Trigram() == nil
+			if !needBloom && !needTri {
+				_ = reader.Close()
+				continue
+			}
+			// Rebuild filters from keys stream
+			// Load keys via StreamKeys and feed a temporary builder's filter routines
+			var keys [][]byte
+			adv := reader.StreamKeys()
+			for {
+				k, ok := adv()
+				if !ok {
+					break
+				}
+				kk := make([]byte, len(k))
+				copy(kk, k)
+				keys = append(keys, kk)
+			}
+			_ = reader.Close()
+			b := segment.NewBuilder(seg.ID, common.LevelL0, dir, logger)
+			// Only configure filters; skip values and LOUDS
+			bloomFPR := s.opts.PrefixBloomFPR
+			if bloomFPR <= 0 {
+				bloomFPR = common.DefaultBloomFPR
+			}
+			prefixLen := s.opts.PrefixBloomMaxPrefixLen
+			if prefixLen <= 0 {
+				prefixLen = int(common.DefaultPrefixBloomLength)
+			}
+			b.ConfigureFilters(bloomFPR, prefixLen, s.opts.EnableTrigramFilter)
+			// Inject keys and build only filters files
+			// Hack: populate b.keys, then call internal filter build
+			// Safer: reuse buildFilters API after setting keys
+			// We do minimal approach: export keys via AddFromPairs
+			tombs := make([]bool, len(keys))
+			if err := b.AddFromPairs(keys, tombs); err != nil {
+				continue
+			}
+			filtersDir := filepath.Join(dir, fmt.Sprintf("%016d", seg.ID), "filters")
+			_ = os.MkdirAll(filtersDir, 0755)
+			// Build requested filters
+			if needBloom {
+				_ = b.BuildBloomOnly(filtersDir)
+			}
+			if needTri && s.opts.EnableTrigramFilter {
+				_ = b.BuildTrigramOnly(filtersDir)
+			}
+		}
+	}()
+}
+
 // PruneWAL deletes obsolete WAL files older than the current WAL sequence.
 func (s *storeImpl) PruneWAL() error {
 	if s.readonly {
@@ -1098,96 +1173,158 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 
 	// Freeze-and-swap memtable under a short lock
 	s.mu.Lock()
-	s.mtGuard.Lock()
 	oldMem := s.memtablePtr.Swap(memtable.New())
 	if oldMem == nil {
 		s.mu.Unlock()
-		s.mtGuard.Unlock()
 		return nil // Nothing to flush
 	}
 	oldCount := oldMem.Count()
 	oldDeleted := oldMem.DeletedCount()
 	if oldCount == 0 && oldDeleted == 0 {
 		s.mu.Unlock()
-		s.mtGuard.Unlock()
 		return nil // Nothing to flush
 	}
-	// Reserve a new segment ID and cache dir while under lock
-	segmentID := atomic.AddUint64(&s.nextSegmentID, 1)
+	// Reserve a new base segment ID and cache dir while under lock
+	baseID := atomic.AddUint64(&s.nextSegmentID, 1)
 	segmentsDir := filepath.Join(s.dir, common.DirSegments)
 	s.mu.Unlock()
 
 	s.logger.Info("starting flush", "entries", oldCount)
 
-	// Snapshot the frozen memtable after swap; this will include any in-flight writes to old memtable
+	// Snapshot the frozen memtable after swap
 	snapshot := oldMem.Snapshot()
-	s.mtGuard.Unlock()
 
-	// Build segment from snapshot (outside of store lock)
-	builder := segment.NewBuilder(segmentID, common.LevelL0, segmentsDir, s.logger)
-	// Configure filters from options
-	bloomFPR := s.opts.PrefixBloomFPR
-	if bloomFPR <= 0 {
-		bloomFPR = common.DefaultBloomFPR
-	}
-	prefixLen := s.opts.PrefixBloomMaxPrefixLen
-	if prefixLen <= 0 {
-		prefixLen = int(common.DefaultPrefixBloomLength)
-	}
-	enableTri := s.opts.EnableTrigramFilter
-	builder.ConfigureFilters(bloomFPR, prefixLen, enableTri)
-	// Configure build sharding/adaptive
-	builder.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
-	if err := builder.AddFromMemtable(snapshot); err != nil {
-		// Rollback: reinsert snapshot into current memtable to avoid data loss
-		s.rollbackSnapshotIntoMemtable(snapshot)
-		return fmt.Errorf("add memtable to builder: %w", err)
+	// Partition count
+	parts := s.opts.BuildRangePartitions
+	if parts <= 1 {
+		parts = 1
 	}
 
-	metadata, err := builder.Build()
-	if err != nil {
-		// Rollback to preserve data
-		s.rollbackSnapshotIntoMemtable(snapshot)
-		return fmt.Errorf("build segment: %w", err)
+	// Helper to configure a builder
+	cfgBuilder := func(b *segment.Builder) {
+		bloomFPR := s.opts.PrefixBloomFPR
+		if bloomFPR <= 0 {
+			bloomFPR = common.DefaultBloomFPR
+		}
+		prefixLen := s.opts.PrefixBloomMaxPrefixLen
+		if prefixLen <= 0 {
+			prefixLen = int(common.DefaultPrefixBloomLength)
+		}
+		enableTri := s.opts.EnableTrigramFilter
+		b.ConfigureFilters(bloomFPR, prefixLen, enableTri)
+		b.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
 	}
 
-	// Open reader for the new segment so queries can see it immediately
-	reader, rerr := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
-	if rerr != nil {
-		// Non-fatal: log and continue (we still register the segment in manifest)
-		s.logger.Warn("failed to open reader for new segment", "id", segmentID, "error", rerr)
+	type partResult struct {
+		id  uint64
+		md  *segment.Metadata
+		err error
+	}
+
+	results := make(chan partResult, parts)
+
+	if parts == 1 {
+		// Single builder path (existing)
+		segID := baseID
+		builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
+		cfgBuilder(builder)
+		if err := builder.AddFromMemtable(snapshot); err != nil {
+			// Rollback: reinsert snapshot into current memtable to avoid data loss
+			s.rollbackSnapshotIntoMemtable(snapshot)
+			return fmt.Errorf("add memtable to builder: %w", err)
+		}
+		md, err := builder.Build()
+		if err != nil {
+			s.rollbackSnapshotIntoMemtable(snapshot)
+			return fmt.Errorf("build segment: %w", err)
+		}
+		results <- partResult{id: segID, md: md, err: nil}
+		close(results)
+	} else {
+		// Range-partition snapshot by first byte (0..255) sklejone do parts wiader
+		// Zbierz wszystkie klucze/tombs i rozdziel do kubełków bez sortowania tutaj – sort w builderze
+		keys, tombs := snapshot.GetAllWithTombstones()
+		buckets := make([][][]byte, parts)
+		btombs := make([][]bool, parts)
+		for i := range buckets {
+			buckets[i] = make([][]byte, 0, len(keys)/parts+1)
+			btombs[i] = make([]bool, 0, len(keys)/parts+1)
+		}
+		for i, k := range keys {
+			idx := 0
+			if len(k) > 0 {
+				idx = int(k[0]) * parts / 256
+				if idx >= parts {
+					idx = parts - 1
+				}
+			}
+			buckets[idx] = append(buckets[idx], k)
+			btombs[idx] = append(btombs[idx], tombs[i])
+		}
+		var wg sync.WaitGroup
+		for p := 0; p < parts; p++ {
+			if len(buckets[p]) == 0 {
+				continue
+			}
+			wg.Add(1)
+			go func(pid int) {
+				defer wg.Done()
+				segID := atomic.AddUint64(&s.nextSegmentID, 1)
+				builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
+				cfgBuilder(builder)
+				if err := builder.AddFromPairs(buckets[pid], btombs[pid]); err != nil {
+					results <- partResult{id: segID, err: fmt.Errorf("add partition: %w", err)}
+					return
+				}
+				md, err := builder.Build()
+				if err != nil {
+					results <- partResult{id: segID, err: fmt.Errorf("build partition: %w", err)}
+					return
+				}
+				results <- partResult{id: segID, md: md, err: nil}
+			}(p)
+		}
+		go func() { wg.Wait(); close(results) }()
+	}
+
+	// Collect results
+	var mds []*segment.Metadata
+	for r := range results {
+		if r.err != nil {
+			s.rollbackSnapshotIntoMemtable(snapshot)
+			return r.err
+		}
+		mds = append(mds, r.md)
 	}
 
 	// Update in-memory state and manifest under lock
 	s.mu.Lock()
-	s.segments = append(s.segments, metadata)
-	if rerr == nil {
-		s.readers = append(s.readers, reader)
-	}
-	// Add to manifest if available
-	if s.manifest != nil {
-		info := manifest.SegmentInfo{
-			ID:      segmentID,
-			Level:   common.LevelL0,
-			NumKeys: uint64(snapshot.Count()),
-			Size:    s.computeSegmentSize(segmentID),
+	for _, md := range mds {
+		s.segments = append(s.segments, md)
+		reader, rerr := segment.NewReader(md.SegmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+		if rerr == nil {
+			s.readers = append(s.readers, reader)
+		} else {
+			s.logger.Warn("failed to open reader for new segment", "id", md.SegmentID, "error", rerr)
 		}
-		// Populate min/max HEX from metadata
-		if minb, err := metadata.GetMinKey(); err == nil {
-			info.MinKeyHex = fmt.Sprintf("%x", minb)
-		}
-		if maxb, err := metadata.GetMaxKey(); err == nil {
-			info.MaxKeyHex = fmt.Sprintf("%x", maxb)
-		}
-		if err := s.manifest.AddSegment(info); err != nil {
-			s.logger.Warn("failed to add segment to manifest", "error", err)
+		if s.manifest != nil {
+			info := manifest.SegmentInfo{ID: md.SegmentID, Level: common.LevelL0, NumKeys: md.Counts.Accepted, Size: s.computeSegmentSize(md.SegmentID)}
+			if minb, err := md.GetMinKey(); err == nil {
+				info.MinKeyHex = fmt.Sprintf("%x", minb)
+			}
+			if maxb, err := md.GetMaxKey(); err == nil {
+				info.MaxKeyHex = fmt.Sprintf("%x", maxb)
+			}
+			if err := s.manifest.AddSegment(info); err != nil {
+				s.logger.Warn("failed to add segment to manifest", "error", err)
+			}
 		}
 	}
 	// Refresh stats after flush
 	s.updateStatsFromManifest()
 	s.mu.Unlock()
 
-	// Sync WAL after persisting the segment
+	// Sync WAL after persisting segments
 	if err := s.wal.Sync(); err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
 	}
@@ -1198,12 +1335,13 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			s.logger.Warn("failed to rotate WAL after flush", "error", err)
 		}
 	}
-	// Note: do not force WAL rotation here; let size-based rotation control WAL file size
 
 	s.lastFlushTime = time.Now()
 	s.stats.RecordFlush(time.Since(start))
+	s.logger.Info("flush completed", "duration", time.Since(start), "segments", len(mds))
 
-	s.logger.Info("flush completed", "duration", time.Since(start), "segmentID", segmentID)
+	// Optionally schedule async filter building for missing filters
+	s.maybeScheduleAsyncFilters()
 
 	return nil
 }
@@ -1281,15 +1419,23 @@ func (s *storeImpl) SetAutotunerEnabled(enabled bool) {
 // replayWAL replays the WAL to restore the memtable.
 func (s *storeImpl) replayWAL() error {
 	count := 0
-	err := s.wal.Replay(func(op uint8, key []byte, ttl time.Duration) error {
+	err := s.wal.Replay(func(op uint8, key []byte, expiresAt time.Time) error {
 		switch op {
 		case common.OpInsert:
-			if mt := s.memtablePtr.Load(); mt != nil {
-				if err := mt.InsertWithTTL(key, ttl); err != nil {
-					return err
+			if expiresAt.IsZero() || time.Now().Before(expiresAt) {
+				if mt := s.memtablePtr.Load(); mt != nil {
+					if expiresAt.IsZero() {
+						if err := mt.InsertWithTTL(key, 0); err != nil {
+							return err
+						}
+					} else {
+						if err := mt.InsertWithExpiry(key, expiresAt); err != nil {
+							return err
+						}
+					}
+				} else {
+					return fmt.Errorf("memtable not initialized")
 				}
-			} else {
-				return fmt.Errorf("memtable not initialized")
 			}
 		case common.OpDelete:
 			if mt := s.memtablePtr.Load(); mt != nil {

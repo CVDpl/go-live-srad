@@ -32,6 +32,8 @@ type Builder struct {
 	tombstones []bool
 	// For future: persist tombstones for merge policies
 	tombstoneKeys [][]byte
+	// Per-key absolute expiry times in Unix nanos (0 if none), parallel to keys
+	expiries []int64
 
 	// Statistics
 	minKey []byte
@@ -78,6 +80,7 @@ type Builder struct {
 type pair struct {
 	k []byte
 	t bool
+	e int64
 }
 
 // NewBuilder creates a new segment builder.
@@ -101,14 +104,14 @@ func (b *Builder) DropAllTombstones() { b.dropTombstones = true }
 
 // AddFromMemtable adds all entries from a memtable snapshot.
 func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
-	// Get all keys with tombstone flags
-	allKeys, tombs := snapshot.GetAllWithTombstones()
+	// Get all keys with tombstone flags and expiries
+	allKeys, tombs, exps := snapshot.GetAllWithMeta()
 	// Keep pairs aligned while sorting
 	pairs := make([]pair, len(allKeys))
 	for i := range allKeys {
-		pairs[i] = pair{k: allKeys[i], t: tombs[i]}
+		pairs[i] = pair{k: allKeys[i], t: tombs[i], e: exps[i]}
 	}
-	pairs = b.parallelSortPairs(pairs)
+	sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
 
 	// Input is now sorted; allow Build() to skip resort/dedup
 	b.alreadySorted = true
@@ -121,7 +124,7 @@ func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
 			b.tombstoneKeys = append(b.tombstoneKeys, kc)
 			continue
 		}
-		if err := b.Add(p.k, p.k, false); err != nil {
+		if err := b.AddWithExpiry(p.k, p.k, p.e, false); err != nil {
 			return err
 		}
 	}
@@ -129,8 +132,41 @@ func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
 	return nil
 }
 
+// AddFromPairs adds entries from provided keys and tomb flags (already in-memory), optimized for partitioned flush.
+func (b *Builder) AddFromPairs(keys [][]byte, tombs []bool) error {
+	if len(keys) != len(tombs) {
+		return fmt.Errorf("keys/tombs length mismatch")
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	pairs := make([]pair, len(keys))
+	for i := range keys {
+		pairs[i] = pair{k: keys[i], t: tombs[i]}
+	}
+	pairs = b.parallelSortPairs(pairs)
+	b.alreadySorted = true
+	for _, p := range pairs {
+		if p.t {
+			kc := make([]byte, len(p.k))
+			copy(kc, p.k)
+			b.tombstoneKeys = append(b.tombstoneKeys, kc)
+			continue
+		}
+		if err := b.Add(p.k, p.k, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Add adds a key-value pair to the builder.
 func (b *Builder) Add(key, value []byte, tombstone bool) error {
+	return b.AddWithExpiry(key, value, 0, tombstone)
+}
+
+// AddWithExpiry adds a key-value pair with an absolute expiry timestamp (unix nanos; 0 = none).
+func (b *Builder) AddWithExpiry(key, value []byte, expiresAtNanos int64, tombstone bool) error {
 	// Skip tombstones for now (they're handled by shadowing in merge)
 	if tombstone {
 		return nil
@@ -144,6 +180,7 @@ func (b *Builder) Add(key, value []byte, tombstone bool) error {
 	b.keys = append(b.keys, keyCopy)
 	b.values = append(b.values, []byte{})
 	b.tombstones = append(b.tombstones, tombstone)
+	b.expiries = append(b.expiries, expiresAtNanos)
 
 	// Update min/max keys
 	if b.minKey == nil || bytes.Compare(key, b.minKey) < 0 {
@@ -258,6 +295,17 @@ func (b *Builder) Build() (*Metadata, error) {
 			errCh <- err
 		}
 	}()
+	// expiry.dat (optional, but write even if empty to preserve alignment when present)
+	if len(b.keys) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			expPath := filepath.Join(segmentDir, "expiry.dat")
+			if err := b.writeExpiryFile(expPath); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 	// tombstones.dat (optional)
 	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
 		wg.Add(1)
@@ -345,14 +393,16 @@ func (b *Builder) Build() (*Metadata, error) {
 		Tails:    0,
 		Accepted: uint64(len(b.keys)),
 	}
-	// Populate filters section
+
 	if b.filterBloomBits > 0 && b.filterBloomK > 0 {
 		metadata.Filters.PrefixBloom = &BloomFilter{Bits: b.filterBloomBits, K: b.filterBloomK, FPR: b.filterBloomFPR}
 	}
 	if b.filterTrigramBits > 0 {
 		metadata.Filters.Trigram = &TrigramFilter{Bits: b.filterTrigramBits, Scheme: b.filterTrigramScheme}
 	}
-	// BLAKE3 for files we generated
+	if len(b.keys) > 0 {
+		metadata.Files.Expiry = "expiry.dat"
+	}
 	metadata.Blake3 = map[string]string{}
 	if b.loudsBlake3 != "" {
 		metadata.Blake3["index.louds"] = b.loudsBlake3
@@ -393,6 +443,11 @@ func (b *Builder) Build() (*Metadata, error) {
 		metadata.Blake3["keys.dat"] = b.keysBlake3
 	} else if h, err := utils.ComputeBLAKE3File(keysPath); err == nil {
 		metadata.Blake3["keys.dat"] = h
+	}
+	if len(b.keys) > 0 {
+		if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "expiry.dat")); err == nil {
+			metadata.Blake3["expiry.dat"] = h
+		}
 	}
 	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
 		if b.tombsBlake3 != "" {
@@ -450,6 +505,45 @@ func (b *Builder) writeKeysFile(path string) error {
 		return err
 	}
 	b.keysBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
+	return af.Commit()
+}
+
+func (b *Builder) writeExpiryFile(path string) error {
+	af, err := utils.NewAtomicFile(path)
+	if err != nil {
+		return err
+	}
+	defer af.Close()
+
+	bw := bufio.NewWriterSize(af, 2<<20)
+	hasher := blake3.New()
+	out := io.MultiWriter(bw, hasher)
+
+	// Write common header with magic and version
+	if err := WriteCommonHeader(out, common.MagicExpiry, common.VersionSegment); err != nil {
+		return err
+	}
+	count := uint32(len(b.keys))
+	if err := binary.Write(out, binary.LittleEndian, count); err != nil {
+		return err
+	}
+	// Ensure expiries slice length matches keys; missing values are zero
+	if len(b.expiries) < int(count) {
+		pad := make([]int64, int(count)-len(b.expiries))
+		b.expiries = append(b.expiries, pad...)
+	}
+	for i := 0; i < int(count); i++ {
+		var e int64
+		if i < len(b.expiries) {
+			e = b.expiries[i]
+		}
+		if err := binary.Write(out, binary.LittleEndian, e); err != nil {
+			return err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return err
+	}
 	return af.Commit()
 }
 
@@ -750,6 +844,18 @@ func (b *Builder) buildFilters(dir string) error {
 	}
 
 	return nil
+}
+
+// BuildBloomOnly builds only the bloom filter into dir.
+func (b *Builder) BuildBloomOnly(dir string) error {
+	bloomPath := filepath.Join(dir, "prefix.bf")
+	return b.buildBloomFilter(bloomPath)
+}
+
+// BuildTrigramOnly builds only the trigram filter into dir.
+func (b *Builder) BuildTrigramOnly(dir string) error {
+	trigramPath := filepath.Join(dir, "tri.bits")
+	return b.buildTrigramFilter(trigramPath)
 }
 
 // buildBloomFilter builds the prefix bloom filter.

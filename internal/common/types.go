@@ -23,6 +23,7 @@ const (
 	MagicTrigram uint32 = 0x47495254 // "TRIG" in little-endian
 	MagicKeys    uint32 = 0x5359454B // "KEYS" in little-endian
 	MagicTombs   uint32 = 0x424D4F54 // "TOMB" in little-endian
+	MagicExpiry  uint32 = 0x59525058 // "EXPR" in little-endian
 )
 
 // File format versions

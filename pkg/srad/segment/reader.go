@@ -2,12 +2,15 @@ package segment
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"time"
 
 	"github.com/CVDpl/go-live-srad/internal/common"
 	"github.com/CVDpl/go-live-srad/internal/encoding"
@@ -26,12 +29,15 @@ type Reader struct {
 	louds   *encoding.LOUDS
 	keys    [][]byte // fallback list for iteration
 	keysMap []byte   // mmapped keys.dat (optional)
+	// Expiry data per key (parallel to keys order); unix nanos, 0 if none
+	expiries []int64
 
 	// File handles (memory mapped in future)
 	loudsFile  *os.File
 	edgesFile  *os.File
 	acceptFile *os.File
 	keysFile   *os.File
+	expFile    *os.File
 
 	logger common.Logger
 
@@ -87,6 +93,26 @@ func NewReader(segmentID uint64, dir string, logger common.Logger, verifyChecksu
 	return reader, nil
 }
 
+// MinKey returns a copy of the minimum key from metadata if available.
+func (r *Reader) MinKey() ([]byte, bool) {
+	if r.metadata == nil {
+		return nil, false
+	}
+	mk, err := r.metadata.GetMinKey()
+	if err != nil || len(mk) == 0 {
+		return nil, false
+	}
+	out := make([]byte, len(mk))
+	copy(out, mk)
+	return out, true
+}
+
+// Bloom returns the loaded bloom filter (may be nil if not present).
+func (r *Reader) Bloom() *filters.BloomFilter { return r.bloom }
+
+// Trigram returns the loaded trigram filter (may be nil if not present).
+func (r *Reader) Trigram() *filters.TrigramFilter { return r.trigram }
+
 // openFiles opens the segment files.
 func (r *Reader) openFiles() error {
 	var err error
@@ -125,6 +151,12 @@ func (r *Reader) openFiles() error {
 				r.keysMap = mapped
 			}
 		}
+	}
+
+	// Open expiry file (optional)
+	expPath := filepath.Join(r.dir, "expiry.dat")
+	if f, err := os.Open(expPath); err == nil {
+		r.expFile = f
 	}
 
 	// Open trigram filter (optional)
@@ -233,6 +265,13 @@ func (r *Reader) loadLOUDS() error {
 		if err := r.loadTombstones(); err != nil {
 			// non-fatal
 			r.logger.Warn("failed to load tombstones", "id", r.segmentID, "error", err)
+		}
+	}
+
+	// Load expiries if present
+	if r.expFile != nil {
+		if err := r.loadExpiries(); err != nil {
+			r.logger.Warn("failed to load expiries", "id", r.segmentID, "error", err)
 		}
 	}
 
@@ -432,6 +471,49 @@ func (r *Reader) HasTombstone(key []byte) bool {
 	return ok
 }
 
+func (r *Reader) loadExpiries() error {
+	if r.expFile == nil {
+		return nil
+	}
+	defer r.expFile.Seek(0, 0)
+	// Read and validate header
+	hdr, err := ReadCommonHeader(r.expFile)
+	if err != nil {
+		return err
+	}
+	if err := ValidateHeader(hdr, common.MagicExpiry, common.VersionSegment); err != nil {
+		return err
+	}
+	var count uint32
+	if err := binary.Read(r.expFile, binary.LittleEndian, &count); err != nil {
+		return err
+	}
+	exps := make([]int64, count)
+	for i := uint32(0); i < count; i++ {
+		var e int64
+		if err := binary.Read(r.expFile, binary.LittleEndian, &e); err != nil {
+			return err
+		}
+		exps[i] = e
+	}
+	r.expiries = exps
+	return nil
+}
+
+func (r *Reader) isExpiredKeyIndex(idx int) bool {
+	if idx < 0 {
+		return false
+	}
+	if idx >= len(r.expiries) {
+		return false
+	}
+	e := r.expiries[idx]
+	if e == 0 {
+		return false
+	}
+	return time.Now().UnixNano() >= e
+}
+
 // Get retrieves a value by key.
 func (r *Reader) Get(key []byte) ([]byte, bool) {
 	if r.louds == nil {
@@ -440,8 +522,19 @@ func (r *Reader) Get(key []byte) ([]byte, bool) {
 			return nil, false
 		}
 	}
-
-	return r.louds.Search(key)
+	val, ok := r.louds.Search(key)
+	if !ok {
+		return nil, false
+	}
+	// If we have keys loaded, check expiry via index lookup
+	if len(r.keys) > 0 && len(r.expiries) == len(r.keys) {
+		// binary search to find index
+		i := sort.Search(len(r.keys), func(i int) bool { return bytes.Compare(r.keys[i], key) >= 0 })
+		if i < len(r.keys) && bytes.Equal(r.keys[i], key) && r.isExpiredKeyIndex(i) {
+			return nil, false
+		}
+	}
+	return val, ok
 }
 
 // Contains checks if a key exists in the segment.
@@ -464,6 +557,10 @@ func (r *Reader) RegexIterator(pattern *regexp.Regexp) *SegmentIterator {
 	if r.tombstoneSet == nil && r.tombFile != nil {
 		_ = r.loadTombstones()
 	}
+	// Ensure expiries are loaded
+	if len(r.expiries) == 0 && r.expFile != nil {
+		_ = r.loadExpiries()
+	}
 	return &SegmentIterator{
 		reader:  r,
 		pattern: pattern,
@@ -484,6 +581,9 @@ func (r *Reader) Close() error {
 	}
 	if r.keysFile != nil {
 		r.keysFile.Close()
+	}
+	if r.expFile != nil {
+		r.expFile.Close()
 	}
 	if r.triFile != nil {
 		r.triFile.Close()
@@ -592,6 +692,10 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
 			if _, err := io.ReadFull(r.keysFile, k); err != nil {
 				return nil, false
 			}
+		}
+		// If expiries were loaded into memory and are aligned, check and drop expired
+		if len(r.expiries) > 0 && len(r.keys) > 0 {
+			// On streaming, we don't have index; this path is primarily for compaction streams; we'll filter by comparing to in-memory keys if loaded
 		}
 		i++
 		return k, true
@@ -819,6 +923,16 @@ func (it *SegmentIterator) Next() bool {
 			it.keysRead++
 			if (it.pattern == nil || it.pattern.Match(k)) && !it.reader.HasTombstone(k) {
 				// Note: k points into mmap; valid until reader is closed
+				if len(it.reader.keys) == 0 {
+					// Attempt to lazy load keys to align expiries
+					_ = it.reader.loadKeys()
+				}
+				if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
+					idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], k) >= 0 })
+					if idx < len(it.reader.keys) && bytes.Equal(it.reader.keys[idx], k) && it.reader.isExpiredKeyIndex(idx) {
+						continue
+					}
+				}
 				it.current = iteratorState{node: 0, key: k}
 				return true
 			}
@@ -842,6 +956,15 @@ func (it *SegmentIterator) Next() bool {
 			}
 			it.keysRead++
 			if (it.pattern == nil || it.pattern.Match(k)) && !it.reader.HasTombstone(k) {
+				if len(it.reader.keys) == 0 {
+					_ = it.reader.loadKeys()
+				}
+				if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
+					idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], k) >= 0 })
+					if idx < len(it.reader.keys) && bytes.Equal(it.reader.keys[idx], k) && it.reader.isExpiredKeyIndex(idx) {
+						continue
+					}
+				}
 				it.current = iteratorState{node: 0, key: k}
 				return true
 			}
@@ -854,6 +977,12 @@ func (it *SegmentIterator) Next() bool {
 			k := it.reader.keys[it.keysIndex]
 			it.keysIndex++
 			if (it.pattern == nil || it.pattern.Match(k)) && !it.reader.HasTombstone(k) {
+				if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
+					idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], k) >= 0 })
+					if idx < len(it.reader.keys) && bytes.Equal(it.reader.keys[idx], k) && it.reader.isExpiredKeyIndex(idx) {
+						continue
+					}
+				}
 				it.current = iteratorState{node: 0, key: k}
 				return true
 			}

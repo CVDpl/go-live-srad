@@ -451,11 +451,16 @@ func (w *WAL) encodeRecord(record WALRecord) ([]byte, error) {
 		return nil, err
 	}
 
-	// Write TTL as int64 (nanoseconds)
-	ttlNanos := int64(record.TTL)
-	ttlBuf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(ttlBuf, uint64(ttlNanos))
-	buf.Write(ttlBuf)
+	// Write absolute expiry as int64 unix nanos (0 means none)
+	var abs int64
+	if record.TTL > 0 {
+		abs = time.Now().Add(record.TTL).UnixNano()
+	} else {
+		abs = 0
+	}
+	absBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(absBuf, uint64(abs))
+	buf.Write(absBuf)
 
 	// Compute CRC32C
 	data := buf.Bytes()
@@ -470,7 +475,7 @@ func (w *WAL) encodeRecord(record WALRecord) ([]byte, error) {
 }
 
 // Replay replays all WAL files and calls the callback for each record.
-func (w *WAL) Replay(callback func(op uint8, key []byte, ttl time.Duration) error) error {
+func (w *WAL) Replay(callback func(op uint8, key []byte, expiresAt time.Time) error) error {
 	files, err := w.listWALFiles()
 	if err != nil {
 		return fmt.Errorf("list WAL files: %w", err)
@@ -487,7 +492,7 @@ func (w *WAL) Replay(callback func(op uint8, key []byte, ttl time.Duration) erro
 }
 
 // replayFile replays a single WAL file.
-func (w *WAL) replayFile(path string, callback func(op uint8, key []byte, ttl time.Duration) error) error {
+func (w *WAL) replayFile(path string, callback func(op uint8, key []byte, expiresAt time.Time) error) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open WAL file: %w", err)
@@ -546,8 +551,18 @@ func (w *WAL) replayFile(path string, callback func(op uint8, key []byte, ttl ti
 			continue
 		}
 
+		// Convert to absolute expiry
+		var expiresAt time.Time
+		if record.TTL > 0 {
+			// In new format readRecord stores absolute unix nanos in TTL field as time.Duration
+			abs := int64(record.TTL)
+			if abs > 0 {
+				expiresAt = time.Unix(0, abs)
+			}
+		}
+
 		// Call callback
-		if err := callback(record.Op, record.Key, record.TTL); err != nil {
+		if err := callback(record.Op, record.Key, expiresAt); err != nil {
 			return fmt.Errorf("replay callback error: %w", err)
 		}
 
@@ -589,13 +604,12 @@ func (w *WAL) readRecord(reader *bufio.Reader) (WALRecord, int, error) {
 	}
 	startPos += int(keyLen)
 
-	// Read TTL as int64 (nanoseconds)
-	ttlBuf := make([]byte, 8)
-	if _, err := io.ReadFull(reader, ttlBuf); err != nil {
-		return WALRecord{}, startPos, fmt.Errorf("read TTL: %w", err)
+	// Read absolute expiry as int64 (unix nanos)
+	expBuf := make([]byte, 8)
+	if _, err := io.ReadFull(reader, expBuf); err != nil {
+		return WALRecord{}, startPos, fmt.Errorf("read expiry: %w", err)
 	}
-	ttlNanos := int64(binary.LittleEndian.Uint64(ttlBuf))
-	ttl := time.Duration(ttlNanos)
+	abs := int64(binary.LittleEndian.Uint64(expBuf))
 	startPos += 8
 
 	// Read CRC32C
@@ -611,17 +625,22 @@ func (w *WAL) readRecord(reader *bufio.Reader) (WALRecord, int, error) {
 	utils.WriteUvarint(&buf, uint64(op))
 	utils.WriteUvarint(&buf, uint64(keyLen))
 	buf.Write(key)
-	buf.Write(ttlBuf)
+	buf.Write(expBuf)
 
 	actualCRC := utils.ComputeCRC32C(buf.Bytes())
 	if actualCRC != expectedCRC {
 		return WALRecord{}, startPos, common.ErrCRCMismatch
 	}
 
+	var ttlAsDuration time.Duration
+	if abs > 0 {
+		// temporarily store absolute nanos in TTL field for compatibility inside this file
+		ttlAsDuration = time.Duration(abs)
+	}
 	return WALRecord{
 		Op:     uint8(op),
 		Key:    key,
-		TTL:    ttl,
+		TTL:    ttlAsDuration,
 		CRC32C: expectedCRC,
 	}, startPos, nil
 }

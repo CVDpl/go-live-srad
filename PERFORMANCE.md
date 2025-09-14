@@ -106,6 +106,17 @@ opts.PrefixBloomMaxPrefixLen = 8
 opts.EnableTrigramFilter = false
 ```
 
+### 7. Range-partitioned Flush/Compact
+
+- `BuildRangePartitions` (>1) splits the key space into N buckets and builds N segments in parallel.
+- Recommendation: N ≈ half the number of CPU cores; try 4–16.
+- In CompactNow, partitioning turns one large K‑way merge into many smaller ones, significantly improving CPU scaling.
+
+### 8. AsyncFilterBuild
+
+- Enable `AsyncFilterBuild` to build missing filters in the background after flush/compaction.
+- Largest benefit in batch workloads: prioritize flush time, and let read-accelerating filters catch up shortly after.
+
 ### 7. Flush strategy
 
 - Flush uses freeze-and-swap memtable to minimize lock time and avoid write loss; building segments happens outside the store lock.

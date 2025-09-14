@@ -113,6 +113,34 @@ func (m *Memtable) InsertWithTTL(key []byte, ttl time.Duration) error {
 	return nil
 }
 
+// InsertWithExpiry adds a key with an absolute expiration timestamp.
+func (m *Memtable) InsertWithExpiry(key []byte, expiresAt time.Time) error {
+	if len(key) == 0 {
+		return common.ErrEmptyKey
+	}
+	if len(key) > common.MaxKeySize {
+		return common.ErrKeyTooLarge
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	seqNum := atomic.AddUint64(&m.seqNum, 1)
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
+	value := &Value{
+		data:      keyCopy,
+		seqNum:    seqNum,
+		tombstone: false,
+		expiresAt: expiresAt,
+	}
+	oldSize := m.root.cachedSize
+	m.insertNode(m.root, keyCopy, value)
+	newSize := m.root.cachedSize
+	atomic.AddInt64(&m.size, newSize-oldSize)
+	atomic.AddInt64(&m.count, 1)
+	return nil
+}
+
 // Delete marks a key as deleted (tombstone).
 func (m *Memtable) Delete(key []byte) error {
 	if len(key) == 0 {
@@ -561,6 +589,33 @@ func (s *Snapshot) GetAllWithTombstones() ([][]byte, []bool) {
 	}
 	walk(s.root, nil)
 	return keys, tombs
+}
+
+// GetAllWithMeta returns keys, tombstone flags, and absolute expiry (Unix nanos, 0 if none).
+func (s *Snapshot) GetAllWithMeta() ([][]byte, []bool, []int64) {
+	var keys [][]byte
+	var tombs []bool
+	var exps []int64
+	var walk func(node *Node, prefix []byte)
+	walk = func(node *Node, prefix []byte) {
+		currentKey := append(prefix, node.label...)
+		if node.value != nil && !node.value.IsExpired() {
+			k := make([]byte, len(currentKey))
+			copy(k, currentKey)
+			keys = append(keys, k)
+			tombs = append(tombs, node.value.tombstone)
+			var e int64
+			if !node.value.expiresAt.IsZero() {
+				e = node.value.expiresAt.UnixNano()
+			}
+			exps = append(exps, e)
+		}
+		for _, child := range node.children {
+			walk(child, currentKey)
+		}
+	}
+	walk(s.root, nil)
+	return keys, tombs, exps
 }
 
 // Size returns the size of the snapshot.

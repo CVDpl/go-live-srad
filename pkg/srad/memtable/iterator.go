@@ -381,7 +381,7 @@ func NewAllIterator(snapshot *Snapshot) *AllIterator {
 func collectAllWithValues(node *Node, prefix []byte, keys *[][]byte, values *[]*Value) {
 	currentKey := append(prefix, node.label...)
 
-	if node.value != nil && !node.value.tombstone {
+	if node.value != nil && !node.value.tombstone && !node.value.IsExpired() {
 		keyCopy := make([]byte, len(currentKey))
 		copy(keyCopy, currentKey)
 		*keys = append(*keys, keyCopy)
