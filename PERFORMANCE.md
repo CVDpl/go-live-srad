@@ -132,6 +132,20 @@ opts.EnableTrigramFilter = false
 - Recommendation: N ≈ half the number of CPU cores; try 4–16.
 - In CompactNow, partitioning turns one large K‑way merge into many smaller ones, significantly improving CPU scaling.
 
+Fallback for skewed keys:
+
+- If the range bucketing (by first byte) collapses to ≤1 non-empty bucket due to long shared prefixes, SRAD automatically falls back to a hash-based distribution (FNV-1a) across the configured number of parts. This preserves parallelism under skew without affecting correctness.
+- Logs emitted when fallback is used:
+
+```text
+flush using hash-based partitioning
+compaction using hash-based partitioning
+```
+
+Guidance:
+
+- Start with `BuildRangePartitions = min(16, max(4, NumCPU()/2))`. If you see the fallback logs frequently, your workload is skewed; consider slightly higher partitions if CPU and I/O allow.
+
 ### 8. AsyncFilterBuild
 
 - Enable `AsyncFilterBuild` to build missing filters in the background after flush/compaction.

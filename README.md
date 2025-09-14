@@ -163,6 +163,14 @@ opts.BuildMaxShards = runtime.NumCPU()
 opts.BuildRangePartitions = runtime.NumCPU()/2 // e.g., 8–16
 ```
 
+- Fallback: when keys are highly clustered (e.g., many share a long common prefix) the range bucketing by first byte can collapse to a single non-empty bucket. When this happens and `BuildRangePartitions > 1`, SRAD automatically switches to hash-based partitioning (FNV-1a) across the same number of parts to preserve parallelism. You will see logs like:
+
+```text
+flush using hash-based partitioning
+compaction using hash-based partitioning
+```
+This fallback only affects how work is split during Flush/Compaction. It does not change query behavior or on-disk key order within a segment.
+
 ### AsyncFilterBuild
 
 - `AsyncFilterBuild = true` enables building missing filters (`filters/prefix.bf`, `filters/tri.bits`) in the background after flush/compaction.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -663,6 +664,13 @@ func max(a, b int) int {
 	return b
 }
 
+// fnv32 returns FNV-1a 32-bit hash of b.
+func fnv32(b []byte) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write(b)
+	return h.Sum32()
+}
+
 // parallelMergedIterator merges memtable and channel of segment results.
 type parallelMergedIterator struct {
 	memIter *memtable.Iterator
@@ -912,6 +920,32 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 			}
 		}
 		buckets[idx] = append(buckets[idx], r)
+	}
+
+	// If range partition collapses, fallback to hash-based distribution for better parallelism
+	if parts > 1 {
+		nonEmpty := 0
+		for i := 0; i < parts; i++ {
+			if len(buckets[i]) > 0 {
+				nonEmpty++
+			}
+		}
+		if nonEmpty <= 1 {
+			for i := 0; i < parts; i++ {
+				buckets[i] = buckets[i][:0]
+			}
+			for _, r := range readersSnapshot {
+				minK, _ := r.MinKey()
+				var idx int
+				if len(minK) > 0 {
+					idx = int(fnv32(minK) % uint32(parts))
+				} else {
+					idx = int(r.GetSegmentID() % uint64(parts))
+				}
+				buckets[idx] = append(buckets[idx], r)
+			}
+			s.logger.Info("compaction using hash-based partitioning", "parts", parts)
+		}
 	}
 
 	// Dedup set across all inputs (newest wins) kept per bucket scope
@@ -1359,8 +1393,8 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		results <- partResult{id: segID, md: md, err: nil}
 		close(results)
 	} else {
-		// Range-partition snapshot by first byte (0..255) sklejone do parts wiader
-		// Zbierz wszystkie klucze/tombs i rozdziel do kubełków bez sortowania tutaj – sort w builderze
+		// Range-partition snapshot by first byte (0..255). If it collapses to <=1 non-empty bucket,
+		// fallback to hash-based partitioning to ensure parallel build even for heavy shared prefixes.
 		keys, tombs := snapshot.GetAllWithTombstones()
 		buckets := make([][][]byte, parts)
 		btombs := make([][]bool, parts)
@@ -1378,6 +1412,27 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			}
 			buckets[idx] = append(buckets[idx], k)
 			btombs[idx] = append(btombs[idx], tombs[i])
+		}
+		// count non-empty
+		nonEmpty := 0
+		for p := 0; p < parts; p++ {
+			if len(buckets[p]) > 0 {
+				nonEmpty++
+			}
+		}
+		if parts > 1 && nonEmpty <= 1 {
+			// fallback: hash partition all keys evenly
+			for i := range buckets {
+				buckets[i] = buckets[i][:0]
+				btombs[i] = btombs[i][:0]
+			}
+			for i, k := range keys {
+				h := fnv32(k)
+				idx := int(h % uint32(parts))
+				buckets[idx] = append(buckets[idx], k)
+				btombs[idx] = append(btombs[idx], tombs[i])
+			}
+			s.logger.Info("flush using hash-based partitioning", "parts", parts)
 		}
 		var wg sync.WaitGroup
 		for p := 0; p < parts; p++ {
