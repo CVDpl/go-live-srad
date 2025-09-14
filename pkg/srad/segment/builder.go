@@ -55,6 +55,13 @@ type Builder struct {
 	filterBloomBlake3   string
 	filterTrigramBlake3 string
 	keysBlake3          string
+	// Core artifacts BLAKE3
+	loudsBlake3  string
+	edgesBlake3  string
+	acceptBlake3 string
+	tmapBlake3   string
+	tailsBlake3  string
+	tombsBlake3  string
 
 	// Filter configuration (0/false => defaults)
 	customBloomFPR  float64
@@ -65,6 +72,12 @@ type Builder struct {
 	maxShards         int
 	shardMinKeys      int
 	bloomAdaptMinKeys int
+}
+
+// pair holds key and tombstone flag used during snapshot sorting.
+type pair struct {
+	k []byte
+	t bool
 }
 
 // NewBuilder creates a new segment builder.
@@ -91,15 +104,11 @@ func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
 	// Get all keys with tombstone flags
 	allKeys, tombs := snapshot.GetAllWithTombstones()
 	// Keep pairs aligned while sorting
-	type pair struct {
-		k []byte
-		t bool
-	}
 	pairs := make([]pair, len(allKeys))
 	for i := range allKeys {
 		pairs[i] = pair{k: allKeys[i], t: tombs[i]}
 	}
-	sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
+	pairs = b.parallelSortPairs(pairs)
 
 	// Input is now sorted; allow Build() to skip resort/dedup
 	b.alreadySorted = true
@@ -214,7 +223,7 @@ func (b *Builder) Build() (*Metadata, error) {
 
 	// Ensure tombstones are sorted to allow streaming merge
 	if len(b.tombstoneKeys) > 1 {
-		sort.Slice(b.tombstoneKeys, func(i, j int) bool { return bytes.Compare(b.tombstoneKeys[i], b.tombstoneKeys[j]) < 0 })
+		b.tombstoneKeys = b.parallelSortByteSlices(b.tombstoneKeys)
 	}
 
 	// Create segment directory
@@ -232,42 +241,72 @@ func (b *Builder) Build() (*Metadata, error) {
 	// Kick off parallel tasks that don't depend on trie
 	keysPath := filepath.Join(segmentDir, "keys.dat")
 	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
-	wg.Add(2)
+	errCh := make(chan error, 8)
+	// filters
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if err := b.buildFilters(filtersDir); err != nil {
 			errCh <- err
 		}
 	}()
+	// keys.dat
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if err := b.writeKeysFile(keysPath); err != nil {
 			errCh <- err
 		}
 	}()
+	// tombstones.dat (optional)
+	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tombPath := filepath.Join(segmentDir, "tombstones.dat")
+			if err := b.writeTombstonesFile(tombPath); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	b.logger.Info("building segment", "id", b.segmentID, "keys", len(b.keys))
 
 	// Build trie structure (simplified for now)
 	trie := b.buildTrie()
 
-	// Build LOUDS/Edges/Accept/TMap/Tails sequentially (depend on trie)
-	if err := b.buildLOUDS(trie, filepath.Join(segmentDir, "index.louds")); err != nil {
-		return nil, fmt.Errorf("build LOUDS: %w", err)
-	}
-	if err := b.buildEdges(trie, filepath.Join(segmentDir, "index.edges")); err != nil {
-		return nil, fmt.Errorf("build edges: %w", err)
-	}
-	if err := b.buildAccept(trie, filepath.Join(segmentDir, "index.accept")); err != nil {
-		return nil, fmt.Errorf("build accept: %w", err)
-	}
-	if err := b.buildTMap(filepath.Join(segmentDir, "index.tmap")); err != nil {
-		return nil, fmt.Errorf("build tmap: %w", err)
-	}
-	if err := b.buildTails(filepath.Join(segmentDir, "tails.dat")); err != nil {
-		return nil, fmt.Errorf("build tails: %w", err)
-	}
+	// Build LOUDS/Edges/Accept/TMap/Tails in parallel (depend only on trie)
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		if err := b.buildLOUDS(trie, filepath.Join(segmentDir, "index.louds")); err != nil {
+			errCh <- fmt.Errorf("build LOUDS: %w", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := b.buildEdges(trie, filepath.Join(segmentDir, "index.edges")); err != nil {
+			errCh <- fmt.Errorf("build edges: %w", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := b.buildAccept(trie, filepath.Join(segmentDir, "index.accept")); err != nil {
+			errCh <- fmt.Errorf("build accept: %w", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := b.buildTMap(filepath.Join(segmentDir, "index.tmap")); err != nil {
+			errCh <- fmt.Errorf("build tmap: %w", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := b.buildTails(filepath.Join(segmentDir, "tails.dat")); err != nil {
+			errCh <- fmt.Errorf("build tails: %w", err)
+		}
+	}()
 
 	// Wait for parallel tasks
 	wg.Wait()
@@ -278,13 +317,7 @@ func (b *Builder) Build() (*Metadata, error) {
 		}
 	}
 
-	// Optionally write tombstones file (can be omitted when unnecessary)
-	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
-		tombPath := filepath.Join(segmentDir, "tombstones.dat")
-		if err := b.writeTombstonesFile(tombPath); err != nil {
-			return nil, fmt.Errorf("write tombstones.dat: %w", err)
-		}
-	}
+	// tombstones written above when present
 
 	// Create metadata
 	metadata := NewMetadata(b.segmentID, b.level)
@@ -319,21 +352,31 @@ func (b *Builder) Build() (*Metadata, error) {
 	if b.filterTrigramBits > 0 {
 		metadata.Filters.Trigram = &TrigramFilter{Bits: b.filterTrigramBits, Scheme: b.filterTrigramScheme}
 	}
-	// Compute BLAKE3 for key files we generate here
+	// BLAKE3 for files we generated
 	metadata.Blake3 = map[string]string{}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.louds")); err == nil {
+	if b.loudsBlake3 != "" {
+		metadata.Blake3["index.louds"] = b.loudsBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.louds")); err == nil {
 		metadata.Blake3["index.louds"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.edges")); err == nil {
+	if b.edgesBlake3 != "" {
+		metadata.Blake3["index.edges"] = b.edgesBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.edges")); err == nil {
 		metadata.Blake3["index.edges"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.accept")); err == nil {
+	if b.acceptBlake3 != "" {
+		metadata.Blake3["index.accept"] = b.acceptBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.accept")); err == nil {
 		metadata.Blake3["index.accept"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.tmap")); err == nil {
+	if b.tmapBlake3 != "" {
+		metadata.Blake3["index.tmap"] = b.tmapBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.tmap")); err == nil {
 		metadata.Blake3["index.tmap"] = h
 	}
-	if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "tails.dat")); err == nil {
+	if b.tailsBlake3 != "" {
+		metadata.Blake3["tails.dat"] = b.tailsBlake3
+	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "tails.dat")); err == nil {
 		metadata.Blake3["tails.dat"] = h
 	}
 	if b.filterBloomBlake3 != "" {
@@ -352,7 +395,9 @@ func (b *Builder) Build() (*Metadata, error) {
 		metadata.Blake3["keys.dat"] = h
 	}
 	if len(b.tombstoneKeys) > 0 && !b.dropTombstones {
-		if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "tombstones.dat")); err == nil {
+		if b.tombsBlake3 != "" {
+			metadata.Blake3["tombstones.dat"] = b.tombsBlake3
+		} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "tombstones.dat")); err == nil {
 			metadata.Blake3["tombstones.dat"] = h
 		}
 	}
@@ -416,27 +461,30 @@ func (b *Builder) writeTombstonesFile(path string) error {
 	defer af.Close()
 
 	bw := bufio.NewWriterSize(af, 2<<20)
+	hasher := blake3.New()
+	out := io.MultiWriter(bw, hasher)
 
 	// Write common header with magic and version
-	if err := WriteCommonHeader(bw, common.MagicTombs, common.VersionSegment); err != nil {
+	if err := WriteCommonHeader(out, common.MagicTombs, common.VersionSegment); err != nil {
 		return err
 	}
 	count := uint32(len(b.tombstoneKeys))
-	if err := binary.Write(bw, binary.LittleEndian, count); err != nil {
+	if err := binary.Write(out, binary.LittleEndian, count); err != nil {
 		return err
 	}
 	for _, k := range b.tombstoneKeys {
 		kl := uint32(len(k))
-		if err := binary.Write(bw, binary.LittleEndian, kl); err != nil {
+		if err := binary.Write(out, binary.LittleEndian, kl); err != nil {
 			return err
 		}
-		if _, err := bw.Write(k); err != nil {
+		if _, err := out.Write(k); err != nil {
 			return err
 		}
 	}
 	if err := bw.Flush(); err != nil {
 		return err
 	}
+	b.tombsBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return af.Commit()
 }
 
@@ -535,12 +583,15 @@ func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
 		return err
 	}
 	defer file.Close()
-	if err := WriteCommonHeader(file, common.MagicLouds, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicLouds, common.VersionSegment); err != nil {
 		return err
 	}
-	if _, err := file.Write(loudsData); err != nil {
+	if _, err := out.Write(loudsData); err != nil {
 		return err
 	}
+	b.loudsBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
@@ -594,16 +645,18 @@ func (b *Builder) buildEdges(_ *trieNode, path string) error {
 	defer file.Close()
 
 	// Write header
-	if err := WriteCommonHeader(file, common.MagicEdges, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicEdges, common.VersionSegment); err != nil {
 		return err
 	}
 
 	// Write placeholder data
 	data := make([]byte, 1024)
-	if _, err := file.Write(data); err != nil {
+	if _, err := out.Write(data); err != nil {
 		return err
 	}
-
+	b.edgesBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
@@ -617,16 +670,18 @@ func (b *Builder) buildAccept(_ *trieNode, path string) error {
 	defer file.Close()
 
 	// Write header
-	if err := WriteCommonHeader(file, common.MagicAccept, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicAccept, common.VersionSegment); err != nil {
 		return err
 	}
 
 	// Write placeholder data
 	data := make([]byte, 1024)
-	if _, err := file.Write(data); err != nil {
+	if _, err := out.Write(data); err != nil {
 		return err
 	}
-
+	b.acceptBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
@@ -639,16 +694,18 @@ func (b *Builder) buildTMap(path string) error {
 	defer file.Close()
 
 	// Write header
-	if err := WriteCommonHeader(file, common.MagicTMap, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicTMap, common.VersionSegment); err != nil {
 		return err
 	}
 
 	// Write placeholder data
 	data := make([]byte, 256)
-	if _, err := file.Write(data); err != nil {
+	if _, err := out.Write(data); err != nil {
 		return err
 	}
-
+	b.tmapBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
@@ -661,16 +718,18 @@ func (b *Builder) buildTails(path string) error {
 	defer file.Close()
 
 	// Write header
-	if err := WriteCommonHeader(file, common.MagicTails, common.VersionSegment); err != nil {
+	hasher := blake3.New()
+	out := io.MultiWriter(file, hasher)
+	if err := WriteCommonHeader(out, common.MagicTails, common.VersionSegment); err != nil {
 		return err
 	}
 
 	// Write placeholder data
 	data := make([]byte, 256)
-	if _, err := file.Write(data); err != nil {
+	if _, err := out.Write(data); err != nil {
 		return err
 	}
-
+	b.tailsBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
 	return file.Commit()
 }
 
@@ -874,6 +933,148 @@ func commonPrefixLength(a, b []byte) int {
 	}
 
 	return minLen
+}
+
+// parallelSortPairs sorts pairs by key using shard-sort + merge if opportune, otherwise falls back to single-threaded sort.
+func (b *Builder) parallelSortPairs(pairs []pair) []pair {
+	n := len(pairs)
+	if n < 2 {
+		return pairs
+	}
+	shards := runtime.GOMAXPROCS(0)
+	if b.maxShards > 0 && shards > b.maxShards {
+		shards = b.maxShards
+	}
+	minKeys := b.shardMinKeys
+	if minKeys <= 0 {
+		minKeys = 200_000
+	}
+	if n < minKeys {
+		sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
+		return pairs
+	}
+	if shards < 2 {
+		sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
+		return pairs
+	}
+	runs := make([][]pair, shards)
+	var wg sync.WaitGroup
+	wg.Add(shards)
+	for s := 0; s < shards; s++ {
+		start := (n * s) / shards
+		end := (n * (s + 1)) / shards
+		go func(start, end, idx int) {
+			defer wg.Done()
+			run := make([]pair, end-start)
+			copy(run, pairs[start:end])
+			sort.Slice(run, func(i, j int) bool { return bytes.Compare(run[i].k, run[j].k) < 0 })
+			runs[idx] = run
+		}(start, end, s)
+	}
+	wg.Wait()
+	// Iteratively merge runs
+	for len(runs) > 1 {
+		next := make([][]pair, 0, (len(runs)+1)/2)
+		for i := 0; i < len(runs); i += 2 {
+			if i+1 >= len(runs) {
+				next = append(next, runs[i])
+				break
+			}
+			a, b := runs[i], runs[i+1]
+			merged := make([]pair, 0, len(a)+len(b))
+			ia, ib := 0, 0
+			for ia < len(a) && ib < len(b) {
+				if bytes.Compare(a[ia].k, b[ib].k) <= 0 {
+					merged = append(merged, a[ia])
+					ia++
+				} else {
+					merged = append(merged, b[ib])
+					ib++
+				}
+			}
+			if ia < len(a) {
+				merged = append(merged, a[ia:]...)
+			}
+			if ib < len(b) {
+				merged = append(merged, b[ib:]...)
+			}
+			next = append(next, merged)
+		}
+		runs = next
+	}
+	if len(runs) == 1 {
+		return runs[0]
+	}
+	return pairs
+}
+
+// parallelSortByteSlices sorts [][]byte similarly to parallelSortPairs
+func (b *Builder) parallelSortByteSlices(keys [][]byte) [][]byte {
+	n := len(keys)
+	if n < 2 {
+		return keys
+	}
+	shards := runtime.GOMAXPROCS(0)
+	if b.maxShards > 0 && shards > b.maxShards {
+		shards = b.maxShards
+	}
+	minKeys := b.shardMinKeys
+	if minKeys <= 0 {
+		minKeys = 200_000
+	}
+	if n < minKeys || shards < 2 {
+		sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
+		return keys
+	}
+	runs := make([][][]byte, shards)
+	var wg sync.WaitGroup
+	wg.Add(shards)
+	for s := 0; s < shards; s++ {
+		start := (n * s) / shards
+		end := (n * (s + 1)) / shards
+		go func(start, end, idx int) {
+			defer wg.Done()
+			run := make([][]byte, end-start)
+			copy(run, keys[start:end])
+			sort.Slice(run, func(i, j int) bool { return bytes.Compare(run[i], run[j]) < 0 })
+			runs[idx] = run
+		}(start, end, s)
+	}
+	wg.Wait()
+	// Merge runs
+	for len(runs) > 1 {
+		next := make([][][]byte, 0, (len(runs)+1)/2)
+		for i := 0; i < len(runs); i += 2 {
+			if i+1 >= len(runs) {
+				next = append(next, runs[i])
+				break
+			}
+			a, b := runs[i], runs[i+1]
+			merged := make([][]byte, 0, len(a)+len(b))
+			ia, ib := 0, 0
+			for ia < len(a) && ib < len(b) {
+				if bytes.Compare(a[ia], b[ib]) <= 0 {
+					merged = append(merged, a[ia])
+					ia++
+				} else {
+					merged = append(merged, b[ib])
+					ib++
+				}
+			}
+			if ia < len(a) {
+				merged = append(merged, a[ia:]...)
+			}
+			if ib < len(b) {
+				merged = append(merged, b[ib:]...)
+			}
+			next = append(next, merged)
+		}
+		runs = next
+	}
+	if len(runs) == 1 {
+		return runs[0]
+	}
+	return keys
 }
 
 // NullLogger is a logger that discards all messages.
