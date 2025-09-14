@@ -178,8 +178,7 @@ func TestPersistenceAndRecovery(t *testing.T) {
 	defer store.Close()
 
 	// Count all keys
-	pattern := regexp.MustCompile("persist-key-.*")
-	iter, err := store.RegexSearch(ctx, pattern, DefaultQueryOptions())
+	iter, err := store.RangeScan(ctx, []byte("persist-key-"), []byte("persist-key-~"), DefaultQueryOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -212,6 +212,75 @@ func TestStoreStats(t *testing.T) {
 	_ = stats.WritesPerSecond
 }
 
+// Tombstone should not hide a newer reinsert (newest wins)
+func TestTombstoneThenReinsertVisible(t *testing.T) {
+	dir := t.TempDir()
+
+	opts := DefaultOptions()
+	store, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	key := []byte("foo")
+	if err := store.Insert(key); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := store.Delete(key); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if err := store.Insert(key); err != nil {
+		t.Fatalf("reinsert: %v", err)
+	}
+
+	ctx := context.Background()
+	re := regexp.MustCompile("^foo$")
+	it, err := store.RegexSearch(ctx, re, nil)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	defer it.Close()
+	if !it.Next(ctx) {
+		t.Fatalf("expected to find reinserted key")
+	}
+}
+
+// Expired entries should not be returned via LOUDS path
+func TestExpiryHiddenInLOUDS(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	store, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	key := []byte("bar")
+	if err := store.InsertWithTTL(key, 50*time.Millisecond); err != nil {
+		t.Fatalf("insert ttl: %v", err)
+	}
+	if err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	ctx := context.Background()
+	re := regexp.MustCompile("^bar$")
+	it, err := store.RegexSearch(ctx, re, nil)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	defer it.Close()
+	if it.Next(ctx) {
+		t.Fatalf("expired key should not be returned")
+	}
+}
+
 func TestStoreLimits(t *testing.T) {
 	dir := t.TempDir()
 

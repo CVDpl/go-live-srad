@@ -87,8 +87,8 @@ var (
 	ErrInvalidTTL = errors.New("invalid TTL value")
 
 	// TTL constants
-	MaxTTL     = 365 * 24 * time.Hour // 1 year max TTL
-	DefaultTTL = 24 * time.Hour       // 24 hours default
+	MaxTTL                   = 200 * 365 * 24 * time.Hour // 200 years max TTL
+	DefaultTTL time.Duration = 0                          // 0 = never expire by default
 )
 
 // File paths within store directory

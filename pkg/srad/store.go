@@ -121,6 +121,13 @@ type Options struct {
 	// WALBufferSize overrides the WAL write buffer size in bytes (0 = default).
 	WALBufferSize int
 
+	// WALSyncOnEveryWrite forces fsync on each WAL write (safest, slowest).
+	WALSyncOnEveryWrite bool
+	// WALFlushOnEveryWrite forces buffer flush on each WAL write (safer, faster than sync).
+	WALFlushOnEveryWrite bool
+	// WALFlushEveryBytes triggers buffer flush after approximately this many bytes written (0 = disabled).
+	WALFlushEveryBytes int
+
 	// PrefixBloomFPR sets Bloom filter target false positive rate (0 => default).
 	PrefixBloomFPR float64
 	// PrefixBloomMaxPrefixLen limits prefix length added to Bloom (0 => default).
@@ -315,6 +322,9 @@ func DefaultOptions() *Options {
 		WALRotateSize:               0,
 		WALMaxFileSize:              0,
 		WALBufferSize:               0,
+		WALSyncOnEveryWrite:         false,
+		WALFlushOnEveryWrite:        false,
+		WALFlushEveryBytes:          int(common.WALBufferSize),
 		PrefixBloomFPR:              common.DefaultBloomFPR,
 		PrefixBloomMaxPrefixLen:     int(common.DefaultPrefixBloomLength),
 		EnableTrigramFilter:         true,

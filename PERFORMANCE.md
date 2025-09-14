@@ -86,6 +86,26 @@ val := fetchFromStore(key)
 cache.Put(key, val)
 ```
 
+### 5. WAL tuning (durability vs latency)
+
+- WAL write buffer is 256KB by default.
+- Default behavior: `WALFlushEveryBytes = 256KB` (flush buffer roughly each buffer-size written).
+- Options:
+  - `WALFlushEveryBytes`: increase to reduce flush frequency (better throughput, larger loss window) or decrease to reduce loss window.
+  - `WALFlushOnEveryWrite`: flush after each write (no fsync) – reduces loss window on process crash.
+  - `WALSyncOnEveryWrite`: fsync on every write – maximum durability, highest latency.
+
+Guidance:
+- General production: keep `FlushEveryBytes = 256KB`, enable `RotateWALOnFlush`, periodically call `PruneWAL()`.
+- Latency-sensitive: increase `FlushEveryBytes` (e.g., 1MB) and rotate WAL on flush.
+- Durability-critical: enable `WALSyncOnEveryWrite`.
+
+### 5b. Search concurrency and correctness
+
+- Segment scans run newest-to-oldest with per-segment tombstone seeding to enforce "newest wins" semantics.
+- Internally, the engine holds references to segment readers during scans to avoid use-after-close while compaction runs.
+- Use contexts to cancel long-running searches; the iterator respects `ctx.Done()`.
+
 ### 6. Builder parallelization and filter tuning
 
 - Use sharding knobs for large builds:

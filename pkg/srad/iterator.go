@@ -29,6 +29,9 @@ func (it *simpleIterator) Next(ctx context.Context) bool {
 	}
 
 	// Advance memtable iterator
+	if it.memIter == nil {
+		return false
+	}
 	if !it.memIter.Next(ctx) {
 		it.err = it.memIter.Err()
 		return false
@@ -56,7 +59,10 @@ func (it *simpleIterator) Err() error {
 	if it.err != nil {
 		return it.err
 	}
-	return it.memIter.Err()
+	if it.memIter != nil {
+		return it.memIter.Err()
+	}
+	return nil
 }
 
 // ID returns the global ID of the current result.

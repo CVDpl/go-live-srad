@@ -268,6 +268,9 @@ func (b *Builder) Build() (*Metadata, error) {
 	if err := os.MkdirAll(segmentDir, 0755); err != nil {
 		return nil, fmt.Errorf("create segment directory: %w", err)
 	}
+	// Create BUILDING sentinel to protect against RCU cleanup during long builds
+	buildingPath := filepath.Join(segmentDir, ".building")
+	_ = os.WriteFile(buildingPath, []byte("1"), 0644)
 
 	// Create filters directory
 	filtersDir := filepath.Join(segmentDir, "filters")
@@ -462,6 +465,9 @@ func (b *Builder) Build() (*Metadata, error) {
 	if err := metadata.SaveToFile(metadataPath); err != nil {
 		return nil, fmt.Errorf("save metadata: %w", err)
 	}
+
+	// Build completed successfully – remove BUILDING sentinel
+	_ = os.Remove(buildingPath)
 
 	b.logger.Info("segment built successfully", "id", b.segmentID)
 

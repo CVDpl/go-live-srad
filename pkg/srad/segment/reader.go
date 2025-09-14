@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/CVDpl/go-live-srad/internal/common"
@@ -58,6 +59,59 @@ type Reader struct {
 
 	// mmapped file content (entire file). We slice payload at [256:].
 	mmap []byte
+
+	// Refcount for safe lifetime under concurrent queries
+	refcnt int32
+
+	// Closed flag to make Close idempotent
+	closed int32
+}
+
+// IncRef increments the reader's reference count.
+func (r *Reader) IncRef() { atomic.AddInt32(&r.refcnt, 1) }
+
+// DecRef decrements the reference count.
+func (r *Reader) DecRef() { atomic.AddInt32(&r.refcnt, -1) }
+
+// Release decrements refcount and closes resources when it reaches zero.
+func (r *Reader) Release() {
+	if atomic.AddInt32(&r.refcnt, -1) == 0 {
+		r.internalClose()
+	}
+}
+
+func (r *Reader) internalClose() {
+	if !atomic.CompareAndSwapInt32(&r.closed, 0, 1) {
+		return
+	}
+	if r.loudsFile != nil {
+		r.loudsFile.Close()
+	}
+	if r.edgesFile != nil {
+		r.edgesFile.Close()
+	}
+	if r.acceptFile != nil {
+		r.acceptFile.Close()
+	}
+	if r.keysFile != nil {
+		r.keysFile.Close()
+	}
+	if r.expFile != nil {
+		r.expFile.Close()
+	}
+	if r.triFile != nil {
+		r.triFile.Close()
+	}
+	if r.bloomFile != nil {
+		r.bloomFile.Close()
+	}
+	if r.tombFile != nil {
+		r.tombFile.Close()
+	}
+	if r.mmap != nil {
+		_ = unix.Munmap(r.mmap)
+		r.mmap = nil
+	}
 }
 
 // NewReader creates a new segment reader.
@@ -570,36 +624,7 @@ func (r *Reader) RegexIterator(pattern *regexp.Regexp) *SegmentIterator {
 
 // Close closes the segment reader.
 func (r *Reader) Close() error {
-	if r.loudsFile != nil {
-		r.loudsFile.Close()
-	}
-	if r.edgesFile != nil {
-		r.edgesFile.Close()
-	}
-	if r.acceptFile != nil {
-		r.acceptFile.Close()
-	}
-	if r.keysFile != nil {
-		r.keysFile.Close()
-	}
-	if r.expFile != nil {
-		r.expFile.Close()
-	}
-	if r.triFile != nil {
-		r.triFile.Close()
-	}
-	if r.bloomFile != nil {
-		r.bloomFile.Close()
-	}
-	if r.tombFile != nil {
-		r.tombFile.Close()
-	}
-	// Unmap if mapped
-	if r.mmap != nil {
-		_ = unix.Munmap(r.mmap)
-		r.mmap = nil
-	}
-
+	r.internalClose()
 	return nil
 }
 
@@ -640,9 +665,13 @@ func (r *Reader) MayContain(pattern *regexp.Regexp) bool {
 	lit, _ := pattern.LiteralPrefix()
 	if lit != "" && r.bloom != nil {
 		b := []byte(lit)
-		// Our builder added prefixes up to 10 bytes; exact check is most selective
-		if len(b) <= 16 { // be lenient; Bloom still works for longer but may be higher FPR
+		if len(b) <= 16 {
 			if !r.bloom.Contains(b) {
+				return false
+			}
+		} else {
+			// For longer literals, check any prefix presence
+			if !r.bloom.ContainsPrefix(b) {
 				return false
 			}
 		}
@@ -677,28 +706,33 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
 	if err := binary.Read(r.keysFile, binary.LittleEndian, &count); err != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
+	// Best-effort load expiries so we can filter during streaming
+	if len(r.expiries) == 0 && r.expFile != nil {
+		_ = r.loadExpiries()
+	}
 	var i uint32
 	return func() ([]byte, bool) {
-		if i >= count {
-			return nil, false
-		}
-		var kl uint32
-		if err := binary.Read(r.keysFile, binary.LittleEndian, &kl); err != nil {
-			return nil, false
-		}
-		var k []byte
-		if kl > 0 {
-			k = make([]byte, kl)
-			if _, err := io.ReadFull(r.keysFile, k); err != nil {
+		for i < count {
+			var kl uint32
+			if err := binary.Read(r.keysFile, binary.LittleEndian, &kl); err != nil {
 				return nil, false
 			}
+			var k []byte
+			if kl > 0 {
+				k = make([]byte, kl)
+				if _, err := io.ReadFull(r.keysFile, k); err != nil {
+					return nil, false
+				}
+			}
+			idx := int(i)
+			i++
+			// Filter expired using aligned expiry index when available
+			if idx < len(r.expiries) && r.isExpiredKeyIndex(idx) {
+				continue
+			}
+			return k, true
 		}
-		// If expiries were loaded into memory and are aligned, check and drop expired
-		if len(r.expiries) > 0 && len(r.keys) > 0 {
-			// On streaming, we don't have index; this path is primarily for compaction streams; we'll filter by comparing to in-memory keys if loaded
-		}
-		i++
-		return k, true
+		return nil, false
 	}
 }
 
@@ -816,8 +850,33 @@ func (it *SegmentIterator) Next() bool {
 
 			if it.reader.louds.IsLeaf(state.node) {
 				if (it.pattern == nil || it.pattern.Match(state.key)) && !it.reader.HasTombstone(state.key) {
-					it.current = state
-					return true
+					// If expiries are loaded and keys are available, check expiry by index
+					if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
+						idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], state.key) >= 0 })
+						if idx < len(it.reader.keys) && bytes.Equal(it.reader.keys[idx], state.key) && it.reader.isExpiredKeyIndex(idx) {
+							// skip expired
+						} else {
+							it.current = state
+							return true
+						}
+					} else {
+						// Try to lazily load keys to enable expiry checks
+						_ = it.reader.loadKeys()
+						if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
+							idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], state.key) >= 0 })
+							if idx < len(it.reader.keys) && bytes.Equal(it.reader.keys[idx], state.key) && it.reader.isExpiredKeyIndex(idx) {
+								// skip expired
+								// continue
+							} else {
+								it.current = state
+								return true
+							}
+						} else {
+							// No expiry information; emit as-is
+							it.current = state
+							return true
+						}
+					}
 				}
 			}
 
@@ -825,8 +884,25 @@ func (it *SegmentIterator) Next() bool {
 			var children = make([]iteratorState, 0, 8)
 			for child != 0 {
 				label := it.reader.louds.GetLabel(child)
-				// Early pruning: if we have a literal and current depth is within it,
-				// the next label must match the literal's next byte.
+				// First, advance NFA to avoid literal false negatives
+				nextState := state.nfa
+				viable := true
+				if it.eng != nil {
+					if nextState != nil {
+						nextState, viable = it.eng.Step(nextState, label)
+					} else {
+						// Build minimal key only when needed for fallback viability check
+						tmpKey := make([]byte, len(state.key)+1)
+						copy(tmpKey, state.key)
+						tmpKey[len(tmpKey)-1] = label
+						viable = it.eng.CanMatchPrefix(tmpKey)
+					}
+				}
+				if !viable {
+					child = it.reader.louds.NextSibling(child)
+					continue
+				}
+				// Optional literal pruning after NFA viability
 				if it.hasLiteral {
 					pos := len(state.key)
 					if pos < len(it.literal) && it.literal[pos] != label {
@@ -834,24 +910,8 @@ func (it *SegmentIterator) Next() bool {
 						continue
 					}
 				}
-				nextState := state.nfa
-				viable := true
-				if it.eng != nil {
-					// If we have an explicit state, step it; otherwise fallback check
-					if nextState != nil {
-						nextState, viable = it.eng.Step(nextState, label)
-					} else {
-						// Build minimal key only if needed for fallback viability check
-						tmpKey := make([]byte, len(state.key)+1)
-						copy(tmpKey, state.key)
-						tmpKey[len(tmpKey)-1] = label
-						viable = it.eng.CanMatchPrefix(tmpKey)
-					}
-				}
-				if viable {
-					childKey := append(append([]byte(nil), state.key...), label)
-					children = append(children, iteratorState{node: child, key: childKey, nfa: nextState})
-				}
+				childKey := append(append([]byte(nil), state.key...), label)
+				children = append(children, iteratorState{node: child, key: childKey, nfa: nextState})
 				child = it.reader.louds.NextSibling(child)
 			}
 			for i := len(children) - 1; i >= 0; i-- {

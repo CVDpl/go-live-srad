@@ -396,3 +396,28 @@ Contributions are welcome! Please ensure:
 ## License
 
 This project is licensed under the BSD 3-Clause License. See the `LICENSE` file for details.
+
+## WAL Durability
+
+SRAD uses a write-ahead log (WAL) for durability. By default, the WAL buffers writes in userspace and flushes them periodically. You can tune durability-vs-latency using the following options:
+
+- `WALSyncOnEveryWrite` (bool): call `fsync` after each WAL write. Safest but slowest.
+- `WALFlushOnEveryWrite` (bool): flush the userspace buffer after each write (no `fsync`). Faster than sync but still reduces loss on process crash.
+- `WALFlushEveryBytes` (int): flush after approximately this many bytes are written. Defaults to the WAL buffer size (256KB).
+
+Recommendations:
+- Production: keep `WALFlushEveryBytes = 256KB` (default). Enable `RotateWALOnFlush` to make pruning effective. Periodically call `PruneWAL()`.
+- Maximum durability: set `WALSyncOnEveryWrite = true` (expect higher latency).
+- Lowest latency: leave all off, at the cost of higher data-loss window on process crash.
+
+Example:
+```go
+opts := srad.DefaultOptions()
+opts.WALFlushEveryBytes = 512 * 1024 // 512KB
+opts.RotateWALOnFlush = true         // rotate on each flush
+store, _ := srad.Open(dir, opts)
+```
+
+### Search concurrency and correctness
+
+Regex search scans memtable first, then segments from newest to oldest, seeding a `seen` set with memtable tombstones and per-segment tombstones to enforce "newest wins". The engine holds internal references to segment readers during scans to avoid use-after-close during compaction. Use contexts to cancel long-running searches.

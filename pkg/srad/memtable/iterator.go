@@ -81,10 +81,9 @@ func (it *Iterator) Next(ctx context.Context) bool {
 
 			// Early pruning using literal prefix when available: ensure child label matches literal suffix
 			if it.hasLiteral {
-				curLen := len(currentKey)
-				if curLen < len(it.literal) {
-					suffix := it.literal[curLen:]
-					if !bytes.HasPrefix(suffix, child.label) {
+				pos := len(currentKey)
+				if pos < len(it.literal) {
+					if len(child.label) == 0 || child.label[0] != it.literal[pos] {
 						it.stats.pathsSkipped++
 						continue
 					}

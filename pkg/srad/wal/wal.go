@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/CVDpl/go-live-srad/internal/common"
+	enc "github.com/CVDpl/go-live-srad/internal/encoding"
 	"github.com/CVDpl/go-live-srad/pkg/srad/utils"
 )
 
@@ -33,6 +34,12 @@ type WAL struct {
 	logger      common.Logger
 	closed      bool
 	bufferSize  int
+
+	// Durability policy
+	syncOnEveryWrite    bool
+	flushOnEveryWrite   bool
+	flushEveryBytes     int
+	bytesSinceLastFlush int
 }
 
 // Config controls WAL sizing and buffering.
@@ -40,6 +47,10 @@ type Config struct {
 	RotateSize  int64
 	MaxFileSize int64
 	BufferSize  int
+	// Durability policy
+	SyncOnEveryWrite  bool
+	FlushOnEveryWrite bool
+	FlushEveryBytes   int
 }
 
 // WALHeader represents the fixed-size WAL file header (14 bytes).
@@ -96,11 +107,14 @@ func NewWithConfig(dir string, logger common.Logger, cfg Config) (*WAL, error) {
 	}
 
 	w := &WAL{
-		dir:         dir,
-		rotateSize:  cfg.RotateSize,
-		maxFileSize: cfg.MaxFileSize,
-		bufferSize:  cfg.BufferSize,
-		logger:      logger,
+		dir:               dir,
+		rotateSize:        cfg.RotateSize,
+		maxFileSize:       cfg.MaxFileSize,
+		bufferSize:        cfg.BufferSize,
+		logger:            logger,
+		syncOnEveryWrite:  cfg.SyncOnEveryWrite,
+		flushOnEveryWrite: cfg.FlushOnEveryWrite,
+		flushEveryBytes:   cfg.FlushEveryBytes,
 	}
 
 	// Find the latest WAL file or create a new one
@@ -296,11 +310,30 @@ func (w *WAL) WriteWithTTL(op uint8, key []byte, ttl time.Duration) error {
 	}
 
 	// Write record
-	if _, err := w.writer.Write(data); err != nil {
+	n, err := w.writer.Write(data)
+	if err != nil {
 		return fmt.Errorf("write WAL record: %w", err)
 	}
 
 	w.currentSize += int64(len(data))
+	w.bytesSinceLastFlush += n
+
+	// Optional flush policy
+	if w.flushOnEveryWrite || (w.flushEveryBytes > 0 && w.bytesSinceLastFlush >= w.flushEveryBytes) {
+		if err := w.writer.Flush(); err != nil {
+			return fmt.Errorf("flush WAL buffer: %w", err)
+		}
+		w.bytesSinceLastFlush = 0
+	}
+	// Optional sync policy (implies flush)
+	if w.syncOnEveryWrite {
+		if err := w.writer.Flush(); err != nil {
+			return fmt.Errorf("flush WAL buffer before sync: %w", err)
+		}
+		if err := w.currentFile.Sync(); err != nil {
+			return fmt.Errorf("sync WAL file: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -363,6 +396,9 @@ func (w *WAL) rotate() error {
 	}
 
 	w.logger.Info("rotated WAL file", "old_seq", w.currentSeq-1, "new_seq", w.currentSeq)
+
+	// reset flush counter
+	w.bytesSinceLastFlush = 0
 
 	return nil
 }
@@ -578,47 +614,40 @@ func (w *WAL) replayFile(path string, callback func(op uint8, key []byte, expire
 
 // readRecord reads a single WAL record.
 func (w *WAL) readRecord(reader *bufio.Reader) (WALRecord, int, error) {
-	startPos := 0
-
 	// Read op as varint
 	op, err := utils.ReadUvarint(reader)
 	if err == io.EOF {
-		return WALRecord{}, startPos, io.EOF
+		return WALRecord{}, 0, io.EOF
 	}
 	if err != nil {
-		return WALRecord{}, startPos, fmt.Errorf("read op: %w", err)
+		return WALRecord{}, 0, fmt.Errorf("read op: %w", err)
 	}
-	startPos += binary.MaxVarintLen64 // approximate
 
 	// Read key length as varint
 	keyLen, err := utils.ReadUvarint(reader)
 	if err != nil {
-		return WALRecord{}, startPos, fmt.Errorf("read key length: %w", err)
+		return WALRecord{}, 0, fmt.Errorf("read key length: %w", err)
 	}
-	startPos += binary.MaxVarintLen64 // approximate
 
 	// Read key
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(reader, key); err != nil {
-		return WALRecord{}, startPos, fmt.Errorf("read key: %w", err)
+		return WALRecord{}, 0, fmt.Errorf("read key: %w", err)
 	}
-	startPos += int(keyLen)
 
 	// Read absolute expiry as int64 (unix nanos)
 	expBuf := make([]byte, 8)
 	if _, err := io.ReadFull(reader, expBuf); err != nil {
-		return WALRecord{}, startPos, fmt.Errorf("read expiry: %w", err)
+		return WALRecord{}, 0, fmt.Errorf("read expiry: %w", err)
 	}
 	abs := int64(binary.LittleEndian.Uint64(expBuf))
-	startPos += 8
 
 	// Read CRC32C
 	crcBuf := make([]byte, 4)
 	if _, err := io.ReadFull(reader, crcBuf); err != nil {
-		return WALRecord{}, startPos, fmt.Errorf("read CRC: %w", err)
+		return WALRecord{}, 0, fmt.Errorf("read CRC: %w", err)
 	}
 	expectedCRC := binary.LittleEndian.Uint32(crcBuf)
-	startPos += 4
 
 	// Verify CRC
 	var buf bytes.Buffer
@@ -629,8 +658,16 @@ func (w *WAL) readRecord(reader *bufio.Reader) (WALRecord, int, error) {
 
 	actualCRC := utils.ComputeCRC32C(buf.Bytes())
 	if actualCRC != expectedCRC {
-		return WALRecord{}, startPos, common.ErrCRCMismatch
+		return WALRecord{}, 0, common.ErrCRCMismatch
 	}
+
+	// Compute exact size consumed
+	size := 0
+	size += enc.SizeUvarint(uint64(op))
+	size += enc.SizeUvarint(uint64(keyLen))
+	size += int(keyLen)
+	size += 8 // expiry
+	size += 4 // CRC32C
 
 	var ttlAsDuration time.Duration
 	if abs > 0 {
@@ -642,7 +679,7 @@ func (w *WAL) readRecord(reader *bufio.Reader) (WALRecord, int, error) {
 		Key:    key,
 		TTL:    ttlAsDuration,
 		CRC32C: expectedCRC,
-	}, startPos, nil
+	}, size, nil
 }
 
 // DeleteOldFiles deletes WAL files older than the specified sequence.
