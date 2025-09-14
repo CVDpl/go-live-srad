@@ -557,7 +557,7 @@ func (w *WAL) replayFile(path string, callback func(op uint8, key []byte, expire
 	}
 
 	// Read records
-	reader := bufio.NewReader(file)
+	reader := bufio.NewReaderSize(file, 1<<20)
 	offset := int64(14) // header size
 	lastValidOffset := offset
 	recordCount := 0

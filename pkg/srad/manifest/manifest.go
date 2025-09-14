@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -163,8 +164,13 @@ func (m *Manifest) save() error {
 	}
 	defer file.Close()
 
-	if _, err := file.Write(data); err != nil {
+	// Buffered writer to reduce syscalls for larger JSON
+	bw := bufio.NewWriterSize(file, 1<<20)
+	if _, err := bw.Write(data); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("flush manifest: %w", err)
 	}
 
 	if err := file.Commit(); err != nil {

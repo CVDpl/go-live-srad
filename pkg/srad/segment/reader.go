@@ -203,6 +203,7 @@ func (r *Reader) openFiles() error {
 		if stat, err := f.Stat(); err == nil && stat.Size() > 0 {
 			if mapped, mErr := unix.Mmap(int(f.Fd()), 0, int(stat.Size()), unix.PROT_READ, unix.MAP_SHARED); mErr == nil {
 				r.keysMap = mapped
+				_ = unix.Madvise(mapped, unix.MADV_SEQUENTIAL)
 			}
 		}
 	}
@@ -268,6 +269,7 @@ func (r *Reader) loadLOUDS() error {
 	} else {
 		// Keep mapping for lifetime of reader
 		r.mmap = mapped
+		_ = unix.Madvise(mapped, unix.MADV_SEQUENTIAL)
 		header := mapped[:6]
 		magic := binary.LittleEndian.Uint32(header[0:4])
 		if magic != common.MagicLouds {
@@ -286,8 +288,9 @@ func (r *Reader) loadLOUDS() error {
 		// Read full file (6B header + payload)
 		if stat, err := r.triFile.Stat(); err == nil && stat.Size() >= 6 {
 			if _, err := r.triFile.Seek(0, 0); err == nil {
+				br := bufio.NewReaderSize(r.triFile, 1<<20)
 				full := make([]byte, stat.Size())
-				if _, err := r.triFile.Read(full); err == nil {
+				if _, err := io.ReadFull(br, full); err == nil {
 					if binary.LittleEndian.Uint32(full[0:4]) == common.MagicTrigram {
 						payload := full[6:]
 						r.trigram = filters.UnmarshalTrigram(payload)
@@ -302,8 +305,9 @@ func (r *Reader) loadLOUDS() error {
 	if r.bloomFile != nil {
 		if stat, err := r.bloomFile.Stat(); err == nil && stat.Size() >= 6 {
 			if _, err := r.bloomFile.Seek(0, 0); err == nil {
+				br := bufio.NewReaderSize(r.bloomFile, 1<<20)
 				full := make([]byte, stat.Size())
-				if _, err := r.bloomFile.Read(full); err == nil {
+				if _, err := io.ReadFull(br, full); err == nil {
 					if binary.LittleEndian.Uint32(full[0:4]) == common.MagicBloom {
 						payload := full[6:]
 						r.bloom = filters.UnmarshalBloomFilter(payload)
@@ -376,26 +380,27 @@ func (r *Reader) loadKeys() error {
 
 	// File-based path with mandatory header
 	defer r.keysFile.Seek(0, 0)
+	br := bufio.NewReaderSize(r.keysFile, 1<<20)
 	var count uint32
 	// Read and validate required header
-	hdr, err := ReadCommonHeader(r.keysFile)
+	hdr, err := ReadCommonHeader(br)
 	if err != nil {
 		return err
 	}
 	if err := ValidateHeader(hdr, common.MagicKeys, common.VersionSegment); err != nil {
 		return err
 	}
-	if err := binary.Read(r.keysFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return err
 	}
 	keys := make([][]byte, 0, count)
 	for i := uint32(0); i < count; i++ {
 		var kl uint32
-		if err := binary.Read(r.keysFile, binary.LittleEndian, &kl); err != nil {
+		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
 			return err
 		}
 		k := make([]byte, kl)
-		if _, err := r.keysFile.Read(k); err != nil {
+		if _, err := io.ReadFull(br, k); err != nil {
 			return err
 		}
 		keys = append(keys, k)
@@ -413,22 +418,23 @@ func (r *Reader) IterateKeys(fn func(k []byte) bool) (int, error) {
 	if _, err := r.keysFile.Seek(0, 0); err != nil {
 		return 0, err
 	}
-	// Optional header
-	if hdr, err := ReadCommonHeader(r.keysFile); err == nil {
-		if err := ValidateHeader(hdr, common.MagicKeys, common.VersionSegment); err != nil {
-			return 0, err
-		}
-	} else {
+	br := bufio.NewReaderSize(r.keysFile, 1<<20)
+	// Mandatory header
+	hdr, err := ReadCommonHeader(br)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateHeader(hdr, common.MagicKeys, common.VersionSegment); err != nil {
 		return 0, err
 	}
 	var count uint32
-	if err := binary.Read(r.keysFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return 0, err
 	}
 	iterated := 0
 	for i := uint32(0); i < count; i++ {
 		var kl uint32
-		if err := binary.Read(r.keysFile, binary.LittleEndian, &kl); err != nil {
+		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
 			return iterated, err
 		}
 		if kl == 0 {
@@ -439,7 +445,7 @@ func (r *Reader) IterateKeys(fn func(k []byte) bool) (int, error) {
 			continue
 		}
 		buf := make([]byte, kl)
-		if _, err := r.keysFile.Read(buf); err != nil {
+		if _, err := io.ReadFull(br, buf); err != nil {
 			return iterated, err
 		}
 		if !fn(buf) {
@@ -452,25 +458,26 @@ func (r *Reader) IterateKeys(fn func(k []byte) bool) (int, error) {
 
 func (r *Reader) loadTombstones() error {
 	defer r.tombFile.Seek(0, 0)
+	br := bufio.NewReaderSize(r.tombFile, 1<<20)
 	var count uint32
-	if hdr, err := ReadCommonHeader(r.tombFile); err == nil {
+	if hdr, err := ReadCommonHeader(br); err == nil {
 		if err := ValidateHeader(hdr, common.MagicTombs, common.VersionSegment); err != nil {
 			return err
 		}
 	} else {
 		return err
 	}
-	if err := binary.Read(r.tombFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return err
 	}
 	set := make(map[string]struct{}, count)
 	for i := uint32(0); i < count; i++ {
 		var kl uint32
-		if err := binary.Read(r.tombFile, binary.LittleEndian, &kl); err != nil {
+		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
 			return err
 		}
 		k := make([]byte, kl)
-		if _, err := r.tombFile.Read(k); err != nil {
+		if _, err := io.ReadFull(br, k); err != nil {
 			return err
 		}
 		set[string(k)] = struct{}{}
@@ -530,8 +537,9 @@ func (r *Reader) loadExpiries() error {
 		return nil
 	}
 	defer r.expFile.Seek(0, 0)
+	br := bufio.NewReaderSize(r.expFile, 1<<20)
 	// Read and validate header
-	hdr, err := ReadCommonHeader(r.expFile)
+	hdr, err := ReadCommonHeader(br)
 	if err != nil {
 		return err
 	}
@@ -539,13 +547,13 @@ func (r *Reader) loadExpiries() error {
 		return err
 	}
 	var count uint32
-	if err := binary.Read(r.expFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return err
 	}
 	exps := make([]int64, count)
 	for i := uint32(0); i < count; i++ {
 		var e int64
-		if err := binary.Read(r.expFile, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(br, binary.LittleEndian, &e); err != nil {
 			return err
 		}
 		exps[i] = e
@@ -698,12 +706,13 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
 	if _, err := r.keysFile.Seek(0, 0); err != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
-	hdr, err := ReadCommonHeader(r.keysFile)
+	br := bufio.NewReaderSize(r.keysFile, 1<<20)
+	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicKeys, common.VersionSegment) != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
 	var count uint32
-	if err := binary.Read(r.keysFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
 	// Best-effort load expiries so we can filter during streaming
@@ -714,13 +723,13 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
 	return func() ([]byte, bool) {
 		for i < count {
 			var kl uint32
-			if err := binary.Read(r.keysFile, binary.LittleEndian, &kl); err != nil {
+			if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
 				return nil, false
 			}
 			var k []byte
 			if kl > 0 {
 				k = make([]byte, kl)
-				if _, err := io.ReadFull(r.keysFile, k); err != nil {
+				if _, err := io.ReadFull(br, k); err != nil {
 					return nil, false
 				}
 			}
@@ -745,12 +754,13 @@ func (r *Reader) StreamTombstones() (advance func() ([]byte, bool)) {
 	if _, err := r.tombFile.Seek(0, 0); err != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
-	hdr, err := ReadCommonHeader(r.tombFile)
+	br := bufio.NewReaderSize(r.tombFile, 1<<20)
+	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicTombs, common.VersionSegment) != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
 	var count uint32
-	if err := binary.Read(r.tombFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return func() ([]byte, bool) { return nil, false }
 	}
 	var i uint32
@@ -759,13 +769,13 @@ func (r *Reader) StreamTombstones() (advance func() ([]byte, bool)) {
 			return nil, false
 		}
 		var kl uint32
-		if err := binary.Read(r.tombFile, binary.LittleEndian, &kl); err != nil {
+		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
 			return nil, false
 		}
 		var k []byte
 		if kl > 0 {
 			k = make([]byte, kl)
-			if _, err := io.ReadFull(r.tombFile, k); err != nil {
+			if _, err := io.ReadFull(br, k); err != nil {
 				return nil, false
 			}
 		}

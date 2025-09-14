@@ -482,7 +482,7 @@ func (b *Builder) writeKeysFile(path string) error {
 	defer af.Close()
 
 	// Buffered writer to reduce syscall count
-	bw := bufio.NewWriterSize(af, 2<<20)
+	bw := bufio.NewWriterSize(af, 4<<20)
 	// Compute BLAKE3 while writing
 	hasher := blake3.New()
 	out := io.MultiWriter(bw, hasher)
@@ -521,7 +521,7 @@ func (b *Builder) writeExpiryFile(path string) error {
 	}
 	defer af.Close()
 
-	bw := bufio.NewWriterSize(af, 2<<20)
+	bw := bufio.NewWriterSize(af, 4<<20)
 	hasher := blake3.New()
 	out := io.MultiWriter(bw, hasher)
 
@@ -560,7 +560,7 @@ func (b *Builder) writeTombstonesFile(path string) error {
 	}
 	defer af.Close()
 
-	bw := bufio.NewWriterSize(af, 2<<20)
+	bw := bufio.NewWriterSize(af, 4<<20)
 	hasher := blake3.New()
 	out := io.MultiWriter(bw, hasher)
 
@@ -684,11 +684,15 @@ func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
 	}
 	defer file.Close()
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicLouds, common.VersionSegment); err != nil {
 		return err
 	}
 	if _, err := out.Write(loudsData); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.loudsBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
@@ -746,7 +750,8 @@ func (b *Builder) buildEdges(_ *trieNode, path string) error {
 
 	// Write header
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicEdges, common.VersionSegment); err != nil {
 		return err
 	}
@@ -754,6 +759,9 @@ func (b *Builder) buildEdges(_ *trieNode, path string) error {
 	// Write placeholder data
 	data := make([]byte, 1024)
 	if _, err := out.Write(data); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.edgesBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
@@ -771,7 +779,8 @@ func (b *Builder) buildAccept(_ *trieNode, path string) error {
 
 	// Write header
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicAccept, common.VersionSegment); err != nil {
 		return err
 	}
@@ -779,6 +788,9 @@ func (b *Builder) buildAccept(_ *trieNode, path string) error {
 	// Write placeholder data
 	data := make([]byte, 1024)
 	if _, err := out.Write(data); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.acceptBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
@@ -795,7 +807,8 @@ func (b *Builder) buildTMap(path string) error {
 
 	// Write header
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicTMap, common.VersionSegment); err != nil {
 		return err
 	}
@@ -803,6 +816,9 @@ func (b *Builder) buildTMap(path string) error {
 	// Write placeholder data
 	data := make([]byte, 256)
 	if _, err := out.Write(data); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.tmapBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
@@ -819,7 +835,8 @@ func (b *Builder) buildTails(path string) error {
 
 	// Write header
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicTails, common.VersionSegment); err != nil {
 		return err
 	}
@@ -827,6 +844,9 @@ func (b *Builder) buildTails(path string) error {
 	// Write placeholder data
 	data := make([]byte, 256)
 	if _, err := out.Write(data); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.tailsBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
@@ -947,11 +967,15 @@ func (b *Builder) buildBloomFilter(path string) error {
 	}
 	defer file.Close()
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicBloom, common.VersionSegment); err != nil {
 		return err
 	}
 	if _, err := out.Write(bloomData); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.filterBloomBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
@@ -1020,11 +1044,15 @@ func (b *Builder) buildTrigramFilter(path string) error {
 	}
 	defer file.Close()
 	hasher := blake3.New()
-	out := io.MultiWriter(file, hasher)
+	bw := bufio.NewWriterSize(file, 4<<20)
+	out := io.MultiWriter(bw, hasher)
 	if err := WriteCommonHeader(out, common.MagicTrigram, common.VersionSegment); err != nil {
 		return err
 	}
 	if _, err := out.Write(data); err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
 		return err
 	}
 	b.filterTrigramBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
