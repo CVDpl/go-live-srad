@@ -893,140 +893,119 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		}
 	}
 
-	// K-way merge state for sorted sources
-	type srcIter struct {
+	// Async streams per reader to overlap IO
+	type keyStream struct {
+		ch    <-chan []byte
 		key   []byte
 		ok    bool
-		next  func() ([]byte, bool)
-		order int // higher = newer
+		order int
 	}
-	less := func(a, b *srcIter) bool {
-		cmp := bytes.Compare(a.key, b.key)
+	newKeyChan := func(r *segment.Reader) <-chan []byte {
+		out := make(chan []byte, 1024)
+		go func() {
+			adv := r.StreamKeys()
+			for {
+				k, ok := adv()
+				if !ok {
+					break
+				}
+				out <- k
+			}
+			close(out)
+		}()
+		return out
+	}
+	newTombChan := func(r *segment.Reader) <-chan []byte {
+		out := make(chan []byte, 1024)
+		go func() {
+			adv := r.StreamTombstones()
+			for {
+				k, ok := adv()
+				if !ok {
+					break
+				}
+				out <- k
+			}
+			close(out)
+		}()
+		return out
+	}
+	// Build streams
+	streams := make([]*keyStream, 0, len(readersSnapshot))
+	for idx := len(readersSnapshot) - 1; idx >= 0; idx-- {
+		r := readersSnapshot[idx]
+		ch := newKeyChan(r)
+		ks := &keyStream{ch: ch, order: idx + 1}
+		ks.key, ks.ok = <-ch
+		streams = append(streams, ks)
+	}
+	// Tombstones heap via channels
+	type tombHead struct {
+		ch  <-chan []byte
+		key []byte
+		ok  bool
+	}
+	var tsHeads []*tombHead
+	for _, r := range readersSnapshot {
+		ch := newTombChan(r)
+		th := &tombHead{ch: ch}
+		th.key, th.ok = <-ch
+		if th.ok {
+			tsHeads = append(tsHeads, th)
+		}
+	}
+	sort.Slice(tsHeads, func(i, j int) bool { return bytes.Compare(tsHeads[i].key, tsHeads[j].key) < 0 })
+	advanceTs := func() {
+		if len(tsHeads) == 0 {
+			return
+		}
+		th := tsHeads[0]
+		th.key, th.ok = <-th.ch
+		if !th.ok {
+			tsHeads = tsHeads[1:]
+			return
+		}
+		sort.Slice(tsHeads, func(i, j int) bool { return bytes.Compare(tsHeads[i].key, tsHeads[j].key) < 0 })
+	}
+	// Min-heap-ish via sort on slice of heads
+	sort.Slice(streams, func(i, j int) bool {
+		cmp := bytes.Compare(streams[i].key, streams[j].key)
 		if cmp != 0 {
 			return cmp < 0
 		}
-		return a.order > b.order // for equal keys, newer first
-	}
-	// Build source iterators: memtable (posortowany) + segments keys; tombstones heap to suppress
-	srcs := make([]*srcIter, 0, len(readersSnapshot)+1)
-	type tsIter struct {
-		key  []byte
-		ok   bool
-		next func() ([]byte, bool)
-	}
-	tsHeap := make([]*tsIter, 0, len(readersSnapshot)+1)
-	tsLess := func(i, j int) bool { return bytes.Compare(tsHeap[i].key, tsHeap[j].key) < 0 }
-	pushTS := func(ti *tsIter) {
-		if ti.ok {
-			tsHeap = append(tsHeap, ti)
-			sort.Slice(tsHeap, tsLess)
-		}
-	}
-	popTS := func() *tsIter {
-		if len(tsHeap) == 0 {
-			return nil
-		}
-		x := tsHeap[0]
-		tsHeap = tsHeap[1:]
-		return x
-	}
-
-	// memtable iterator
-	{
-		it := memtable.NewAllIterator(snapshot)
-		advance := func() ([]byte, bool) {
-			if it.Next() {
-				if it.IsTombstone() {
-					return nil, true
-				} // memtable tombs handled by deletes phase; ignore here
-				return it.Key(), true
-			}
-			return nil, false
-		}
-		k, ok := advance()
-		srcs = append(srcs, &srcIter{key: k, ok: ok, next: advance, order: len(readersSnapshot) + 1})
-	}
-	// segments
-	for idx := len(readersSnapshot) - 1; idx >= 0; idx-- { // newest first gets wyższy priorytet
-		r := readersSnapshot[idx]
-		advance := r.StreamKeys()
-		k, ok := advance()
-		srcs = append(srcs, &srcIter{key: k, ok: ok, next: advance, order: idx + 1})
-		// tombstones stream
-		advT := r.StreamTombstones()
-		if tk, tok := advT(); tok {
-			pushTS(&tsIter{key: tk, ok: tok, next: advT})
-		}
-	}
-	// Min-heap
-	h := make([]*srcIter, 0, len(srcs))
-	push := func(si *srcIter) {
-		if si.ok {
-			h = append(h, si)
-			sort.Slice(h, func(i, j int) bool { return less(h[i], h[j]) })
-		}
-	}
-	pop := func() *srcIter {
-		if len(h) == 0 {
-			return nil
-		}
-		x := h[0]
-		h = h[1:]
-		return x
-	}
-	for _, siter := range srcs {
-		push(siter)
-	}
-
+		return streams[i].order > streams[j].order
+	})
 	var curKey []byte
-	for len(h) > 0 {
-		si := pop()
-		if si.key == nil && si.ok { // skip empty
-			if k, ok := si.next(); ok {
-				si.key = k
-				si.ok = true
-				push(si)
+	for len(streams) > 0 {
+		si := streams[0]
+		if !si.ok || si.key == nil {
+			// advance this stream
+			k, ok := <-si.ch
+			if !ok {
+				streams = streams[1:]
+				continue
 			}
+			si.key, si.ok = k, true
+			sort.Slice(streams, func(i, j int) bool {
+				cmp := bytes.Compare(streams[i].key, streams[j].key)
+				if cmp != 0 {
+					return cmp < 0
+				}
+				return streams[i].order > streams[j].order
+			})
 			continue
 		}
-		// New key or same key but older
 		emit := false
 		if curKey == nil || !bytes.Equal(si.key, curKey) {
-			// finalize duplicate run: nothing to do
 			curKey = append([]byte(nil), si.key...)
-			_ = si.order
-			// check tombstone in newer sources? For simplicity: we don't carry tombstones in memtable iterator; deletions are handled earlier
 			emit = true
-		} else {
-			// same key; newer already chosen; skip
-			emit = false
 		}
 		if emit {
-			// advance tombstone heap to current key (drop any ts < curKey)
-			for {
-				if len(tsHeap) == 0 {
-					break
-				}
-				if bytes.Compare(tsHeap[0].key, curKey) < 0 {
-					ti := popTS()
-					if nk, ok := ti.next(); ok {
-						ti.key = nk
-						ti.ok = true
-						pushTS(ti)
-					}
-					continue
-				}
-				break
+			for len(tsHeads) > 0 && bytes.Compare(tsHeads[0].key, curKey) < 0 {
+				advanceTs()
 			}
-			// if tombstone equals current key, suppress emit and advance that tombstone
-			if len(tsHeap) > 0 && bytes.Equal(tsHeap[0].key, curKey) {
-				ti := popTS()
-				if nk, ok := ti.next(); ok {
-					ti.key = nk
-					ti.ok = true
-					pushTS(ti)
-				}
-				// do not emit this key
+			if len(tsHeads) > 0 && bytes.Equal(tsHeads[0].key, curKey) {
+				advanceTs()
 			} else {
 				ensureBuilder()
 				if err := cur.builder.Add(curKey, curKey, false); err != nil {
@@ -1040,11 +1019,20 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 				}
 			}
 		}
-		if k, ok := si.next(); ok {
-			si.key = k
-			si.ok = true
-			push(si)
+		// advance current head
+		k, ok := <-si.ch
+		if !ok {
+			streams = streams[1:]
+			continue
 		}
+		si.key, si.ok = k, true
+		sort.Slice(streams, func(i, j int) bool {
+			cmp := bytes.Compare(streams[i].key, streams[j].key)
+			if cmp != 0 {
+				return cmp < 0
+			}
+			return streams[i].order > streams[j].order
+		})
 	}
 
 	// Finalize last chunk
