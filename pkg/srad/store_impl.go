@@ -233,7 +233,7 @@ func (s *storeImpl) Close() error {
 
 	// Flush memtable if not read-only
 	if !s.readonly {
-		if mt := s.memtablePtr.Load(); mt != nil && mt.Count() > 0 {
+		if mt := s.memtablePtr.Load(); mt != nil && (mt.Count() > 0 || mt.DeletedCount() > 0) {
 			if err := s.Flush(context.Background()); err != nil {
 				s.logger.Error("failed to flush on close", "error", err)
 			}
@@ -1659,7 +1659,7 @@ func (s *storeImpl) rcuCleanupTask() {
 					continue
 				}
 				var segID uint64
-				if _, err := fmt.Sscanf(e.Name(), "%016d", &segID); err != nil {
+				if _, err := fmt.Sscanf(e.Name(), "%d", &segID); err != nil {
 					continue
 				}
 				if _, ok := activeIDs[segID]; ok {
@@ -1728,7 +1728,7 @@ func (s *storeImpl) loadSegments() error {
 
 		// Parse segment ID
 		var segmentID uint64
-		if _, err := fmt.Sscanf(entry.Name(), "%016d", &segmentID); err != nil {
+		if _, err := fmt.Sscanf(entry.Name(), "%d", &segmentID); err != nil {
 			continue
 		}
 
