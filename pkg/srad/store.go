@@ -71,6 +71,10 @@ type Store interface {
 	// This bypasses the RCU grace period and should be used only in maintenance tools
 	// or tests when no readers are using old segments.
 	PurgeObsoleteSegments() error
+
+	// RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
+	// for all active segments. Blocks until completion.
+	RebuildMissingFilters(ctx context.Context) error
 }
 
 // Options configures the store behavior.

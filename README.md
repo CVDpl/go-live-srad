@@ -89,6 +89,14 @@ type Store interface {
     // files with sequence < current and never truncates the active WAL. Enabling
     // RotateWALOnFlush makes older files eligible for pruning immediately.
     PruneWAL() error
+
+    // PurgeObsoleteSegments removes non-active segment directories immediately (dangerous).
+    // Bypasses the RCU grace period; only for maintenance when no readers use old segments.
+    PurgeObsoleteSegments() error
+
+    // RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
+    // for all active segments. Blocks until completion.
+    RebuildMissingFilters(ctx context.Context) error
 }
 ```
 
@@ -165,6 +173,8 @@ opts.EnableTrigramFilter = false           // optional
 store, _ := srad.Open(dir, opts)
 // ... bulk load ...
 store.Flush(ctx)
+// Optionally force filters to be present before shutdown/cleanup
+_ = store.RebuildMissingFilters(ctx)
 // Re-enable LOUDS for subsequent smaller batches if needed
 ```
 
@@ -217,6 +227,7 @@ This fallback only affects how work is split during Flush/Compaction. It does no
 
 - `AsyncFilterBuild = true` enables building missing filters (`filters/prefix.bf`, `filters/tri.bits`) in the background after flush/compaction.
 - When enabled, the builder skips inline filter generation during Flush/Compact to shorten the critical path; filters are produced shortly after by a background task that scans active segments.
+- You can also trigger a blocking rebuild at any time via `store.RebuildMissingFilters(ctx)` (e.g., right before `Close()` or `PurgeObsoleteSegments()`), which rebuilds any missing filters for active segments and returns when done.
 - Queries are correct even without filters; filters only accelerate reads.
 
 ```go
@@ -244,6 +255,8 @@ opts.BuildMaxShards = runtime.NumCPU()
 store, _ := srad.Open(dir, opts)
 // ... bulk load ...
 store.Flush(ctx)       // writes segments fast; filters will follow asynchronously
+// If you need filters now (before close/purge), run a blocking rebuild:
+_ = store.RebuildMissingFilters(ctx)
 // Optionally run compaction later, then allow background filter builder to finish
 ```
 

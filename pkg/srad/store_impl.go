@@ -1341,6 +1341,78 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 	}()
 }
 
+// RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters for active segments.
+func (s *storeImpl) RebuildMissingFilters(ctx context.Context) error {
+	if s.manifest == nil {
+		return nil
+	}
+	s.mu.RLock()
+	active := s.manifest.GetActiveSegments()
+	dir := filepath.Join(s.dir, common.DirSegments)
+	logger := s.logger
+	enableTri := s.opts.EnableTrigramFilter
+	bloomFPR := s.opts.PrefixBloomFPR
+	if bloomFPR <= 0 {
+		bloomFPR = common.DefaultBloomFPR
+	}
+	prefixLen := s.opts.PrefixBloomMaxPrefixLen
+	if prefixLen <= 0 {
+		prefixLen = int(common.DefaultPrefixBloomLength)
+	}
+	s.mu.RUnlock()
+
+	for _, seg := range active {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		reader, err := segment.NewReader(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad)
+		if err != nil {
+			continue
+		}
+		needBloom := reader.Bloom() == nil
+		needTri := enableTri && reader.Trigram() == nil
+		if !needBloom && !needTri {
+			_ = reader.Close()
+			continue
+		}
+		// Stream keys
+		var keys [][]byte
+		adv, closeFn := reader.StreamKeys()
+		for {
+			k, ok := adv()
+			if !ok {
+				break
+			}
+			kk := make([]byte, len(k))
+			copy(kk, k)
+			keys = append(keys, kk)
+		}
+		closeFn()
+		_ = reader.Close()
+
+		// Build requested filters
+		b := segment.NewBuilder(seg.ID, common.LevelL0, dir, logger)
+		b.ConfigureFilters(bloomFPR, prefixLen, enableTri)
+		tombs := make([]bool, len(keys))
+		if err := b.AddFromPairs(keys, tombs); err != nil {
+			continue
+		}
+		filtersDir := filepath.Join(dir, fmt.Sprintf("%016d", seg.ID), "filters")
+		if err := os.MkdirAll(filtersDir, 0755); err != nil {
+			continue
+		}
+		if needBloom {
+			_ = b.BuildBloomOnly(filtersDir)
+		}
+		if needTri {
+			_ = b.BuildTrigramOnly(filtersDir)
+		}
+	}
+	return nil
+}
+
 // PruneWAL deletes obsolete WAL files older than the current WAL sequence.
 func (s *storeImpl) PruneWAL() error {
 	if s.readonly {
