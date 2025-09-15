@@ -765,11 +765,6 @@ func (b *Builder) buildEdges(_ *trieNode, path string) error {
 		return err
 	}
 
-	// Write placeholder data
-	data := make([]byte, 1024)
-	if _, err := out.Write(data); err != nil {
-		return err
-	}
 	if err := bw.Flush(); err != nil {
 		return err
 	}
@@ -794,11 +789,6 @@ func (b *Builder) buildAccept(_ *trieNode, path string) error {
 		return err
 	}
 
-	// Write placeholder data
-	data := make([]byte, 1024)
-	if _, err := out.Write(data); err != nil {
-		return err
-	}
 	if err := bw.Flush(); err != nil {
 		return err
 	}
@@ -822,11 +812,6 @@ func (b *Builder) buildTMap(path string) error {
 		return err
 	}
 
-	// Write placeholder data
-	data := make([]byte, 256)
-	if _, err := out.Write(data); err != nil {
-		return err
-	}
 	if err := bw.Flush(); err != nil {
 		return err
 	}
@@ -850,11 +835,6 @@ func (b *Builder) buildTails(path string) error {
 		return err
 	}
 
-	// Write placeholder data
-	data := make([]byte, 256)
-	if _, err := out.Write(data); err != nil {
-		return err
-	}
 	if err := bw.Flush(); err != nil {
 		return err
 	}
