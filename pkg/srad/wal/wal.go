@@ -69,6 +69,13 @@ type WALRecord struct {
 	CRC32C uint32
 }
 
+// WALEntry represents a single operation to be written to the WAL.
+type WALEntry struct {
+	Op  uint8
+	Key []byte
+	TTL time.Duration
+}
+
 // NullLogger is a logger that discards all log messages.
 type NullLogger struct{}
 
@@ -267,6 +274,70 @@ func (w *WAL) openFile(path string) error {
 	w.writer = bufio.NewWriterSize(file, w.bufferSize)
 
 	w.logger.Info("opened WAL file", "path", path, "size", w.currentSize)
+
+	return nil
+}
+
+// WriteBatch writes a batch of operations to the WAL.
+// This is more efficient than multiple individual writes as it minimizes lock contention and disk I/O.
+func (w *WAL) WriteBatch(entries []*WALEntry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return common.ErrClosed
+	}
+
+	var dataToWrite [][]byte
+	var totalSize int64
+
+	for _, entry := range entries {
+		if len(entry.Key) > common.MaxKeySize {
+			return common.ErrKeyTooLarge // Fail the whole batch on invalid entry
+		}
+
+		record := WALRecord{
+			Op:  entry.Op,
+			Key: entry.Key,
+			TTL: entry.TTL,
+		}
+
+		data, err := w.encodeRecord(record)
+		if err != nil {
+			return fmt.Errorf("encode WAL record: %w", err)
+		}
+		dataToWrite = append(dataToWrite, data)
+		totalSize += int64(len(data))
+	}
+
+	if w.currentSize+totalSize > w.rotateSize {
+		if err := w.rotate(); err != nil {
+			return fmt.Errorf("rotate WAL before batch write: %w", err)
+		}
+	}
+
+	for _, data := range dataToWrite {
+		n, err := w.writer.Write(data)
+		if err != nil {
+			return fmt.Errorf("write WAL record from batch: %w", err)
+		}
+		w.bytesSinceLastFlush += n
+	}
+
+	w.currentSize += totalSize
+
+	if w.flushOnEveryWrite || w.syncOnEveryWrite || (w.flushEveryBytes > 0 && w.bytesSinceLastFlush >= w.flushEveryBytes) {
+		if err := w.writer.Flush(); err != nil {
+			return fmt.Errorf("flush WAL buffer after batch: %w", err)
+		}
+		w.bytesSinceLastFlush = 0
+	}
+
+	if w.syncOnEveryWrite {
+		if err := w.currentFile.Sync(); err != nil {
+			return fmt.Errorf("sync WAL file after batch: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -702,4 +773,166 @@ func (w *WAL) DeleteOldFiles(beforeSeq uint64) error {
 	}
 
 	return nil
+}
+
+// ReplayDir replays WAL files from a directory in read-only fashion.
+// It does not create, rotate, modify, or quarantine files. Best-effort: on corruption, it logs and continues.
+func ReplayDir(dir string, logger common.Logger, callback func(op uint8, key []byte, expiresAt time.Time) error) error {
+	if logger == nil {
+		logger = &NullLogger{}
+	}
+	files, err := listWALFilesRO(dir)
+	if err != nil {
+		return fmt.Errorf("list WAL files (RO): %w", err)
+	}
+	for _, path := range files {
+		if err := replayFileRO(path, logger, callback); err != nil {
+			logger.Warn("failed to replay WAL file (RO)", "path", path, "error", err)
+			// continue with other files
+		}
+	}
+	return nil
+}
+
+// listWALFilesRO returns sorted list of WAL files in a directory without using WAL instance.
+func listWALFilesRO(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	var files []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasSuffix(name, ".log") && !strings.Contains(name, ".corrupt") {
+			files = append(files, filepath.Join(dir, name))
+		}
+	}
+	// Sort by sequence number
+	sort.Slice(files, func(i, j int) bool {
+		return extractSequenceRO(files[i]) < extractSequenceRO(files[j])
+	})
+	return files, nil
+}
+
+func extractSequenceRO(path string) uint64 {
+	base := filepath.Base(path)
+	parts := strings.Split(base, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	seq, _ := strconv.ParseUint(parts[0], 10, 64)
+	return seq
+}
+
+func replayFileRO(path string, logger common.Logger, callback func(op uint8, key []byte, expiresAt time.Time) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open WAL file (RO): %w", err)
+	}
+	defer f.Close()
+
+	// Read header
+	hdr, err := readHeaderRO(f)
+	if err != nil {
+		return fmt.Errorf("read WAL header (RO): %w", err)
+	}
+	if hdr.Magic != common.MagicWAL || hdr.Version != common.VersionWAL {
+		return fmt.Errorf("invalid WAL header (RO)")
+	}
+
+	reader := bufio.NewReaderSize(f, 1<<20)
+	for {
+		rec, _, rerr := readRecordRO(reader)
+		if rerr == io.EOF || errors.Is(rerr, io.EOF) {
+			break
+		}
+		if rerr != nil {
+			// best-effort: log and stop this file
+			logger.Warn("stop replay due to record error (RO)", "path", path, "error", rerr)
+			break
+		}
+		var expiresAt time.Time
+		if rec.TTL > 0 {
+			abs := int64(rec.TTL)
+			if abs > 0 {
+				expiresAt = time.Unix(0, abs)
+			}
+		}
+		if err := callback(rec.Op, rec.Key, expiresAt); err != nil {
+			return fmt.Errorf("replay callback error (RO): %w", err)
+		}
+	}
+	return nil
+}
+
+func readHeaderRO(file *os.File) (WALHeader, error) {
+	buf := make([]byte, 14)
+	if _, err := io.ReadFull(file, buf); err != nil {
+		return WALHeader{}, err
+	}
+	return WALHeader{
+		Magic:     binary.LittleEndian.Uint32(buf[0:4]),
+		Version:   binary.LittleEndian.Uint16(buf[4:6]),
+		CreatedAt: int64(binary.LittleEndian.Uint64(buf[6:14])),
+	}, nil
+}
+
+func readRecordRO(reader *bufio.Reader) (WALRecord, int, error) {
+	// Read op as varint
+	op, err := utils.ReadUvarint(reader)
+	if err == io.EOF {
+		return WALRecord{}, 0, io.EOF
+	}
+	if err != nil {
+		return WALRecord{}, 0, fmt.Errorf("read op: %w", err)
+	}
+	// Read key length
+	keyLen, err := utils.ReadUvarint(reader)
+	if err != nil {
+		return WALRecord{}, 0, fmt.Errorf("read key length: %w", err)
+	}
+	key := make([]byte, keyLen)
+	if _, err := io.ReadFull(reader, key); err != nil {
+		return WALRecord{}, 0, fmt.Errorf("read key: %w", err)
+	}
+	// Read expiry
+	expBuf := make([]byte, 8)
+	if _, err := io.ReadFull(reader, expBuf); err != nil {
+		return WALRecord{}, 0, fmt.Errorf("read expiry: %w", err)
+	}
+	// Read CRC
+	crcBuf := make([]byte, 4)
+	if _, err := io.ReadFull(reader, crcBuf); err != nil {
+		return WALRecord{}, 0, fmt.Errorf("read CRC: %w", err)
+	}
+
+	expectedCRC := binary.LittleEndian.Uint32(crcBuf)
+	// Verify CRC
+	var buf bytes.Buffer
+	utils.WriteUvarint(&buf, uint64(op))
+	utils.WriteUvarint(&buf, uint64(keyLen))
+	buf.Write(key)
+	buf.Write(expBuf)
+	actualCRC := utils.ComputeCRC32C(buf.Bytes())
+	if actualCRC != expectedCRC {
+		return WALRecord{}, 0, common.ErrCRCMismatch
+	}
+	size := 0
+	size += enc.SizeUvarint(uint64(op))
+	size += enc.SizeUvarint(uint64(keyLen))
+	size += int(keyLen)
+	size += 8
+	size += 4
+	abs := int64(binary.LittleEndian.Uint64(expBuf))
+	var ttlAsDuration time.Duration
+	if abs > 0 {
+		ttlAsDuration = time.Duration(abs)
+	}
+	return WALRecord{Op: uint8(op), Key: key, TTL: ttlAsDuration, CRC32C: expectedCRC}, size, nil
 }
