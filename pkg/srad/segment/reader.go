@@ -181,21 +181,29 @@ func (r *Reader) openFiles() error {
 		return fmt.Errorf("open LOUDS file: %w", err)
 	}
 
-	// Open edges file
-	edgesPath := filepath.Join(r.dir, r.metadata.Files.Edges)
-	r.edgesFile, err = os.Open(edgesPath)
-	if err != nil {
-		r.loudsFile.Close()
-		return fmt.Errorf("open edges file: %w", err)
+	// Open edges file (optional)
+	if r.metadata.Files.Edges != "" {
+		edgesPath := filepath.Join(r.dir, r.metadata.Files.Edges)
+		if f, e := os.Open(edgesPath); e == nil {
+			r.edgesFile = f
+		} else if !os.IsNotExist(e) {
+			r.loudsFile.Close()
+			return fmt.Errorf("open edges file: %w", e)
+		}
 	}
 
-	// Open accept file
-	acceptPath := filepath.Join(r.dir, r.metadata.Files.Accept)
-	r.acceptFile, err = os.Open(acceptPath)
-	if err != nil {
-		r.loudsFile.Close()
-		r.edgesFile.Close()
-		return fmt.Errorf("open accept file: %w", err)
+	// Open accept file (optional)
+	if r.metadata.Files.Accept != "" {
+		acceptPath := filepath.Join(r.dir, r.metadata.Files.Accept)
+		if f, e := os.Open(acceptPath); e == nil {
+			r.acceptFile = f
+		} else if !os.IsNotExist(e) {
+			r.loudsFile.Close()
+			if r.edgesFile != nil {
+				r.edgesFile.Close()
+			}
+			return fmt.Errorf("open accept file: %w", e)
+		}
 	}
 
 	// Open keys file (optional)

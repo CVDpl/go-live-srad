@@ -45,6 +45,7 @@ type Builder struct {
 	dropTombstones bool
 	// Hint that keys were added in sorted order (e.g., via AddFromMemtable)
 	alreadySorted bool
+	forceTrie     bool
 
 	// Options
 	logger common.Logger
@@ -246,6 +247,9 @@ func (b *Builder) SetAutoDisableLOUDSThreshold(n int) { b.autoDisableMinKeys = n
 // SetTrieGCPercent configures a temporary GC percent used only during trie build (0 = unchanged).
 func (b *Builder) SetTrieGCPercent(p int) { b.trieGCPercent = p }
 
+// SetForceTrie forces building trie even for sorted inputs (benchmark/debug).
+func (b *Builder) SetForceTrie(force bool) { b.forceTrie = force }
+
 // SetSkipFilters controls whether Build() should skip generating filter files.
 // When set to true, filters can be generated later via BuildBloomOnly/BuildTrigramOnly.
 func (b *Builder) SetSkipFilters(skip bool) { b.skipFilterBuild = skip }
@@ -282,6 +286,8 @@ func (b *Builder) Build() (*Metadata, error) {
 			b.minKey = b.keys[0]
 			b.maxKey = b.keys[len(b.keys)-1]
 		}
+		// Mark as sorted to enable fast-path builders (trie/LOUDS)
+		b.alreadySorted = true
 	}
 
 	// Ensure tombstones are sorted to allow streaming merge
@@ -353,62 +359,31 @@ func (b *Builder) Build() (*Metadata, error) {
 
 	stepStart := time.Now()
 
-	// Build trie structure (simplified for now)
-	b.logger.Info("trie build start", "id", b.segmentID, "keys", len(b.keys))
-	trieStart := time.Now()
-	gcPrev := -2
-	if b.trieGCPercent != 0 {
-		// Save current GC percent and apply temporary policy
-		gcPrev = debug.SetGCPercent(b.trieGCPercent)
+	var trie *trieNode
+	if b.alreadySorted && !b.forceTrie {
+		b.logger.Info("trie build skipped (streaming LOUDS)", "id", b.segmentID, "keys", len(b.keys))
+	} else {
+		// Build trie structure (simplified for now)
+		b.logger.Info("trie build start", "id", b.segmentID, "keys", len(b.keys))
+		trieStart := time.Now()
+		gcPrev := -2
+		if b.trieGCPercent != 0 {
+			// Save current GC percent and apply temporary policy
+			gcPrev = debug.SetGCPercent(b.trieGCPercent)
+		}
+		trie = b.buildTrie()
+		if b.trieGCPercent != 0 {
+			_ = debug.SetGCPercent(gcPrev)
+		}
+		b.logger.Info("trie build done", "id", b.segmentID, "duration", time.Since(trieStart))
 	}
-	trie := b.buildTrie()
-	if b.trieGCPercent != 0 {
-		_ = debug.SetGCPercent(gcPrev)
-	}
-	b.logger.Info("trie build done", "id", b.segmentID, "duration", time.Since(trieStart))
 
-	// Build LOUDS/Edges/Accept/TMap/Tails in parallel (depend only on trie)
-	wg.Add(5)
-	go func() {
-		defer wg.Done()
-		localStart := time.Now()
-		if err := b.buildLOUDS(trie, filepath.Join(segmentDir, "index.louds")); err != nil {
-			errCh <- fmt.Errorf("build LOUDS: %w", err)
-		}
-		b.logger.Info("step done", "id", b.segmentID, "step", "LOUDS", "duration", time.Since(localStart))
-	}()
-	go func() {
-		defer wg.Done()
-		localStart := time.Now()
-		if err := b.buildEdges(trie, filepath.Join(segmentDir, "index.edges")); err != nil {
-			errCh <- fmt.Errorf("build edges: %w", err)
-		}
-		b.logger.Info("step done", "id", b.segmentID, "step", "EDGES", "duration", time.Since(localStart))
-	}()
-	go func() {
-		defer wg.Done()
-		localStart := time.Now()
-		if err := b.buildAccept(trie, filepath.Join(segmentDir, "index.accept")); err != nil {
-			errCh <- fmt.Errorf("build accept: %w", err)
-		}
-		b.logger.Info("step done", "id", b.segmentID, "step", "ACCEPT", "duration", time.Since(localStart))
-	}()
-	go func() {
-		defer wg.Done()
-		localStart := time.Now()
-		if err := b.buildTMap(filepath.Join(segmentDir, "index.tmap")); err != nil {
-			errCh <- fmt.Errorf("build tmap: %w", err)
-		}
-		b.logger.Info("step done", "id", b.segmentID, "step", "TMAP", "duration", time.Since(localStart))
-	}()
-	go func() {
-		defer wg.Done()
-		localStart := time.Now()
-		if err := b.buildTails(filepath.Join(segmentDir, "tails.dat")); err != nil {
-			errCh <- fmt.Errorf("build tails: %w", err)
-		}
-		b.logger.Info("step done", "id", b.segmentID, "step", "TAILS", "duration", time.Since(localStart))
-	}()
+	// Build LOUDS synchronously
+	localStart := time.Now()
+	if err := b.buildLOUDS(trie, filepath.Join(segmentDir, "index.louds")); err != nil {
+		return nil, fmt.Errorf("build LOUDS: %w", err)
+	}
+	b.logger.Info("step done", "id", b.segmentID, "step", "LOUDS", "duration", time.Since(localStart))
 
 	// Wait for parallel tasks
 	wg.Wait()
@@ -650,72 +625,154 @@ type trieNode struct {
 
 // buildTrie builds a trie from the keys.
 func (b *Builder) buildTrie() *trieNode {
-	root := &trieNode{}
-
-	for i, key := range b.keys {
-		b.insertIntoTrie(root, key, b.values[i])
+	if len(b.keys) == 0 {
+		return &trieNode{}
 	}
-
+	if b.alreadySorted && !b.forceTrie {
+		return b.buildTrieFromSortedRange(0, len(b.keys), 0)
+	}
+	root := &trieNode{}
+	for i, key := range b.keys {
+		// inline insert (original insertIntoTrie removed)
+		var insert func(node *trieNode, key, value []byte)
+		insert = func(node *trieNode, key, value []byte) {
+			if len(key) == 0 {
+				node.isLeaf = true
+				node.value = value
+				return
+			}
+			for _, child := range node.children {
+				if len(child.label) > 0 && child.label[0] == key[0] {
+					commonLen := commonPrefixLength(child.label, key)
+					if commonLen == len(child.label) {
+						insert(child, key[commonLen:], value)
+						return
+					}
+					newChild := &trieNode{
+						label:    child.label[commonLen:],
+						children: child.children,
+						isLeaf:   child.isLeaf,
+						value:    child.value,
+					}
+					child.label = child.label[:commonLen]
+					child.children = []*trieNode{newChild}
+					child.isLeaf = false
+					child.value = nil
+					if commonLen < len(key) {
+						leafChild := &trieNode{label: key[commonLen:], isLeaf: true, value: value}
+						child.children = append(child.children, leafChild)
+					} else {
+						child.isLeaf = true
+						child.value = value
+					}
+					return
+				}
+			}
+			node.children = append(node.children, &trieNode{label: key, isLeaf: true, value: value})
+		}
+		insert(root, key, b.values[i])
+	}
 	return root
 }
 
-// insertIntoTrie inserts a key-value pair into the trie.
-func (b *Builder) insertIntoTrie(node *trieNode, key, value []byte) {
-	if len(key) == 0 {
+// buildTrieFromSortedRange builds a compressed trie from sorted keys in range.
+func (b *Builder) buildTrieFromSortedRange(start, end, depth int) *trieNode {
+	node := &trieNode{}
+	if start >= end {
+		return node
+	}
+	i := start
+	for i < end && len(b.keys[i]) == depth {
 		node.isLeaf = true
-		node.value = value
-		return
+		node.value = b.values[i]
+		i++
 	}
-
-	// Find matching child
-	for _, child := range node.children {
-		if len(child.label) > 0 && child.label[0] == key[0] {
-			// Found matching child
-			commonLen := commonPrefixLength(child.label, key)
-
-			if commonLen == len(child.label) {
-				// Continue with child
-				b.insertIntoTrie(child, key[commonLen:], value)
-				return
-			}
-
-			// Split the edge
-			newChild := &trieNode{
-				label:    child.label[commonLen:],
-				children: child.children,
-				isLeaf:   child.isLeaf,
-				value:    child.value,
-			}
-
-			child.label = child.label[:commonLen]
-			child.children = []*trieNode{newChild}
-			child.isLeaf = false
-			child.value = nil
-
-			if commonLen < len(key) {
-				// Add new branch
-				leafChild := &trieNode{
-					label:  key[commonLen:],
-					isLeaf: true,
-					value:  value,
-				}
-				child.children = append(child.children, leafChild)
-			} else {
-				child.isLeaf = true
-				child.value = value
-			}
-
-			return
+	// Collect child groups for this node
+	starts := make([]int, 0, 8)
+	ends := make([]int, 0, 8)
+	labels := make([][]byte, 0, 8)
+	for i < end {
+		if len(b.keys[i]) <= depth {
+			i++
+			continue
 		}
+		lb := b.keys[i][depth]
+		j := i + 1
+		for j < end {
+			if len(b.keys[j]) <= depth {
+				j++
+				continue
+			}
+			if b.keys[j][depth] != lb {
+				break
+			}
+			j++
+		}
+		// Compute common prefix length among [i:j)
+		plen := 1
+		for {
+			pos := depth + plen
+			same := true
+			for k := i; k < j; k++ {
+				if len(b.keys[k]) <= pos || b.keys[k][pos] != b.keys[i][pos] {
+					same = false
+					break
+				}
+			}
+			if !same {
+				break
+			}
+			plen++
+		}
+		starts = append(starts, i)
+		ends = append(ends, j)
+		labels = append(labels, append([]byte(nil), b.keys[i][depth:depth+plen]...))
+		i = j
 	}
 
-	// No matching child, create new one
-	newChild := &trieNode{
-		label:  key,
-		isLeaf: true,
-		value:  value,
+	// Build children possibly in parallel, preserving order
+	n := len(starts)
+	if n == 0 {
+		return node
 	}
-	node.children = append(node.children, newChild)
+	children := make([]*trieNode, n)
+	// Decide on parallelism
+	shards := b.maxShards
+	if shards <= 0 {
+		shards = runtime.GOMAXPROCS(0)
+	}
+	parallel := n > 1 && (ends[n-1]-starts[0]) >= max(200000, b.shardMinKeys) && shards > 1
+	if !parallel {
+		for idx := 0; idx < n; idx++ {
+			sub := b.buildTrieFromSortedRange(starts[idx], ends[idx], depth+len(labels[idx]))
+			child := &trieNode{label: labels[idx]}
+			child.children = sub.children
+			child.isLeaf = sub.isLeaf
+			child.value = sub.value
+			children[idx] = child
+		}
+	} else {
+		sem := make(chan struct{}, shards)
+		var wg sync.WaitGroup
+		for idx := 0; idx < n; idx++ {
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				sub := b.buildTrieFromSortedRange(starts[idx], ends[idx], depth+len(labels[idx]))
+				child := &trieNode{label: labels[idx]}
+				child.children = sub.children
+				child.isLeaf = sub.isLeaf
+				child.value = sub.value
+				children[idx] = child
+				<-sem
+			}(idx)
+		}
+		wg.Wait()
+	}
+	// Append in order
+	node.children = append(node.children, children...)
+	return node
 }
 
 // buildLOUDS builds the LOUDS representation.

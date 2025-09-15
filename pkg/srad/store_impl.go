@@ -1425,6 +1425,10 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		if s.opts.AutoDisableLOUDSMinKeys > 0 {
 			b.SetAutoDisableLOUDSThreshold(s.opts.AutoDisableLOUDSMinKeys)
 		}
+		// Force building trie even for sorted inputs
+		if s.opts.ForceTrieBuild {
+			b.SetForceTrie(true)
+		}
 	}
 
 	type partResult struct {

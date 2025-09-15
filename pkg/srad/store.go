@@ -150,6 +150,10 @@ type Options struct {
 	// Build filters asynchronously after flush (may increase memory)
 	AsyncFilterBuild bool
 
+	// ForceTrieBuild forces building a trie even when input is sorted and
+	// streaming LOUDS path is available. Useful for benchmarks and debugging.
+	ForceTrieBuild bool
+
 	// DisableLOUDSBuild disables building LOUDS index during flush. Readers will
 	// fall back to keys.dat streaming and filters. Exact lookups will use keys.dat.
 	DisableLOUDSBuild bool
@@ -350,6 +354,7 @@ func DefaultOptions() *Options {
 		BloomAdaptiveMinKeys:        10000000,
 		BuildRangePartitions:        1,
 		AsyncFilterBuild:            false,
+		ForceTrieBuild:              false,
 		DisableLOUDSBuild:           false,
 		AutoDisableLOUDSMinKeys:     0,
 	}

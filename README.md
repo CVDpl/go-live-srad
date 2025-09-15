@@ -142,6 +142,9 @@ type Options struct {
     // AutoDisableLOUDSMinKeys: when >0 and a build processes at least this many
     // keys, LOUDS build is skipped regardless of DisableLOUDSBuild.
     AutoDisableLOUDSMinKeys   int
+    // ForceTrieBuild: when true, always build the trie even for sorted inputs
+    // (overrides the streaming LOUDS fast-path). Useful for benchmarking.
+    ForceTrieBuild            bool
 }
 ```
 
@@ -492,3 +495,23 @@ store, _ := srad.Open(dir, opts)
 ### Search concurrency and correctness
 
 Regex search scans memtable first, then segments from newest to oldest, seeding a `seen` set with memtable tombstones and per-segment tombstones to enforce "newest wins". The engine holds internal references to segment readers during scans to avoid use-after-close during compaction. Use contexts to cancel long-running searches.
+
+### Trie and LOUDS build behavior
+
+- **Streaming LOUDS (default when possible)**: for lexicographically sorted inputs (flush/compaction), LOUDS is built directly from the sorted keys in two BFS passes with preallocation. This avoids building an intermediate trie and drastically reduces wall‑clock time.
+- **Trie from sorted data**: when requested, the trie is built without per‑key inserts; it is path‑compressed and can be parallelized per level for large groups (threshold based on `BuildShardMinKeys`).
+- **Unsorted data**: falls back to incremental insert into a compressed trie.
+- **Accept bitvector**: the newer `index.louds` format stores a leaf/accept bitvector and does not serialize per‑leaf value payloads, which reduces I/O.
+
+Settings:
+- `DisableLOUDSBuild` (bool): skip LOUDS (readers use `keys.dat` + filters). Good for very large bulk loads.
+- `AutoDisableLOUDSMinKeys` (int): automatically skip LOUDS when the number of keys ≥ this threshold.
+- `ForceTrieBuild` (bool): force trie building even for sorted inputs (useful for tests/benchmarks).
+
+Example:
+```go
+opts := srad.DefaultOptions()
+opts.ForceTrieBuild = true       // always build the trie (for benchmarks)
+opts.DisableLOUDSBuild = false   // build LOUDS normally
+opts.AutoDisableLOUDSMinKeys = 0 // no auto-skip for LOUDS
+```

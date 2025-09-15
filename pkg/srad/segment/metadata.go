@@ -64,8 +64,8 @@ type TrigramFilter struct {
 // Files lists all segment files.
 type Files struct {
 	Louds  string `json:"louds"`
-	Edges  string `json:"edges"`
-	Accept string `json:"accept"`
+	Edges  string `json:"edges,omitempty"`
+	Accept string `json:"accept,omitempty"`
 	TMap   string `json:"tmap,omitempty"`
 	Tails  string `json:"tails,omitempty"`
 	Expiry string `json:"expiry,omitempty"`
@@ -86,11 +86,7 @@ func NewMetadata(segmentID uint64, level int) *Metadata {
 			AcceptBits: "rrr",
 		},
 		Files: Files{
-			Louds:  "index.louds",
-			Edges:  "index.edges",
-			Accept: "index.accept",
-			TMap:   "index.tmap",
-			Tails:  "tails.dat",
+			Louds: "index.louds",
 		},
 	}
 }
