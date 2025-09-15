@@ -96,31 +96,43 @@ type Store interface {
 
 ```go
 type Options struct {
-    ReadOnly                 bool
-    Parallelism              int
-    VerifyChecksumsOnLoad    bool
-    MemtableTargetBytes      int64
-    CacheLabelAdvanceBytes   int64
-    CacheNFATransitionBytes  int64
-    EnableRCU                bool
-    RCUCleanupInterval       time.Duration
-    Logger                   Logger
-    DisableAutotuner         bool
-    DisableAutoFlush         bool
-    DefaultTTL               time.Duration
+    // Core
+    ReadOnly                  bool
+    Parallelism               int
+    VerifyChecksumsOnLoad     bool
+    MemtableTargetBytes       int64
+    CacheLabelAdvanceBytes    int64
+    CacheNFATransitionBytes   int64
+    EnableRCU                 bool
+    RCUCleanupInterval        time.Duration
+    Logger                    Logger
+    DisableAutotuner          bool
+    DisableAutoFlush          bool
+    DefaultTTL                time.Duration
     DisableBackgroundCompaction bool
-    RotateWALOnFlush         bool
-    WALRotateSize            int64
-    WALMaxFileSize           int64
-    WALBufferSize            int
-    PrefixBloomFPR           float64 // default 0.01
-    PrefixBloomMaxPrefixLen  int     // default 16
-    EnableTrigramFilter      bool    // default true
 
-    // Build parallelization knobs (0 => auto)
-    BuildMaxShards           int
-    BuildShardMinKeys        int
-    BloomAdaptiveMinKeys     int
+    // WAL / durability
+    RotateWALOnFlush          bool
+    WALRotateSize             int64
+    WALMaxFileSize            int64
+    WALBufferSize             int
+    WALSyncOnEveryWrite       bool
+    WALFlushOnEveryWrite      bool
+    WALFlushEveryBytes        int
+
+    // Filters
+    PrefixBloomFPR            float64 // default 0.01
+    PrefixBloomMaxPrefixLen   int     // default 16
+    EnableTrigramFilter       bool    // default true
+
+    // Build parallelization (0 => auto defaults)
+    BuildMaxShards            int
+    BuildShardMinKeys         int
+    BloomAdaptiveMinKeys      int
+
+    // Range partitioning and async filters
+    BuildRangePartitions      int
+    AsyncFilterBuild          bool
 }
 ```
 
@@ -208,7 +220,7 @@ store.Flush(ctx)       // writes segments fast; filters will follow asynchronous
 ### Flush behavior
 
 - Flush uses a freeze-and-swap strategy: first swap the `memtable` for a new one under a short lock, then build the segment from the frozen copy outside the lock. New inserts are minimally blocked and never lost from view.
-- Artifact construction is parallelized: `keys.dat` and filters are built in goroutines alongside the LOUDS chain.
+- Artifact construction is parallelized: `keys.dat` and the LOUDS/edges/tails indexes are built in goroutines; filters are built inline only when `AsyncFilterBuild` is disabled (otherwise they are produced in the background after Flush/Compact).
 
 ### Query Options
 
