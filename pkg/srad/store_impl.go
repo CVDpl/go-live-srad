@@ -1416,6 +1416,15 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		if s.opts.AsyncFilterBuild {
 			b.SetSkipFilters(true)
 		}
+		// Apply optional GC policy for trie build
+		if s.opts.GCPercentDuringTrie != 0 {
+			b.SetTrieGCPercent(s.opts.GCPercentDuringTrie)
+		}
+		// LOUDS build controls
+		b.SetDisableLOUDS(s.opts.DisableLOUDSBuild)
+		if s.opts.AutoDisableLOUDSMinKeys > 0 {
+			b.SetAutoDisableLOUDSThreshold(s.opts.AutoDisableLOUDSMinKeys)
+		}
 	}
 
 	type partResult struct {
@@ -1426,26 +1435,34 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 
 	results := make(chan partResult, parts)
 
+	flushPlanStart := time.Now()
+
 	if parts == 1 {
 		// Single builder path (existing)
 		segID := baseID
 		builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
 		cfgBuilder(builder)
+		s.logger.Info("flush plan: single-partition prepared", "segment_id", segID, "entries", oldCount)
 		if err := builder.AddFromMemtable(snapshot); err != nil {
 			// Rollback: reinsert snapshot into current memtable to avoid data loss
 			s.rollbackSnapshotIntoMemtable(snapshot)
 			return fmt.Errorf("add memtable to builder: %w", err)
 		}
+		addDone := time.Now()
+		s.logger.Info("flush stage: builder input added", "segment_id", segID, "duration", addDone.Sub(flushPlanStart))
+		buildStart := time.Now()
 		md, err := builder.Build()
 		if err != nil {
 			s.rollbackSnapshotIntoMemtable(snapshot)
 			return fmt.Errorf("build segment: %w", err)
 		}
+		s.logger.Info("flush stage: builder.Build completed", "segment_id", segID, "duration", time.Since(buildStart))
 		results <- partResult{id: segID, md: md, err: nil}
 		close(results)
 	} else {
 		// Range-partition snapshot by first byte (0..255). If it collapses to <=1 non-empty bucket,
 		// fallback to hash-based partitioning to ensure parallel build even for heavy shared prefixes.
+		partPrepStart := time.Now()
 		keys, tombs := snapshot.GetAllWithTombstones()
 		buckets := make([][][]byte, parts)
 		btombs := make([][]bool, parts)
@@ -1485,6 +1502,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			}
 			s.logger.Info("flush using hash-based partitioning", "parts", parts)
 		}
+		s.logger.Info("flush stage: partitioning done", "parts", parts, "non_empty", nonEmpty, "duration", time.Since(partPrepStart), "total_keys", len(keys))
 		var wg sync.WaitGroup
 		for p := 0; p < parts; p++ {
 			if len(buckets[p]) == 0 {
@@ -1496,15 +1514,19 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 				segID := atomic.AddUint64(&s.nextSegmentID, 1)
 				builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
 				cfgBuilder(builder)
+				partStart := time.Now()
 				if err := builder.AddFromPairs(buckets[pid], btombs[pid]); err != nil {
 					results <- partResult{id: segID, err: fmt.Errorf("add partition: %w", err)}
 					return
 				}
+				s.logger.Info("flush stage: partition input added", "partition", pid, "segment_id", segID, "keys", len(buckets[pid]), "duration", time.Since(partStart))
+				buildStart := time.Now()
 				md, err := builder.Build()
 				if err != nil {
 					results <- partResult{id: segID, err: fmt.Errorf("build partition: %w", err)}
 					return
 				}
+				s.logger.Info("flush stage: partition built", "partition", pid, "segment_id", segID, "duration", time.Since(buildStart))
 				results <- partResult{id: segID, md: md, err: nil}
 			}(p)
 		}
@@ -1513,6 +1535,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 
 	// Collect results
 	var mds []*segment.Metadata
+	collectStart := time.Now()
 	for r := range results {
 		if r.err != nil {
 			s.rollbackSnapshotIntoMemtable(snapshot)
@@ -1520,8 +1543,10 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		}
 		mds = append(mds, r.md)
 	}
+	s.logger.Info("flush stage: collected results", "segments", len(mds), "duration", time.Since(collectStart))
 
 	// Update in-memory state and manifest under lock
+	applyStart := time.Now()
 	s.mu.Lock()
 	for _, md := range mds {
 		s.segments = append(s.segments, md)
@@ -1547,6 +1572,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	// Refresh stats after flush
 	s.updateStatsFromManifest()
 	s.mu.Unlock()
+	s.logger.Info("flush stage: applied manifest and readers", "segments", len(mds), "duration", time.Since(applyStart))
 
 	// Remove frozen snapshot from visibility once flush completes
 	s.mu.Lock()
@@ -1568,9 +1594,11 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Sync WAL after persisting segments
+	walSyncStart := time.Now()
 	if err := s.wal.Sync(); err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
 	}
+	s.logger.Info("flush stage: WAL synced", "duration", time.Since(walSyncStart))
 
 	// Rotate WAL to start a fresh file after flush
 	if s.wal != nil && s.opts.RotateWALOnFlush {

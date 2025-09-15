@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -12,12 +13,15 @@ type LOUDS struct {
 	bits     *BitVector  // The LOUDS bit sequence
 	rs       *RankSelect // Rank/Select support
 	labels   []byte      // Edge labels
-	values   [][]byte    // Values for leaf nodes
+	values   [][]byte    // Values for leaf nodes (legacy; may be empty)
 	numNodes uint64      // Total number of nodes
 
 	// Lazy child lookup index for high-degree nodes: node -> (label -> child)
 	childIdx map[uint64]map[byte]uint64
 	idxMu    sync.RWMutex
+
+	// Accepting (leaf) nodes; when present, replaces values as leaf marker
+	accept *BitVector
 }
 
 // TrieNode represents a node in a trie for LOUDS encoding.
@@ -35,6 +39,7 @@ func NewLOUDS(root *TrieNode) *LOUDS {
 			bits:     NewBitVector(2),
 			numNodes: 0,
 			childIdx: make(map[uint64]map[byte]uint64),
+			accept:   NewBitVector(2),
 		}
 	}
 
@@ -48,6 +53,7 @@ func NewLOUDS(root *TrieNode) *LOUDS {
 		values:   make([][]byte, 0, nodeCount),
 		numNodes: nodeCount,
 		childIdx: make(map[uint64]map[byte]uint64),
+		accept:   NewBitVector(nodeCount + 2),
 	}
 
 	// Build LOUDS encoding using BFS
@@ -55,6 +61,193 @@ func NewLOUDS(root *TrieNode) *LOUDS {
 
 	// Create rank/select support
 	louds.rs = NewRankSelect(louds.bits)
+
+	return louds
+}
+
+// NewLOUDSNoRS creates a LOUDS encoding from a trie, skipping rank/select build.
+// Use this in offline builders where only Marshal() is needed; readers will
+// reconstruct rank/select upon load.
+func NewLOUDSNoRS(root *TrieNode) *LOUDS {
+	if root == nil {
+		return &LOUDS{
+			bits:     NewBitVector(2),
+			numNodes: 0,
+			childIdx: make(map[uint64]map[byte]uint64),
+			accept:   NewBitVector(2),
+		}
+	}
+
+	// Count nodes and prepare structures
+	nodeCount := countNodes(root)
+	bitLen := nodeCount*2 + 10 // Extra space for super root
+
+	louds := &LOUDS{
+		bits:     NewBitVector(bitLen),
+		labels:   make([]byte, 0, nodeCount),
+		values:   make([][]byte, 0, nodeCount),
+		numNodes: nodeCount,
+		childIdx: make(map[uint64]map[byte]uint64),
+		accept:   NewBitVector(nodeCount + 2),
+	}
+
+	// Build LOUDS encoding using BFS
+	louds.buildFromTrie(root)
+
+	// Intentionally skip building rank/select here
+	return louds
+}
+
+// NewLOUDSFromSortedKeys builds LOUDS directly from lexicographically sorted keys,
+// without constructing an intermediate trie. It performs two passes:
+// 1) Count edges/nodes by level-wise partitioning on next-byte groups
+// 2) Preallocate and emit bitvector runs, labels, and accept bits
+// The returned LOUDS does not include Rank/Select structures; readers rebuild RS.
+func NewLOUDSFromSortedKeys(keys [][]byte) *LOUDS {
+	if len(keys) == 0 {
+		return &LOUDS{
+			bits:     NewBitVector(2),
+			numNodes: 0,
+			childIdx: make(map[uint64]map[byte]uint64),
+		}
+	}
+
+	type group struct {
+		start, end int
+		depth      int
+	}
+
+	// Pass 1: count edges (children) to size structures
+	edgesTotal := 0
+	cur := []group{{0, len(keys), 0}}
+	for len(cur) > 0 {
+		next := make([]group, 0, len(cur)*2)
+		for _, g := range cur {
+			i := g.start
+			// Skip keys that end exactly at this depth (they mark leaf at current node)
+			for i < g.end {
+				if len(keys[i]) <= g.depth {
+					i++
+					continue
+				}
+				break
+			}
+			j := i
+			for j < g.end {
+				if len(keys[j]) <= g.depth {
+					j++
+					continue
+				}
+				// start of a child bucket
+				lb := keys[j][g.depth]
+				k := j + 1
+				for k < g.end {
+					if len(keys[k]) <= g.depth {
+						k++
+						continue
+					}
+					if keys[k][g.depth] != lb {
+						break
+					}
+					k++
+				}
+				edgesTotal++
+				// child group is [j,k) at depth+1
+				next = append(next, group{j, k, g.depth + 1})
+				j = k
+			}
+		}
+		cur = next
+	}
+
+	nodesTotal := edgesTotal + 1
+	bitLen := 2*nodesTotal + 2
+	louds := &LOUDS{
+		bits:     NewBitVector(uint64(bitLen)),
+		labels:   make([]byte, 0, edgesTotal),
+		values:   nil,
+		numNodes: uint64(nodesTotal),
+		childIdx: make(map[uint64]map[byte]uint64),
+		accept:   NewBitVector(uint64(nodesTotal) + 2),
+	}
+
+	// Pass 2: emit LOUDS bit runs, labels, and accept
+	louds.bits.Set(0)
+	louds.bits.Clear(1)
+	bitPos := uint64(2)
+	nodeIdx := uint64(1) // child nodes indices (1-based)
+	cur = []group{{0, len(keys), 0}}
+	for len(cur) > 0 {
+		next := make([]group, 0, len(cur)*2)
+		for _, g := range cur {
+			// Enumerate child buckets in byte order (already ensured by sorted keys)
+			i := g.start
+			// Skip keys that end here (leaf at current prefix)
+			for i < g.end {
+				if len(keys[i]) <= g.depth {
+					i++
+					continue
+				}
+				break
+			}
+			// Count children first to set run
+			// But we can set runs iteratively by accumulating contiguous buckets
+			// We will collect buckets to set run once
+			childStarts := make([]int, 0, 8)
+			childEnds := make([]int, 0, 8)
+			childLabels := make([]byte, 0, 8)
+			for i < g.end {
+				if len(keys[i]) <= g.depth {
+					i++
+					continue
+				}
+				lb := keys[i][g.depth]
+				j := i + 1
+				for j < g.end {
+					if len(keys[j]) <= g.depth {
+						j++
+						continue
+					}
+					if keys[j][g.depth] != lb {
+						break
+					}
+					j++
+				}
+				childStarts = append(childStarts, i)
+				childEnds = append(childEnds, j)
+				childLabels = append(childLabels, lb)
+				i = j
+			}
+			// Set LOUDS 1-run for this node's children
+			if n := uint64(len(childLabels)); n > 0 {
+				louds.bits.SetRun(bitPos, n)
+				bitPos += n
+				// Append labels and accept bits, enqueue children
+				for idx := 0; idx < len(childLabels); idx++ {
+					louds.labels = append(louds.labels, childLabels[idx])
+					// Accept: exists key with exact length depth+1 in [start,end)
+					s, e := childStarts[idx], childEnds[idx]
+					leaf := false
+					for t := s; t < e; t++ {
+						if len(keys[t]) == g.depth+1 {
+							leaf = true
+							break
+						}
+						// early break because sorted by bytes first, but lengths may vary; we scan segment fully
+					}
+					if leaf {
+						louds.accept.Set(nodeIdx)
+					}
+					next = append(next, group{s, e, g.depth + 1})
+					nodeIdx++
+				}
+			}
+			// End-of-children marker
+			louds.bits.Clear(bitPos)
+			bitPos++
+		}
+		cur = next
+	}
 
 	return louds
 }
@@ -68,24 +261,32 @@ func (l *LOUDS) buildFromTrie(root *TrieNode) {
 	// BFS traversal
 	queue := []*TrieNode{root}
 	bitPos := uint64(2)
+	// LOUDS node indices are 1-based and follow children discovery order
+	nodeIdx := uint64(1)
 
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
 
 		// Encode node's children
-		for _, child := range node.Children {
-			l.bits.Set(bitPos)
-			bitPos++
-			l.labels = append(l.labels, child.Label)
-
-			if child.IsLeaf {
-				l.values = append(l.values, child.Value)
-			} else {
-				l.values = append(l.values, nil)
+		children := node.Children
+		if len(children) > 0 {
+			// Set a contiguous run of 1-bits for all children edges
+			l.bits.SetRun(bitPos, uint64(len(children)))
+			bitPos += uint64(len(children))
+			for _, child := range children {
+				l.labels = append(l.labels, child.Label)
+				if child.IsLeaf && l.accept != nil {
+					l.accept.Set(nodeIdx)
+				} else if child.IsLeaf {
+					// Legacy fallback path
+					l.values = append(l.values, child.Value)
+				} else {
+					l.values = append(l.values, nil)
+				}
+				nodeIdx++
+				queue = append(queue, child)
 			}
-
-			queue = append(queue, child)
 		}
 
 		// End of children marker
@@ -162,7 +363,14 @@ func (l *LOUDS) GetValue(i uint64) []byte {
 
 // IsLeaf returns true if node i is a leaf.
 func (l *LOUDS) IsLeaf(i uint64) bool {
-	if i == 0 || i > uint64(len(l.values)) {
+	if i == 0 {
+		return false
+	}
+	// Prefer accept bitvector when available
+	if l.accept != nil && i < l.accept.Length() {
+		return l.accept.Get(i)
+	}
+	if i > uint64(len(l.values)) {
 		return false
 	}
 	return l.values[i-1] != nil
@@ -287,18 +495,76 @@ func (l *LOUDS) Marshal() []byte {
 	binary.Write(&buf, binary.LittleEndian, uint64(len(l.labels)))
 	buf.Write(l.labels)
 
-	// Write values
-	binary.Write(&buf, binary.LittleEndian, uint64(len(l.values)))
-	for _, val := range l.values {
-		if val == nil {
-			binary.Write(&buf, binary.LittleEndian, uint32(0))
-		} else {
-			binary.Write(&buf, binary.LittleEndian, uint32(len(val)))
-			buf.Write(val)
-		}
+	// Write values (legacy): now always zero entries
+	binary.Write(&buf, binary.LittleEndian, uint64(0))
+
+	// Write accept bitvector (optional)
+	if l.accept != nil {
+		acc := l.accept.Marshal()
+		binary.Write(&buf, binary.LittleEndian, uint64(len(acc)))
+		buf.Write(acc)
+	} else {
+		binary.Write(&buf, binary.LittleEndian, uint64(0))
 	}
 
 	return buf.Bytes()
+}
+
+// WriteTo streams the LOUDS structure to w using the same format as Marshal().
+func (l *LOUDS) WriteTo(w io.Writer) (int64, error) {
+	var written int64
+	// Write number of nodes
+	if err := binary.Write(w, binary.LittleEndian, l.numNodes); err != nil {
+		return written, err
+	}
+	written += 8
+	// Write bit vector length (in bytes) then contents (length + words)
+	bvData := l.bits.Marshal()
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(bvData))); err != nil {
+		return written, err
+	}
+	written += 8
+	if n, err := w.Write(bvData); err != nil {
+		return written, err
+	} else {
+		written += int64(n)
+	}
+	// Write labels
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(l.labels))); err != nil {
+		return written, err
+	}
+	written += 8
+	if len(l.labels) > 0 {
+		n, err := w.Write(l.labels)
+		if err != nil {
+			return written, err
+		}
+		written += int64(n)
+	}
+	// Write values (legacy): zero entries
+	if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil {
+		return written, err
+	}
+	written += 8
+	// Write accept bitvector
+	if l.accept != nil {
+		acc := l.accept.Marshal()
+		if err := binary.Write(w, binary.LittleEndian, uint64(len(acc))); err != nil {
+			return written, err
+		}
+		written += 8
+		if n, err := w.Write(acc); err != nil {
+			return written, err
+		} else {
+			written += int64(n)
+		}
+	} else {
+		if err := binary.Write(w, binary.LittleEndian, uint64(0)); err != nil {
+			return written, err
+		}
+		written += 8
+	}
+	return written, nil
 }
 
 // UnmarshalLOUDS deserializes a LOUDS structure.
@@ -343,27 +609,44 @@ func UnmarshalLOUDS(data []byte) (*LOUDS, error) {
 	labels := data[idx : idx+labelsLen]
 	idx += labelsLen
 
-	// values
+	// values (legacy)
 	if err := need(8); err != nil {
 		return nil, err
 	}
 	valuesLen := int(binary.LittleEndian.Uint64(data[idx:]))
 	idx += 8
-	values := make([][]byte, valuesLen)
-	for i := 0; i < valuesLen; i++ {
-		if err := need(4); err != nil {
-			return nil, err
-		}
-		l := int(binary.LittleEndian.Uint32(data[idx:]))
-		idx += 4
-		if l > 0 {
-			if err := need(l); err != nil {
+	values := make([][]byte, 0)
+	if valuesLen > 0 {
+		values = make([][]byte, valuesLen)
+		for i := 0; i < valuesLen; i++ {
+			if err := need(4); err != nil {
 				return nil, err
 			}
-			values[i] = data[idx : idx+l]
-			idx += l
-		} else {
-			values[i] = nil
+			l := int(binary.LittleEndian.Uint32(data[idx:]))
+			idx += 4
+			if l > 0 {
+				if err := need(l); err != nil {
+					return nil, err
+				}
+				values[i] = data[idx : idx+l]
+				idx += l
+			} else {
+				values[i] = nil
+			}
+		}
+	}
+
+	// accept bitvector (optional)
+	var accept *BitVector
+	if idx+8 <= len(data) {
+		accLen := int(binary.LittleEndian.Uint64(data[idx:]))
+		idx += 8
+		if accLen > 0 {
+			if err := need(accLen); err != nil {
+				return nil, err
+			}
+			accept = UnmarshalBitVector(data[idx : idx+accLen])
+			idx += accLen
 		}
 	}
 
@@ -374,6 +657,7 @@ func UnmarshalLOUDS(data []byte) (*LOUDS, error) {
 		values:   values,
 		numNodes: numNodes,
 		childIdx: make(map[uint64]map[byte]uint64),
+		accept:   accept,
 	}
 	return louds, nil
 }

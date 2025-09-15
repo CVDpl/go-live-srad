@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/CVDpl/go-live-srad/internal/common"
 	"github.com/CVDpl/go-live-srad/internal/encoding"
@@ -77,6 +79,13 @@ type Builder struct {
 
 	// When true, Build() skips generating filter files; caller can build them later asynchronously.
 	skipFilterBuild bool
+
+	// LOUDS control
+	disableLOUDS       bool
+	autoDisableMinKeys int
+
+	// GC config during trie build (0 = unchanged; >0 sets GC percent; <0 disables GC)
+	trieGCPercent int
 }
 
 // pair holds key and tombstone flag used during snapshot sorting.
@@ -98,6 +107,7 @@ func NewBuilder(segmentID uint64, level int, dir string, logger common.Logger) *
 		dir:           dir,
 		logger:        logger,
 		enableTrigram: true,
+		trieGCPercent: 0,
 	}
 }
 
@@ -227,6 +237,15 @@ func (b *Builder) ConfigureBuild(maxShards, shardMinKeys, bloomAdaptMinKeys int)
 	}
 }
 
+// SetDisableLOUDS configures whether to skip LOUDS generation during Build.
+func (b *Builder) SetDisableLOUDS(skip bool) { b.disableLOUDS = skip }
+
+// SetAutoDisableLOUDSThreshold sets minimal key count to auto-skip LOUDS.
+func (b *Builder) SetAutoDisableLOUDSThreshold(n int) { b.autoDisableMinKeys = n }
+
+// SetTrieGCPercent configures a temporary GC percent used only during trie build (0 = unchanged).
+func (b *Builder) SetTrieGCPercent(p int) { b.trieGCPercent = p }
+
 // SetSkipFilters controls whether Build() should skip generating filter files.
 // When set to true, filters can be generated later via BuildBloomOnly/BuildTrigramOnly.
 func (b *Builder) SetSkipFilters(skip bool) { b.skipFilterBuild = skip }
@@ -332,40 +351,63 @@ func (b *Builder) Build() (*Metadata, error) {
 
 	b.logger.Info("building segment", "id", b.segmentID, "keys", len(b.keys))
 
+	stepStart := time.Now()
+
 	// Build trie structure (simplified for now)
+	b.logger.Info("trie build start", "id", b.segmentID, "keys", len(b.keys))
+	trieStart := time.Now()
+	gcPrev := -2
+	if b.trieGCPercent != 0 {
+		// Save current GC percent and apply temporary policy
+		gcPrev = debug.SetGCPercent(b.trieGCPercent)
+	}
 	trie := b.buildTrie()
+	if b.trieGCPercent != 0 {
+		_ = debug.SetGCPercent(gcPrev)
+	}
+	b.logger.Info("trie build done", "id", b.segmentID, "duration", time.Since(trieStart))
 
 	// Build LOUDS/Edges/Accept/TMap/Tails in parallel (depend only on trie)
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
+		localStart := time.Now()
 		if err := b.buildLOUDS(trie, filepath.Join(segmentDir, "index.louds")); err != nil {
 			errCh <- fmt.Errorf("build LOUDS: %w", err)
 		}
+		b.logger.Info("step done", "id", b.segmentID, "step", "LOUDS", "duration", time.Since(localStart))
 	}()
 	go func() {
 		defer wg.Done()
+		localStart := time.Now()
 		if err := b.buildEdges(trie, filepath.Join(segmentDir, "index.edges")); err != nil {
 			errCh <- fmt.Errorf("build edges: %w", err)
 		}
+		b.logger.Info("step done", "id", b.segmentID, "step", "EDGES", "duration", time.Since(localStart))
 	}()
 	go func() {
 		defer wg.Done()
+		localStart := time.Now()
 		if err := b.buildAccept(trie, filepath.Join(segmentDir, "index.accept")); err != nil {
 			errCh <- fmt.Errorf("build accept: %w", err)
 		}
+		b.logger.Info("step done", "id", b.segmentID, "step", "ACCEPT", "duration", time.Since(localStart))
 	}()
 	go func() {
 		defer wg.Done()
+		localStart := time.Now()
 		if err := b.buildTMap(filepath.Join(segmentDir, "index.tmap")); err != nil {
 			errCh <- fmt.Errorf("build tmap: %w", err)
 		}
+		b.logger.Info("step done", "id", b.segmentID, "step", "TMAP", "duration", time.Since(localStart))
 	}()
 	go func() {
 		defer wg.Done()
+		localStart := time.Now()
 		if err := b.buildTails(filepath.Join(segmentDir, "tails.dat")); err != nil {
 			errCh <- fmt.Errorf("build tails: %w", err)
 		}
+		b.logger.Info("step done", "id", b.segmentID, "step", "TAILS", "duration", time.Since(localStart))
 	}()
 
 	// Wait for parallel tasks
@@ -376,6 +418,7 @@ func (b *Builder) Build() (*Metadata, error) {
 			return nil, e
 		}
 	}
+	b.logger.Info("segment core build done", "id", b.segmentID, "duration", time.Since(stepStart))
 
 	// tombstones written above when present
 
@@ -680,8 +723,32 @@ func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
 	// Convert our trie to encoding.TrieNode format
 	encodingTrie := b.convertToEncodingTrie(trie)
 
-	// Create LOUDS encoding
-	louds := encoding.NewLOUDS(encodingTrie)
+	// Create LOUDS encoding unless disabled by options/thresholds
+	if b.disableLOUDS || (b.autoDisableMinKeys > 0 && len(b.keys) >= b.autoDisableMinKeys) {
+		b.logger.Info("skipping LOUDS build due to config/threshold", "keys", len(b.keys))
+		file, err := utils.NewAtomicFile(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		bw := bufio.NewWriterSize(file, 4<<20)
+		if err := WriteCommonHeader(bw, common.MagicLouds, common.VersionSegment); err != nil {
+			return err
+		}
+		if err := bw.Flush(); err != nil {
+			return err
+		}
+		return file.Commit()
+	}
+
+	// Build LOUDS without Rank/Select to speed up flush; readers will rebuild RS
+	var louds *encoding.LOUDS
+	if b.alreadySorted {
+		// Prefer streaming LOUDS builder from sorted keys
+		louds = encoding.NewLOUDSFromSortedKeys(b.keys)
+	} else {
+		louds = encoding.NewLOUDSNoRS(encodingTrie)
+	}
 
 	// Marshal LOUDS data
 	loudsData := louds.Marshal()

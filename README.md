@@ -133,6 +133,15 @@ type Options struct {
     // Range partitioning and async filters
     BuildRangePartitions      int
     AsyncFilterBuild          bool
+
+    // LOUDS build controls
+    // DisableLOUDSBuild: when true, LOUDS index is not built during Flush/Compact.
+    // Readers will fall back to keys.dat streaming and filters. Exact lookups
+    // are still correct but may be slower without LOUDS.
+    DisableLOUDSBuild         bool
+    // AutoDisableLOUDSMinKeys: when >0 and a build processes at least this many
+    // keys, LOUDS build is skipped regardless of DisableLOUDSBuild.
+    AutoDisableLOUDSMinKeys   int
 }
 ```
 
@@ -142,6 +151,24 @@ opts := srad.DefaultOptions()
 opts.BuildMaxShards = 8          // limit concurrent shards
 opts.BuildShardMinKeys = 300000  // below threshold, do not shard
 opts.BloomAdaptiveMinKeys = 8_000_000 // reduce Bloom prefixes earlier
+```
+
+Example toggling LOUDS for bulk imports:
+```go
+opts := srad.DefaultOptions()
+opts.DisableLOUDSBuild = true              // skip LOUDS entirely
+opts.AsyncFilterBuild = true               // filters in background
+opts.EnableTrigramFilter = false           // optional
+store, _ := srad.Open(dir, opts)
+// ... bulk load ...
+store.Flush(ctx)
+// Re-enable LOUDS for subsequent smaller batches if needed
+```
+
+Example auto skip example (skip LOUDS only for huge builds):
+```go
+opts := srad.DefaultOptions()
+opts.AutoDisableLOUDSMinKeys = 50_000_000  // 50M+ keys => skip LOUDS
 ```
 
 ### Filters

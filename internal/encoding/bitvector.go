@@ -50,6 +50,46 @@ func (bv *BitVector) Get(i uint64) bool {
 	return (bv.bits[wordIdx] & (uint64(1) << bitIdx)) != 0
 }
 
+// SetRun sets a contiguous run of n 1-bits starting at position start.
+// If the run exceeds the bitvector length, it is truncated.
+func (bv *BitVector) SetRun(start, n uint64) {
+	if n == 0 {
+		return
+	}
+	if start >= bv.length {
+		return
+	}
+	if start+n > bv.length {
+		n = bv.length - start
+	}
+	wordIdx := start / 64
+	bitIdx := start % 64
+	// Fill first partial word
+	if bitIdx != 0 {
+		rem := uint64(64) - bitIdx
+		chunk := n
+		if chunk > rem {
+			chunk = rem
+		}
+		mask := ((uint64(1) << chunk) - 1) << bitIdx
+		bv.bits[wordIdx] |= mask
+		start += chunk
+		n -= chunk
+		wordIdx++
+	}
+	// Fill full words
+	for n >= 64 {
+		bv.bits[wordIdx] = ^uint64(0)
+		wordIdx++
+		n -= 64
+	}
+	// Fill last partial word
+	if n > 0 {
+		mask := (uint64(1) << n) - 1
+		bv.bits[wordIdx] |= mask
+	}
+}
+
 // Rank1 returns the number of 1-bits up to position i (exclusive).
 func (bv *BitVector) Rank1(i uint64) uint64 {
 	if i == 0 {

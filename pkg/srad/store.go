@@ -149,6 +149,18 @@ type Options struct {
 	BuildRangePartitions int
 	// Build filters asynchronously after flush (may increase memory)
 	AsyncFilterBuild bool
+
+	// DisableLOUDSBuild disables building LOUDS index during flush. Readers will
+	// fall back to keys.dat streaming and filters. Exact lookups will use keys.dat.
+	DisableLOUDSBuild bool
+
+	// AutoDisableLOUDSMinKeys: when >0 and number of keys >= this threshold, the
+	// builder will skip LOUDS regardless of DisableLOUDSBuild.
+	AutoDisableLOUDSMinKeys int
+
+	// GCPercentDuringTrie sets temporary runtime GC percent during trie build (0 = unchanged).
+	// Example: set to a large number (e.g., 500-1000) to reduce GC frequency while building huge tries.
+	GCPercentDuringTrie int
 }
 
 // QueryOptions configures query execution.
@@ -338,6 +350,8 @@ func DefaultOptions() *Options {
 		BloomAdaptiveMinKeys:        10000000,
 		BuildRangePartitions:        1,
 		AsyncFilterBuild:            false,
+		DisableLOUDSBuild:           false,
+		AutoDisableLOUDSMinKeys:     0,
 	}
 }
 
