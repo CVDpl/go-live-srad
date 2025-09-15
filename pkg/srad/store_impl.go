@@ -1264,6 +1264,9 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	// Refresh stats
 	s.updateStatsFromManifest()
 
+	// If filters are built asynchronously, schedule building for new segments now
+	s.maybeScheduleAsyncFilters()
+
 	return nil
 }
 
