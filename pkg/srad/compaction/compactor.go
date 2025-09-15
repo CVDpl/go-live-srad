@@ -235,6 +235,8 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		if c.configureBuilder != nil {
 			c.configureBuilder(cur.builder)
 		}
+		// Compaction produces keys in strictly sorted order; enable fast-paths.
+		cur.builder.MarkAlreadySorted()
 		cur.approxBytes = 0
 		cur.acceptedCount = 0
 	}

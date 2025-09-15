@@ -246,6 +246,9 @@ func (b *Builder) SetTrieGCPercent(p int) { b.trieGCPercent = p }
 // SetForceTrie forces building trie even for sorted inputs (benchmark/debug).
 func (b *Builder) SetForceTrie(force bool) { b.forceTrie = force }
 
+// MarkAlreadySorted marks input as sorted to enable fast-path builders.
+func (b *Builder) MarkAlreadySorted() { b.alreadySorted = true }
+
 // SetSkipFilters controls whether Build() should skip generating filter files.
 // When set to true, filters can be generated later via BuildBloomOnly/BuildTrigramOnly.
 func (b *Builder) SetSkipFilters(skip bool) { b.skipFilterBuild = skip }
