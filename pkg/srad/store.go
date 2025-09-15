@@ -66,6 +66,11 @@ type Store interface {
 	// Effective primarily when WAL rotation is enabled on flush; otherwise it only
 	// removes fully older WAL files, never truncating the current one.
 	PruneWAL() error
+
+	// PurgeObsoleteSegments removes non-active segment directories immediately (dangerous).
+	// This bypasses the RCU grace period and should be used only in maintenance tools
+	// or tests when no readers are using old segments.
+	PurgeObsoleteSegments() error
 }
 
 // Options configures the store behavior.
