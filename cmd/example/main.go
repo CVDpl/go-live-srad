@@ -202,7 +202,7 @@ func main() {
 	store.Tune(tuningParams)
 	fmt.Println("   ✓ Store parameters tuned")
 
-	// Force compaction (stub for now)
+	// Force compaction
 	fmt.Println("\n8. Triggering compaction...")
 	compactCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -213,8 +213,8 @@ func main() {
 		fmt.Println("   ✓ Compaction triggered")
 	}
 
-	// Wait a bit for background processes
-	time.Sleep(500 * time.Millisecond)
+	// Optionally purge obsolete segment dirs (demo only; dangerous in production)
+	_ = store.PurgeObsoleteSegments()
 
 	// Post-compaction stats (overall)
 	post := store.Stats()
