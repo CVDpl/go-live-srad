@@ -61,12 +61,8 @@ type Builder struct {
 	filterTrigramBlake3 string
 	keysBlake3          string
 	// Core artifacts BLAKE3
-	loudsBlake3  string
-	edgesBlake3  string
-	acceptBlake3 string
-	tmapBlake3   string
-	tailsBlake3  string
-	tombsBlake3  string
+	loudsBlake3 string
+	tombsBlake3 string
 
 	// Filter configuration (0/false => defaults)
 	customBloomFPR  float64
@@ -439,26 +435,7 @@ func (b *Builder) Build() (*Metadata, error) {
 	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.louds")); err == nil {
 		metadata.Blake3["index.louds"] = h
 	}
-	if b.edgesBlake3 != "" {
-		metadata.Blake3["index.edges"] = b.edgesBlake3
-	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.edges")); err == nil {
-		metadata.Blake3["index.edges"] = h
-	}
-	if b.acceptBlake3 != "" {
-		metadata.Blake3["index.accept"] = b.acceptBlake3
-	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.accept")); err == nil {
-		metadata.Blake3["index.accept"] = h
-	}
-	if b.tmapBlake3 != "" {
-		metadata.Blake3["index.tmap"] = b.tmapBlake3
-	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "index.tmap")); err == nil {
-		metadata.Blake3["index.tmap"] = h
-	}
-	if b.tailsBlake3 != "" {
-		metadata.Blake3["tails.dat"] = b.tailsBlake3
-	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(segmentDir, "tails.dat")); err == nil {
-		metadata.Blake3["tails.dat"] = h
-	}
+	// Deprecated files removed; do not record checksums for edges/accept/tmap/tails
 	if b.filterBloomBlake3 != "" {
 		metadata.Blake3["filters/prefix.bf"] = b.filterBloomBlake3
 	} else if h, err := utils.ComputeBLAKE3File(filepath.Join(filtersDir, "prefix.bf")); err == nil {
@@ -870,100 +847,6 @@ func (b *Builder) convertToEncodingTrie(node *trieNode) *encoding.TrieNode {
 	}
 
 	return result
-}
-
-// buildEdges builds the edges file.
-func (b *Builder) buildEdges(_ *trieNode, path string) error {
-	// Simplified edges building
-	file, err := utils.NewAtomicFile(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Write header
-	hasher := blake3.New()
-	bw := bufio.NewWriterSize(file, 4<<20)
-	out := io.MultiWriter(bw, hasher)
-	if err := WriteCommonHeader(out, common.MagicEdges, common.VersionSegment); err != nil {
-		return err
-	}
-
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	b.edgesBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
-	return file.Commit()
-}
-
-// buildAccept builds the accept states file.
-func (b *Builder) buildAccept(_ *trieNode, path string) error {
-	// Simplified accept building
-	file, err := utils.NewAtomicFile(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Write header
-	hasher := blake3.New()
-	bw := bufio.NewWriterSize(file, 4<<20)
-	out := io.MultiWriter(bw, hasher)
-	if err := WriteCommonHeader(out, common.MagicAccept, common.VersionSegment); err != nil {
-		return err
-	}
-
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	b.acceptBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
-	return file.Commit()
-}
-
-// buildTMap builds the tail mapping file.
-func (b *Builder) buildTMap(path string) error {
-	file, err := utils.NewAtomicFile(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Write header
-	hasher := blake3.New()
-	bw := bufio.NewWriterSize(file, 4<<20)
-	out := io.MultiWriter(bw, hasher)
-	if err := WriteCommonHeader(out, common.MagicTMap, common.VersionSegment); err != nil {
-		return err
-	}
-
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	b.tmapBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
-	return file.Commit()
-}
-
-// buildTails builds the tails data file.
-func (b *Builder) buildTails(path string) error {
-	file, err := utils.NewAtomicFile(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Write header
-	hasher := blake3.New()
-	bw := bufio.NewWriterSize(file, 4<<20)
-	out := io.MultiWriter(bw, hasher)
-	if err := WriteCommonHeader(out, common.MagicTails, common.VersionSegment); err != nil {
-		return err
-	}
-
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	b.tailsBlake3 = fmt.Sprintf("%x", hasher.Sum(nil))
-	return file.Commit()
 }
 
 // buildFilters builds the filter files.

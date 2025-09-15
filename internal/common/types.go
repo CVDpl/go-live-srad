@@ -15,10 +15,6 @@ const (
 const (
 	MagicWAL     uint32 = 0x314C4157 // "WAL1" in little-endian
 	MagicLouds   uint32 = 0x44554F4C // "LOUD" in little-endian
-	MagicEdges   uint32 = 0x45474445 // "EDGE" in little-endian
-	MagicAccept  uint32 = 0x50434341 // "ACCP" in little-endian
-	MagicTMap    uint32 = 0x50414D54 // "TMAP" in little-endian
-	MagicTails   uint32 = 0x4C494154 // "TAIL" in little-endian
 	MagicBloom   uint32 = 0x4D4F4C42 // "BLOM" in little-endian
 	MagicTrigram uint32 = 0x47495254 // "TRIG" in little-endian
 	MagicKeys    uint32 = 0x5359454B // "KEYS" in little-endian
@@ -104,10 +100,6 @@ const (
 // Segment file names
 const (
 	FileIndexLouds  = "index.louds"
-	FileIndexEdges  = "index.edges"
-	FileIndexAccept = "index.accept"
-	FileIndexTMap   = "index.tmap"
-	FileTails       = "tails.dat"
 	FileSegmentMeta = "segment.json"
 	FilePrefixBloom = "filters/prefix.bf"
 	FileTrigramBits = "filters/tri.bits"

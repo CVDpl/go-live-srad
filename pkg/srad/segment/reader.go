@@ -35,11 +35,9 @@ type Reader struct {
 	expiries []int64
 
 	// File handles (memory mapped in future)
-	loudsFile  *os.File
-	edgesFile  *os.File
-	acceptFile *os.File
-	keysFile   *os.File
-	expFile    *os.File
+	loudsFile *os.File
+	keysFile  *os.File
+	expFile   *os.File
 
 	logger common.Logger
 
@@ -87,12 +85,6 @@ func (r *Reader) internalClose() {
 	}
 	if r.loudsFile != nil {
 		r.loudsFile.Close()
-	}
-	if r.edgesFile != nil {
-		r.edgesFile.Close()
-	}
-	if r.acceptFile != nil {
-		r.acceptFile.Close()
 	}
 	if r.keysFile != nil {
 		r.keysFile.Close()
@@ -179,31 +171,6 @@ func (r *Reader) openFiles() error {
 	r.loudsFile, err = os.Open(loudsPath)
 	if err != nil {
 		return fmt.Errorf("open LOUDS file: %w", err)
-	}
-
-	// Open edges file (optional)
-	if r.metadata.Files.Edges != "" {
-		edgesPath := filepath.Join(r.dir, r.metadata.Files.Edges)
-		if f, e := os.Open(edgesPath); e == nil {
-			r.edgesFile = f
-		} else if !os.IsNotExist(e) {
-			r.loudsFile.Close()
-			return fmt.Errorf("open edges file: %w", e)
-		}
-	}
-
-	// Open accept file (optional)
-	if r.metadata.Files.Accept != "" {
-		acceptPath := filepath.Join(r.dir, r.metadata.Files.Accept)
-		if f, e := os.Open(acceptPath); e == nil {
-			r.acceptFile = f
-		} else if !os.IsNotExist(e) {
-			r.loudsFile.Close()
-			if r.edgesFile != nil {
-				r.edgesFile.Close()
-			}
-			return fmt.Errorf("open accept file: %w", e)
-		}
 	}
 
 	// Open keys file (optional)

@@ -56,16 +56,6 @@ func main() {
 	} else {
 		fmt.Println("LOUDS: OK")
 	}
-	// EDGES (optional but expected)
-	if err := checkFile(filepath.Join(*dir, "index.edges"), common.MagicEdges); err == nil {
-		fmt.Println("EDGES: OK")
-	}
-	// ACCEPT (optional but expected)
-	if err := checkFile(filepath.Join(*dir, "index.accept"), common.MagicAccept); err == nil {
-		fmt.Println("ACCEPT: OK")
-	}
-	// TMAP (optional)
-	_ = checkFile(filepath.Join(*dir, "index.tmap"), common.MagicTMap)
 	// Bloom (optional)
 	_ = checkFile(filepath.Join(*dir, "filters", "prefix.bf"), common.MagicBloom)
 	// Trigram (optional)

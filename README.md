@@ -277,10 +277,6 @@ store_directory/
 ├── segments/               # Immutable segment files
 │   ├── <segmentID>/
 │   │   ├── index.louds    # LOUDS-encoded trie
-│   │   ├── index.edges    # Edge labels and topology
-│   │   ├── index.accept   # Accept states
-│   │   ├── index.tmap     # Tail mapping
-│   │   ├── tails.dat      # Tail data
 │   │   ├── segment.json   # Segment metadata
 │   │   └── filters/       # Bloom and trigram filters
 │   │       ├── prefix.bf
@@ -447,9 +443,7 @@ go build ./cmd/segcheck
 ./segcheck -dir /path/to/store/segments/0000000000000003
 ```
 
-It verifies `index.louds` (required) and, if present, `index.edges`, `index.accept`, `index.tmap`, `filters/prefix.bf`,
-`filters/tri.bits`, `keys.dat`, and `tombstones.dat`. If `segment.json` contains BLAKE3 entries, it recomputes and
-compares them.
+It verifies `index.louds` (required), `filters/prefix.bf` (if present), `filters/tri.bits` (if present), `keys.dat` (if present), and `tombstones.dat` (if present). If `segment.json` contains BLAKE3 entries, it recomputes and compares them.
 
 ## Examples
 
