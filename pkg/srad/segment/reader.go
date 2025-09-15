@@ -3,6 +3,7 @@ package segment
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -135,6 +136,8 @@ func NewReader(segmentID uint64, dir string, logger common.Logger, verifyChecksu
 		metadata:        metadata,
 		logger:          logger,
 		verifyChecksums: verifyChecksums,
+		// Hold one reference for store ownership; queries will IncRef/Release.
+		refcnt: 1,
 	}
 
 	// Open segment files
@@ -489,12 +492,19 @@ func (r *Reader) loadTombstones() error {
 // IterateTombstones streams tombstone keys from tombstones.dat without building the full in-memory set.
 // It returns the number of tombstones iterated and the first error encountered.
 func (r *Reader) IterateTombstones(fn func(k []byte) bool) (int, error) {
-	if r.tombFile == nil {
-		return 0, nil
+	path := filepath.Join(r.dir, "tombstones.dat")
+	f, err := os.Open(path)
+	if err != nil {
+		// If file does not exist, treat as no tombstones
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
 	}
-	defer r.tombFile.Seek(0, 0)
+	defer f.Close()
+	br := bufio.NewReaderSize(f, 1<<20)
 	// Read and validate header
-	hdr, err := ReadCommonHeader(r.tombFile)
+	hdr, err := ReadCommonHeader(br)
 	if err != nil {
 		return 0, err
 	}
@@ -502,17 +512,17 @@ func (r *Reader) IterateTombstones(fn func(k []byte) bool) (int, error) {
 		return 0, err
 	}
 	var count uint32
-	if err := binary.Read(r.tombFile, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
 		return 0, err
 	}
 	iterated := 0
 	for i := uint32(0); i < count; i++ {
 		var kl uint32
-		if err := binary.Read(r.tombFile, binary.LittleEndian, &kl); err != nil {
+		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
 			return iterated, err
 		}
 		k := make([]byte, kl)
-		if _, err := r.tombFile.Read(k); err != nil {
+		if _, err := io.ReadFull(br, k); err != nil {
 			return iterated, err
 		}
 		if !fn(k) {
@@ -530,6 +540,32 @@ func (r *Reader) HasTombstone(key []byte) bool {
 	}
 	_, ok := r.tombstoneSet[string(key)]
 	return ok
+}
+
+// HasTombstoneExact checks if the exact key is tombstoned, without preloading the full set.
+// It streams tombstones and stops early on match or cancellation.
+func (r *Reader) HasTombstoneExact(ctx context.Context, key []byte) bool {
+	adv, closeFn := r.StreamTombstones()
+	defer closeFn()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		tk, ok := adv()
+		if !ok {
+			return false
+		}
+		cmp := bytes.Compare(tk, key)
+		if cmp == 0 {
+			return true
+		}
+		// Optional fast-exit if tombstones are sorted
+		if cmp > 0 {
+			return false
+		}
+	}
 }
 
 func (r *Reader) loadExpiries() error {
@@ -698,38 +734,48 @@ func (r *Reader) MayContain(pattern *regexp.Regexp) bool {
 }
 
 // StreamKeys provides a streaming closure over keys.dat for k-way merge.
-// The returned advance func yields the next key (copy) and ok=false on end/error.
-func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
-	if r.keysFile == nil {
-		return func() ([]byte, bool) { return nil, false }
+// Returns an advance function and a close function to release resources early.
+func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
+	path := filepath.Join(r.dir, "keys.dat")
+	f, err := os.Open(path)
+	if err != nil {
+		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
-	if _, err := r.keysFile.Seek(0, 0); err != nil {
-		return func() ([]byte, bool) { return nil, false }
-	}
-	br := bufio.NewReaderSize(r.keysFile, 1<<20)
+	br := bufio.NewReaderSize(f, 1<<20)
 	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicKeys, common.VersionSegment) != nil {
-		return func() ([]byte, bool) { return nil, false }
+		_ = f.Close()
+		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var count uint32
 	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		return func() ([]byte, bool) { return nil, false }
+		_ = f.Close()
+		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	// Best-effort load expiries so we can filter during streaming
 	if len(r.expiries) == 0 && r.expFile != nil {
 		_ = r.loadExpiries()
 	}
 	var i uint32
-	return func() ([]byte, bool) {
+	closed := false
+	closeOnce := func() {
+		if !closed {
+			closed = true
+			_ = f.Close()
+		}
+	}
+	adv := func() ([]byte, bool) {
 		for i < count {
 			var kl uint32
 			if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
+				closeOnce()
 				return nil, false
 			}
 			var k []byte
 			if kl > 0 {
 				k = make([]byte, kl)
 				if _, err := io.ReadFull(br, k); err != nil {
+					closeOnce()
 					return nil, false
 				}
 			}
@@ -741,47 +787,61 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool)) {
 			}
 			return k, true
 		}
+		closeOnce()
 		return nil, false
 	}
+	return adv, closeOnce
 }
 
 // StreamTombstones provides a streaming closure over tombstones.dat.
-// The returned advance func yields the next tombstone key (copy) and ok=false on end/error.
-func (r *Reader) StreamTombstones() (advance func() ([]byte, bool)) {
-	if r.tombFile == nil {
-		return func() ([]byte, bool) { return nil, false }
+// Returns an advance function and a close function to release resources early.
+func (r *Reader) StreamTombstones() (advance func() ([]byte, bool), closeFn func()) {
+	path := filepath.Join(r.dir, "tombstones.dat")
+	f, err := os.Open(path)
+	if err != nil {
+		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
-	if _, err := r.tombFile.Seek(0, 0); err != nil {
-		return func() ([]byte, bool) { return nil, false }
-	}
-	br := bufio.NewReaderSize(r.tombFile, 1<<20)
+	br := bufio.NewReaderSize(f, 1<<20)
 	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicTombs, common.VersionSegment) != nil {
-		return func() ([]byte, bool) { return nil, false }
+		_ = f.Close()
+		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var count uint32
 	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		return func() ([]byte, bool) { return nil, false }
+		_ = f.Close()
+		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var i uint32
-	return func() ([]byte, bool) {
+	closed := false
+	closeOnce := func() {
+		if !closed {
+			closed = true
+			_ = f.Close()
+		}
+	}
+	adv := func() ([]byte, bool) {
 		if i >= count {
+			closeOnce()
 			return nil, false
 		}
 		var kl uint32
 		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
+			closeOnce()
 			return nil, false
 		}
 		var k []byte
 		if kl > 0 {
 			k = make([]byte, kl)
 			if _, err := io.ReadFull(br, k); err != nil {
+				closeOnce()
 				return nil, false
 			}
 		}
 		i++
 		return k, true
 	}
+	return adv, closeOnce
 }
 
 // SegmentIterator iterates over keys in a segment.
