@@ -34,6 +34,9 @@ type Compactor struct {
 	cancel context.CancelFunc
 
 	logger common.Logger
+
+	// Optional: configure each segment.Builder before use (filters, LOUDS, trie, GC, etc.)
+	configureBuilder func(*segment.Builder)
 }
 
 // CompactionPlan describes a compaction task.
@@ -229,6 +232,9 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		}
 		cur.id = c.alloc()
 		cur.builder = segment.NewBuilder(cur.id, targetLevel, segmentsDir, c.logger)
+		if c.configureBuilder != nil {
+			c.configureBuilder(cur.builder)
+		}
 		cur.approxBytes = 0
 		cur.acceptedCount = 0
 	}
@@ -437,6 +443,9 @@ func (c *Compactor) TriggerCompaction() {
 		c.logger.Warn("manual compaction failed", "error", err)
 	}
 }
+
+// SetBuilderConfigurator sets a callback that configures each new segment.Builder the compactor creates.
+func (c *Compactor) SetBuilderConfigurator(fn func(*segment.Builder)) { c.configureBuilder = fn }
 
 // Helper functions
 

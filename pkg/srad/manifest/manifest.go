@@ -95,6 +95,28 @@ func New(dir string, logger common.Logger) (*Manifest, error) {
 	return m, nil
 }
 
+// OpenReadOnly opens an existing manifest without creating any files or directories.
+// It returns an error if the manifest directory or files are missing, and never writes.
+func OpenReadOnly(dir string, logger common.Logger) (*Manifest, error) {
+	if logger == nil {
+		logger = &NullLogger{}
+	}
+
+	manifestDir := filepath.Join(dir, common.DirManifest)
+
+	m := &Manifest{
+		dir:      manifestDir,
+		logger:   logger,
+		versions: make([]*Version, 0),
+	}
+
+	if err := m.load(); err != nil {
+		return nil, err
+	}
+
+	return m, nil
+}
+
 // load loads the manifest from disk.
 func (m *Manifest) load() error {
 	// Prefer CURRENT pointer

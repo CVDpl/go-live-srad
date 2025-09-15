@@ -152,9 +152,11 @@ func Open(dir string, opts *Options) (Store, error) {
 		opts.Logger = NewDefaultLogger()
 	}
 
-	// Create directory if it doesn't exist
-	if err := createStoreDirectories(dir); err != nil {
-		return nil, fmt.Errorf("create store directories: %w", err)
+	// Create directories only when not in read-only mode
+	if !opts.ReadOnly {
+		if err := createStoreDirectories(dir); err != nil {
+			return nil, fmt.Errorf("create store directories: %w", err)
+		}
 	}
 
 	s := &storeImpl{
@@ -239,11 +241,15 @@ func Open(dir string, opts *Options) (Store, error) {
 		}
 	}
 
-	// Initialize manifest
+	// Initialize manifest (read-only avoids creating files)
 	var manifestErr error
-	s.manifest, manifestErr = manifest.New(dir, s.logger)
+	if s.readonly {
+		s.manifest, manifestErr = manifest.OpenReadOnly(dir, s.logger)
+	} else {
+		s.manifest, manifestErr = manifest.New(dir, s.logger)
+	}
 	if manifestErr != nil {
-		s.logger.Warn("failed to create manifest", "error", manifestErr)
+		s.logger.Warn("failed to open manifest", "readonly", s.readonly, "error", manifestErr)
 		// Continue without manifest for now
 	}
 
@@ -259,6 +265,34 @@ func Open(dir string, opts *Options) (Store, error) {
 	if s.manifest != nil && !s.readonly {
 		alloc := func() uint64 { return atomic.AddUint64(&s.nextSegmentID, 1) }
 		s.compactor = compaction.NewCompactor(dir, s.manifest, s.logger, alloc)
+		// Ensure compaction builders are configured consistently with flush
+		cfg := func(b *segment.Builder) {
+			bloomFPR := s.opts.PrefixBloomFPR
+			if bloomFPR <= 0 {
+				bloomFPR = common.DefaultBloomFPR
+			}
+			prefixLen := s.opts.PrefixBloomMaxPrefixLen
+			if prefixLen <= 0 {
+				prefixLen = int(common.DefaultPrefixBloomLength)
+			}
+			enableTri := s.opts.EnableTrigramFilter
+			b.ConfigureFilters(bloomFPR, prefixLen, enableTri)
+			b.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
+			if s.opts.AsyncFilterBuild {
+				b.SetSkipFilters(true)
+			}
+			if s.opts.GCPercentDuringTrie != 0 {
+				b.SetTrieGCPercent(s.opts.GCPercentDuringTrie)
+			}
+			b.SetDisableLOUDS(s.opts.DisableLOUDSBuild)
+			if s.opts.AutoDisableLOUDSMinKeys > 0 {
+				b.SetAutoDisableLOUDSThreshold(s.opts.AutoDisableLOUDSMinKeys)
+			}
+			if s.opts.ForceTrieBuild {
+				b.SetForceTrie(true)
+			}
+		}
+		s.compactor.SetBuilderConfigurator(cfg)
 	}
 
 	// Load tuning parameters
