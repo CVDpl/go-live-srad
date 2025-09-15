@@ -110,7 +110,7 @@ func (r *Reader) internalClose() {
 // NewReader creates a new segment reader.
 func NewReader(segmentID uint64, dir string, logger common.Logger, verifyChecksums bool) (*Reader, error) {
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 
 	segmentDir := filepath.Join(dir, fmt.Sprintf("%016d", segmentID))

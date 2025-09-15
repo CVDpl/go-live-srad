@@ -76,14 +76,6 @@ type WALEntry struct {
 	TTL time.Duration
 }
 
-// NullLogger is a logger that discards all log messages.
-type NullLogger struct{}
-
-func (n *NullLogger) Debug(msg string, fields ...interface{}) {}
-func (n *NullLogger) Info(msg string, fields ...interface{})  {}
-func (n *NullLogger) Warn(msg string, fields ...interface{})  {}
-func (n *NullLogger) Error(msg string, fields ...interface{}) {}
-
 // New creates a new WAL instance.
 func New(dir string, logger common.Logger) (*WAL, error) {
 	return NewWithConfig(dir, logger, Config{
@@ -100,7 +92,7 @@ func NewWithConfig(dir string, logger common.Logger, cfg Config) (*WAL, error) {
 	}
 
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 
 	if cfg.RotateSize <= 0 {
@@ -779,7 +771,7 @@ func (w *WAL) DeleteOldFiles(beforeSeq uint64) error {
 // It does not create, rotate, modify, or quarantine files. Best-effort: on corruption, it logs and continues.
 func ReplayDir(dir string, logger common.Logger, callback func(op uint8, key []byte, expiresAt time.Time) error) error {
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 	files, err := listWALFilesRO(dir)
 	if err != nil {

@@ -52,7 +52,7 @@ type CompactionPlan struct {
 // NewCompactor creates a new compactor.
 func NewCompactor(dir string, m *manifest.Manifest, logger common.Logger, alloc func() uint64) *Compactor {
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 
 	if alloc == nil {
@@ -507,11 +507,3 @@ func calculateTotalSize(segments []manifest.SegmentInfo) int64 {
 	}
 	return total
 }
-
-// NullLogger is a logger that discards all messages.
-type NullLogger struct{}
-
-func (n *NullLogger) Debug(msg string, fields ...interface{}) {}
-func (n *NullLogger) Info(msg string, fields ...interface{})  {}
-func (n *NullLogger) Warn(msg string, fields ...interface{})  {}
-func (n *NullLogger) Error(msg string, fields ...interface{}) {}

@@ -12,7 +12,7 @@ import (
 // TestReadRecordSizeTruncation ensures that readRecord returns precise sizes allowing safe truncation.
 func TestReadRecordSizeTruncation(t *testing.T) {
 	dir := t.TempDir()
-	w, err := NewWithConfig(dir, &NullLogger{}, Config{RotateSize: common.WALRotateSize, MaxFileSize: common.WALMaxFileSize, BufferSize: int(common.WALBufferSize)})
+	w, err := NewWithConfig(dir, common.NewNullLogger(), Config{RotateSize: common.WALRotateSize, MaxFileSize: common.WALMaxFileSize, BufferSize: int(common.WALBufferSize)})
 	if err != nil {
 		t.Fatalf("new wal: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestReadRecordSizeTruncation(t *testing.T) {
 	f.Close()
 
 	// Replay should truncate to lastValidOffset without error
-	w2, err := New(filepath.Join(dir), &NullLogger{})
+	w2, err := New(filepath.Join(dir), common.NewNullLogger())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

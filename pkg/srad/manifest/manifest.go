@@ -64,7 +64,7 @@ type CompactionInfo struct {
 // New creates a new manifest.
 func New(dir string, logger common.Logger) (*Manifest, error) {
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 
 	manifestDir := filepath.Join(dir, common.DirManifest)
@@ -99,7 +99,7 @@ func New(dir string, logger common.Logger) (*Manifest, error) {
 // It returns an error if the manifest directory or files are missing, and never writes.
 func OpenReadOnly(dir string, logger common.Logger) (*Manifest, error) {
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 
 	manifestDir := filepath.Join(dir, common.DirManifest)
@@ -474,11 +474,3 @@ type ManifestStats struct {
 	TotalKeys      uint64
 	LevelCounts    map[int]int
 }
-
-// NullLogger is a logger that discards all messages.
-type NullLogger struct{}
-
-func (n *NullLogger) Debug(msg string, fields ...interface{}) {}
-func (n *NullLogger) Info(msg string, fields ...interface{})  {}
-func (n *NullLogger) Warn(msg string, fields ...interface{})  {}
-func (n *NullLogger) Error(msg string, fields ...interface{}) {}

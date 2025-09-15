@@ -120,18 +120,8 @@ func (l *DefaultLogger) WithFields(fields map[string]interface{}) common.Logger 
 	return newLogger
 }
 
-// NullLogger is a logger that discards all log messages.
-type NullLogger struct{}
-
 // NewNullLogger creates a logger that discards all messages.
-func NewNullLogger() common.Logger {
-	return &NullLogger{}
-}
-
-func (n *NullLogger) Debug(msg string, fields ...interface{}) {}
-func (n *NullLogger) Info(msg string, fields ...interface{})  {}
-func (n *NullLogger) Warn(msg string, fields ...interface{})  {}
-func (n *NullLogger) Error(msg string, fields ...interface{}) {}
+func NewNullLogger() common.Logger { return common.NewNullLogger() }
 
 // LoggerWithContext wraps a logger with contextual information.
 type LoggerWithContext struct {

@@ -95,7 +95,7 @@ type pair struct {
 // NewBuilder creates a new segment builder.
 func NewBuilder(segmentID uint64, level int, dir string, logger common.Logger) *Builder {
 	if logger == nil {
-		logger = &NullLogger{}
+		logger = common.NewNullLogger()
 	}
 
 	return &Builder{
@@ -1215,11 +1215,3 @@ func (b *Builder) parallelSortByteSlices(keys [][]byte) [][]byte {
 	}
 	return keys
 }
-
-// NullLogger is a logger that discards all messages.
-type NullLogger struct{}
-
-func (n *NullLogger) Debug(msg string, fields ...interface{}) {}
-func (n *NullLogger) Info(msg string, fields ...interface{})  {}
-func (n *NullLogger) Warn(msg string, fields ...interface{})  {}
-func (n *NullLogger) Error(msg string, fields ...interface{}) {}
