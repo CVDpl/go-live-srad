@@ -1687,7 +1687,53 @@ func (s *storeImpl) AdvanceRCU(ctx context.Context) error {
 	atomic.AddUint64(&s.rcuEpoch, 1)
 	s.logger.Info("RCU epoch advanced", "epoch", s.rcuEpoch)
 
+	// Opportunistically trigger one cleanup pass to remove obsolete dirs
+	go s.rcuCleanupOnce()
+
 	return nil
+}
+
+// rcuCleanupOnce runs a single RCU cleanup pass (same logic as background task)
+func (s *storeImpl) rcuCleanupOnce() {
+	if s.manifest == nil {
+		return
+	}
+	active := s.manifest.GetActiveSegments()
+	activeIDs := make(map[uint64]struct{}, len(active))
+	for _, seg := range active {
+		activeIDs[seg.ID] = struct{}{}
+	}
+	segmentsDir := filepath.Join(s.dir, common.DirSegments)
+	entries, err := os.ReadDir(segmentsDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-time.Duration(common.RCUGracePeriod) * time.Second).Unix()
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		segPath := filepath.Join(segmentsDir, e.Name())
+		if _, err := os.Stat(filepath.Join(segPath, ".building")); err == nil {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(segPath, "segment.json")); err != nil {
+			continue
+		}
+		var segID uint64
+		if _, err := fmt.Sscanf(e.Name(), "%d", &segID); err != nil {
+			continue
+		}
+		if _, ok := activeIDs[segID]; ok {
+			continue
+		}
+		if info, err := os.Stat(segPath); err == nil {
+			if info.ModTime().Unix() < cutoff {
+				_ = os.RemoveAll(segPath)
+				s.logger.Info("rcu removed obsolete segment dir", "id", segID)
+			}
+		}
+	}
 }
 
 // VacuumPrefix removes all keys with the specified prefix.
