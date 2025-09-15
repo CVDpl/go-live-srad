@@ -75,18 +75,31 @@ func main() {
 	}
 
 	// Open store
-	opts := &srad.Options{
-		ReadOnly:                    false,
-		Parallelism:                 *parallelism,
-		VerifyChecksumsOnLoad:       false,
-		MemtableTargetBytes:         int64(*memtableMB) * 1024 * 1024,
-		CacheLabelAdvanceBytes:      int64(*cacheMB) * 1024 * 1024,
-		CacheNFATransitionBytes:     int64(*cacheMB) * 1024 * 1024,
-		EnableRCU:                   *rcuCleanup,
-		RCUCleanupInterval:          60 * time.Second,
-		DisableAutotuner:            true,
-		DisableBackgroundCompaction: true,
-	}
+	opts := srad.DefaultOptions()
+	opts.Logger = srad.NewNullLogger()
+	opts.ReadOnly = false
+	opts.Parallelism = *parallelism
+	opts.VerifyChecksumsOnLoad = false
+	opts.MemtableTargetBytes = int64(*memtableMB) * 1024 * 1024
+	opts.CacheLabelAdvanceBytes = int64(*cacheMB) * 1024 * 1024
+	opts.CacheNFATransitionBytes = int64(*cacheMB) * 1024 * 1024
+	opts.EnableRCU = *rcuCleanup
+	opts.RCUCleanupInterval = 60 * time.Second
+	// WAL tuning
+	opts.RotateWALOnFlush = true
+	opts.WALRotateSize = 1 << 30
+	opts.WALMaxFileSize = 1 << 30
+	opts.WALBufferSize = 1 << 20
+	opts.WALFlushEveryBytes = 8 << 20
+	// Filters and build
+	opts.PrefixBloomFPR = 0.005
+	opts.PrefixBloomMaxPrefixLen = 24
+	opts.EnableTrigramFilter = true
+	opts.BuildMaxShards = runtime.NumCPU() * 2
+	opts.BuildShardMinKeys = 200000
+	opts.BuildRangePartitions = 16
+	opts.AsyncFilterBuild = true
+	opts.AutoDisableLOUDSMinKeys = 5_000_000
 
 	store, err := srad.Open(*storeDir, opts)
 	if err != nil {
@@ -94,6 +107,22 @@ func main() {
 		return
 	}
 	defer store.Close()
+
+	// Background WAL pruning: every 30 minutes
+	stopPrune := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = store.PruneWAL()
+			case <-stopPrune:
+				return
+			}
+		}
+	}()
+	defer close(stopPrune)
 
 	// Memory before
 	runtime.GC()

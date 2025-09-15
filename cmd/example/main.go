@@ -44,14 +44,28 @@ func main() {
 	fmt.Printf("Using temporary directory: %s\n\n", tempDir)
 
 	// Create store options
-	opts := &srad.Options{
-		ReadOnly:                false,
-		Parallelism:             4,
-		VerifyChecksumsOnLoad:   true,
-		MemtableTargetBytes:     1024 * 1024, // 1MB
-		CacheLabelAdvanceBytes:  64 * 1024,   // 64KB
-		CacheNFATransitionBytes: 64 * 1024,   // 64KB
-	}
+	opts := srad.DefaultOptions()
+	opts.Logger = srad.NewNullLogger()
+	opts.Parallelism = 4
+	opts.VerifyChecksumsOnLoad = false
+	opts.MemtableTargetBytes = 512 * 1024 * 1024 // 512MB
+	opts.CacheLabelAdvanceBytes = 32 * 1024 * 1024
+	opts.CacheNFATransitionBytes = 32 * 1024 * 1024
+	// WAL tuning
+	opts.RotateWALOnFlush = true
+	opts.WALRotateSize = 1 << 30      // 1GB
+	opts.WALMaxFileSize = 1 << 30     // 1GB
+	opts.WALBufferSize = 1 << 20      // 1MB
+	opts.WALFlushEveryBytes = 8 << 20 // 8MB
+	// Filters and build
+	opts.PrefixBloomFPR = 0.005
+	opts.PrefixBloomMaxPrefixLen = 24
+	opts.EnableTrigramFilter = true
+	opts.BuildMaxShards = 8
+	opts.BuildShardMinKeys = 200000
+	opts.BuildRangePartitions = 16
+	opts.AsyncFilterBuild = true
+	opts.AutoDisableLOUDSMinKeys = 5_000_000
 
 	// Open the store
 	fmt.Println("1. Opening store...")
@@ -61,6 +75,22 @@ func main() {
 	}
 	defer store.Close()
 	fmt.Println("   ✓ Store opened successfully")
+
+	// Background WAL pruning (demo): prune every 30 minutes
+	stopPrune := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = store.PruneWAL()
+			case <-stopPrune:
+				return
+			}
+		}
+	}()
+	defer close(stopPrune)
 
 	// Insert sample data
 	fmt.Println("\n2. Inserting sample data...")

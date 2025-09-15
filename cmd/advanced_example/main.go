@@ -148,6 +148,22 @@ func runScenario(ctx context.Context, dir string, size int) error {
 	}
 	defer store.Close()
 
+	// Background WAL pruning per scenario (every 30 minutes)
+	stopPrune := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = store.PruneWAL()
+			case <-stopPrune:
+				return
+			}
+		}
+	}()
+	defer close(stopPrune)
+
 	// Insert phase
 	fmt.Printf("  📝 Inserting %d entries...\n", size)
 	insertStart := time.Now()
@@ -262,6 +278,22 @@ func runConcurrentScenario(ctx context.Context, dir string, size int) error {
 	}
 	defer store.Close()
 
+	// Background WAL pruning per scenario (every 30 minutes)
+	stopPrune := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = store.PruneWAL()
+			case <-stopPrune:
+				return
+			}
+		}
+	}()
+	defer close(stopPrune)
+
 	fmt.Printf("  🔀 Running %d concurrent workers...\n", runtime.NumCPU())
 
 	var wg sync.WaitGroup
@@ -332,6 +364,22 @@ func runComplexRegexScenario(ctx context.Context, dir string, size int) error {
 		return fmt.Errorf("failed to open store: %w", err)
 	}
 	defer store.Close()
+
+	// Background WAL pruning per scenario (every 30 minutes)
+	stopPrune := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = store.PruneWAL()
+			case <-stopPrune:
+				return
+			}
+		}
+	}()
+	defer close(stopPrune)
 
 	// Insert test data
 	fmt.Printf("  📝 Inserting test data...\n")
@@ -424,6 +472,22 @@ func runMemoryPressureScenario(ctx context.Context, dir string, size int) error 
 		return fmt.Errorf("failed to open store: %w", err)
 	}
 	defer store.Close()
+
+	// Background WAL pruning per scenario (every 30 minutes)
+	stopPrune := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = store.PruneWAL()
+			case <-stopPrune:
+				return
+			}
+		}
+	}()
+	defer close(stopPrune)
 
 	fmt.Printf("  💾 Testing with limited memory (4MB memtable)...\n")
 
