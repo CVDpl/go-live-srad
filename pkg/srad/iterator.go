@@ -9,11 +9,12 @@ import (
 
 // simpleIterator is a simple implementation of Iterator for memtable-only queries.
 type simpleIterator struct {
-	memIter *memtable.Iterator
-	mode    QueryMode
-	limit   int
-	count   int
-	current struct {
+	memIter     *memtable.Iterator
+	frozenIters []*memtable.Iterator
+	mode        QueryMode
+	limit       int
+	count       int
+	current     struct {
 		id  uint64
 		key []byte
 		op  uint8
@@ -28,30 +29,52 @@ func (it *simpleIterator) Next(ctx context.Context) bool {
 		return false
 	}
 
-	// Advance memtable iterator
-	if it.memIter == nil {
-		return false
-	}
-	if !it.memIter.Next(ctx) {
-		it.err = it.memIter.Err()
-		return false
-	}
-
-	// Get current data
-	it.current.key = it.memIter.Key()
-	value := it.memIter.Value()
-	if value != nil {
-		// Use sequence number as temporary ID for memtable entries
-		it.current.id = it.memIter.SeqNum()
-		if it.memIter.IsTombstone() {
-			it.current.op = common.OpDelete
-		} else {
-			it.current.op = common.OpInsert
+	// Advance memtable iterator first
+	if it.memIter != nil {
+		if it.memIter.Next(ctx) {
+			// Get current data
+			it.current.key = it.memIter.Key()
+			value := it.memIter.Value()
+			if value != nil {
+				// Use sequence number as temporary ID for memtable entries
+				it.current.id = it.memIter.SeqNum()
+				if it.memIter.IsTombstone() {
+					it.current.op = common.OpDelete
+				} else {
+					it.current.op = common.OpInsert
+				}
+			}
+			it.count++
+			return true
 		}
+		it.err = it.memIter.Err()
+		it.memIter = nil
 	}
 
-	it.count++
-	return true
+	// Then advance frozen snapshot iterators in order
+	for len(it.frozenIters) > 0 {
+		cur := it.frozenIters[0]
+		if cur == nil {
+			it.frozenIters = it.frozenIters[1:]
+			continue
+		}
+		if cur.Next(ctx) {
+			it.current.key = cur.Key()
+			if v := cur.Value(); v != nil {
+				it.current.id = cur.SeqNum()
+				if cur.IsTombstone() {
+					it.current.op = common.OpDelete
+				} else {
+					it.current.op = common.OpInsert
+				}
+			}
+			it.count++
+			return true
+		}
+		it.frozenIters = it.frozenIters[1:]
+	}
+
+	return false
 }
 
 // Err returns any error encountered during iteration.
