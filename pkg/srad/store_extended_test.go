@@ -434,3 +434,102 @@ func BenchmarkRegexSearch(b *testing.B) {
 		iter.Close()
 	}
 }
+
+func TestVisibilityDuringFlush(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.DisableAutoFlush = true
+	// set small memtable to make flush inexpensive
+	var small int64 = 1 << 16 // 64KB
+	opts.MemtableTargetBytes = small
+	store, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Insert keys
+	const N = 2000
+	for i := 0; i < N; i++ {
+		k := []byte(fmt.Sprintf("flush-key-%06d", i))
+		if err := store.Insert(k); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Start flush in background
+	ctx := context.Background()
+	done := make(chan error, 1)
+	go func() { done <- store.Flush(ctx) }()
+
+	// Attempt search immediately; regardless of flush timing, all keys must be visible
+	re := regexp.MustCompile("^flush-key-.*")
+	it, err := store.RegexSearch(ctx, re, DefaultQueryOptions())
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	defer it.Close()
+
+	count := 0
+	for it.Next(ctx) {
+		count++
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iter err: %v", err)
+	}
+	if count != N {
+		t.Fatalf("expected %d keys during/after flush, got %d", N, count)
+	}
+
+	// ensure flush finished
+	<-done
+}
+
+func TestReadOnlySeesUnflushedViaWAL(t *testing.T) {
+	dir := t.TempDir()
+	// Writer opts: flush WAL on every write, do not auto-flush to segments
+	wopts := DefaultOptions()
+	wopts.WALFlushOnEveryWrite = true
+	wopts.DisableAutoFlush = true
+	writer, err := Open(dir, wopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+
+	// Insert keys (remain in WAL + memtable)
+	const N = 500
+	for i := 0; i < N; i++ {
+		k := []byte(fmt.Sprintf("ro-key-%06d", i))
+		if err := writer.Insert(k); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Open read-only process and ensure it replays WAL
+	ropts := DefaultOptions()
+	ropts.ReadOnly = true
+	roStore, err := Open(dir, ropts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roStore.Close()
+
+	re := regexp.MustCompile("^ro-key-.*")
+	ctx := context.Background()
+	it, err := roStore.RegexSearch(ctx, re, DefaultQueryOptions())
+	if err != nil {
+		t.Fatalf("search ro: %v", err)
+	}
+	defer it.Close()
+	count := 0
+	for it.Next(ctx) {
+		count++
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iter ro err: %v", err)
+	}
+	if count != N {
+		t.Fatalf("expected %d keys visible in RO via WAL, got %d", N, count)
+	}
+}
