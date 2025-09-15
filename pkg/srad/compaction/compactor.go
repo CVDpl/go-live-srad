@@ -1,7 +1,9 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +14,6 @@ import (
 	"github.com/CVDpl/go-live-srad/internal/common"
 	"github.com/CVDpl/go-live-srad/pkg/srad/manifest"
 	"github.com/CVDpl/go-live-srad/pkg/srad/segment"
-	blake3 "github.com/zeebo/blake3"
 )
 
 // Compactor manages LSM compaction.
@@ -32,20 +33,17 @@ type Compactor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// State
-	running            bool
-	pendingCompactions []CompactionJob
-
 	logger common.Logger
 }
 
-// CompactionJob describes a compaction task.
-type CompactionJob struct {
-	ID       uint64
-	Level    int
-	Inputs   []uint64 // Segment IDs to compact
-	Priority int      // Higher priority = more urgent
-	Reason   string
+// CompactionPlan describes a compaction task.
+type CompactionPlan struct {
+	IsTrivialMove bool                   // True if we can just move a single L0 file to L1
+	Level         int                    // Level to compact from
+	TargetLevel   int                    // Level to compact to
+	Inputs        []manifest.SegmentInfo // Segments to compact
+	Overlaps      []manifest.SegmentInfo // Overlapping segments in target level
+	Reason        string
 }
 
 // NewCompactor creates a new compactor.
@@ -72,187 +70,134 @@ func NewCompactor(dir string, m *manifest.Manifest, logger common.Logger, alloc 
 // Start starts the compaction background process.
 func (c *Compactor) Start(ctx context.Context) {
 	c.mu.Lock()
-	if c.running {
-		c.mu.Unlock()
-		return
-	}
-	c.running = true
-	// Derive cancelable context
-	c.ctx, c.cancel = context.WithCancel(ctx)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	go c.runCompactionLoop(c.ctx)
+	if c.ctx != nil {
+		return // Already running
+	}
+	c.ctx, c.cancel = context.WithCancel(ctx)
 }
 
 // Stop stops the compaction process.
 func (c *Compactor) Stop() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.cancel != nil {
 		c.cancel()
-	}
-	c.running = false
-	c.mu.Unlock()
-}
-
-// runCompactionLoop runs the compaction loop.
-func (c *Compactor) runCompactionLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case <-ticker.C:
-			c.checkAndScheduleCompactions()
-			c.runPendingCompaction(ctx)
-		}
+		c.ctx = nil
+		c.cancel = nil
 	}
 }
 
-// checkAndScheduleCompactions checks if compaction is needed.
-func (c *Compactor) checkAndScheduleCompactions() {
-	// Get current segment state
+// Plan decides if a compaction is needed and returns a plan.
+// If no compaction is needed, it returns nil.
+func (c *Compactor) Plan() *CompactionPlan {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	segments := c.manifest.GetActiveSegments()
 
-	// Check L0 compaction (too many files in L0)
+	// 1. Priority: L0 to L1 compaction
 	l0Segments := filterByLevel(segments, 0)
 	if len(l0Segments) >= c.maxL0Files {
-		c.scheduleL0Compaction(l0Segments)
-		return
-	}
-
-	// Check leveled compaction (size imbalance between levels)
-	for level := 0; level < common.MaxLevel-1; level++ {
-		levelSegments := filterByLevel(segments, level)
-		nextLevelSegments := filterByLevel(segments, level+1)
-
-		levelSize := calculateTotalSize(levelSegments)
-		nextLevelSize := calculateTotalSize(nextLevelSegments)
-
-		// Check if this level is too large compared to next level
-		if levelSize > 0 && levelSize > nextLevelSize/int64(c.levelRatio) {
-			c.scheduleLeveledCompaction(level, levelSegments)
-			return
+		return &CompactionPlan{
+			Level:       0,
+			TargetLevel: 1,
+			Inputs:      l0Segments,
+			Overlaps:    findOverlaps(l0Segments, filterByLevel(segments, 1)),
+			Reason:      fmt.Sprintf("L0 has %d files (trigger is %d)", len(l0Segments), c.maxL0Files),
 		}
 	}
+	// Fallback: compact L0 when at least 2 files to reduce file count even below threshold
+	if len(l0Segments) >= 2 {
+		return &CompactionPlan{
+			Level:       0,
+			TargetLevel: 1,
+			Inputs:      l0Segments,
+			Overlaps:    findOverlaps(l0Segments, filterByLevel(segments, 1)),
+			Reason:      fmt.Sprintf("L0 has %d files (fallback >=2)", len(l0Segments)),
+		}
+	}
+
+	// 2. Leveled compaction for L1+
+	for level := 1; level < common.MaxLevel-1; level++ {
+		levelSegments := filterByLevel(segments, level)
+		if len(levelSegments) == 0 {
+			continue
+		}
+
+		targetSize := int64(c.levelRatio) * calculateTotalSize(filterByLevel(segments, level-1))
+		if targetSize == 0 {
+			targetSize = c.maxSegmentSize // Base case
+		}
+		currentSize := calculateTotalSize(levelSegments)
+
+		if currentSize > targetSize {
+			// Pick a segment to compact (e.g., the oldest one)
+			sort.Slice(levelSegments, func(i, j int) bool {
+				return levelSegments[i].Created < levelSegments[j].Created
+			})
+			segmentToCompact := levelSegments[0]
+
+			return &CompactionPlan{
+				Level:       level,
+				TargetLevel: level + 1,
+				Inputs:      []manifest.SegmentInfo{segmentToCompact},
+				Overlaps:    findOverlaps([]manifest.SegmentInfo{segmentToCompact}, filterByLevel(segments, level+1)),
+				Reason:      fmt.Sprintf("L%d size is %dMB, exceeds target %dMB", level, currentSize/(1024*1024), targetSize/(1024*1024)),
+			}
+		}
+	}
+
+	return nil // No compaction needed
 }
 
-// scheduleL0Compaction schedules L0 compaction.
-func (c *Compactor) scheduleL0Compaction(segments []manifest.SegmentInfo) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Select segments to compact (oldest first)
-	sort.Slice(segments, func(i, j int) bool {
-		return segments[i].Created < segments[j].Created
-	})
-
-	// Take first batch
-	batch := segments
-	if len(batch) > c.maxL0Files*2 {
-		batch = segments[:c.maxL0Files*2]
-	}
-
-	segmentIDs := make([]uint64, len(batch))
-	for i, seg := range batch {
-		segmentIDs[i] = seg.ID
-	}
-
-	job := CompactionJob{
-		ID:       uint64(time.Now().UnixNano()),
-		Level:    0,
-		Inputs:   segmentIDs,
-		Priority: 100, // High priority for L0
-		Reason:   fmt.Sprintf("L0 has %d files (max %d)", len(segments), c.maxL0Files),
-	}
-
-	c.pendingCompactions = append(c.pendingCompactions, job)
-
-	c.logger.Info("scheduled L0 compaction", "segments", len(segmentIDs), "reason", job.Reason)
-}
-
-// scheduleLeveledCompaction schedules leveled compaction.
-func (c *Compactor) scheduleLeveledCompaction(level int, segments []manifest.SegmentInfo) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Prefer smaller segments first to keep job size bounded
-	sort.Slice(segments, func(i, j int) bool { return segments[i].Size < segments[j].Size })
-
-	// Select segments with overlapping key ranges (simplified: take a limited batch)
-	maxBatch := c.maxL0Files * 3
-	if maxBatch < 4 {
-		maxBatch = 4
-	}
-	if len(segments) > maxBatch {
-		segments = segments[:maxBatch]
-	}
-
-	segmentIDs := make([]uint64, len(segments))
-	for i, seg := range segments {
-		segmentIDs[i] = seg.ID
-	}
-
-	job := CompactionJob{
-		ID:       uint64(time.Now().UnixNano()),
-		Level:    level,
-		Inputs:   segmentIDs,
-		Priority: 50 - level, // Lower levels have higher priority
-		Reason:   fmt.Sprintf("Level %d size imbalance", level),
-	}
-
-	c.pendingCompactions = append(c.pendingCompactions, job)
-
-	c.logger.Info("scheduled leveled compaction", "level", level, "segments", len(segmentIDs), "reason", job.Reason)
-}
-
-// runPendingCompaction runs the highest priority pending compaction.
-func (c *Compactor) runPendingCompaction(ctx context.Context) {
-	c.mu.Lock()
-	if len(c.pendingCompactions) == 0 {
-		c.mu.Unlock()
-		return
-	}
-
-	// Sort by priority (highest first)
-	sort.Slice(c.pendingCompactions, func(i, j int) bool {
-		return c.pendingCompactions[i].Priority > c.pendingCompactions[j].Priority
-	})
-
-	// Take the highest priority job
-	job := c.pendingCompactions[0]
-	c.pendingCompactions = c.pendingCompactions[1:]
-	c.mu.Unlock()
-
-	// Run compaction
-	if err := c.runCompactionLegacy(ctx, job); err != nil {
-		c.logger.Error("compaction failed", "job", job.ID, "error", err)
-	}
-}
-
-// runCompactionLegacy runs a single compaction job using a legacy approach.
-func (c *Compactor) runCompactionLegacy(ctx context.Context, job CompactionJob) error {
+// Execute runs a compaction job described by the plan.
+// It returns the list of new segment readers and an error if any.
+func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 	startTime := time.Now()
+	c.logger.Info("starting compaction", "reason", plan.Reason, "level", plan.Level, "inputs", len(plan.Inputs), "overlaps", len(plan.Overlaps))
 
-	c.logger.Info("starting compaction", "job", job.ID, "level", job.Level, "inputs", len(job.Inputs))
+	inputIDs := make([]uint64, 0, len(plan.Inputs)+len(plan.Overlaps))
+	for _, s := range plan.Inputs {
+		inputIDs = append(inputIDs, s.ID)
+	}
+	for _, s := range plan.Overlaps {
+		inputIDs = append(inputIDs, s.ID)
+	}
 
 	segmentsDir := filepath.Join(c.dir, common.DirSegments)
 	var readers []*segment.Reader
-	for _, segID := range job.Inputs {
+	for _, segID := range inputIDs {
+		// false for checksum verification, assuming it's already been checked on load
 		reader, err := segment.NewReader(segID, segmentsDir, c.logger, false)
 		if err != nil {
-			c.logger.Warn("failed to open segment", "id", segID, "error", err)
-			continue
+			// Clean up already opened readers
+			for _, r := range readers {
+				r.Close()
+			}
+			return nil, fmt.Errorf("failed to open segment reader for %d: %w", segID, err)
 		}
 		readers = append(readers, reader)
-		defer reader.Close()
 	}
+	defer func() {
+		for _, r := range readers {
+			r.Close()
+		}
+	}()
+
 	if len(readers) == 0 {
-		return fmt.Errorf("no segments to compact")
+		return nil, nil // Nothing to compact
 	}
 
+	// The rest of the logic is a k-way merge, similar to the legacy function.
+	// This part can be refactored into a helper if it gets complex.
+	return c.mergeSegments(readers, inputIDs, plan, startTime)
+}
+
+// mergeSegments performs the k-way merge of multiple segment readers.
+func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, plan *CompactionPlan, startTime time.Time) ([]*segment.Reader, error) {
 	// newest first, so newest wins
 	sort.Slice(readers, func(i, j int) bool {
 		mi := readers[i].GetMetadata()
@@ -263,12 +208,11 @@ func (c *Compactor) runCompactionLegacy(ctx context.Context, job CompactionJob) 
 		return mi.CreatedAtUnix > mj.CreatedAtUnix
 	})
 
-	targetLevel := job.Level + 1
-	if job.Level == 0 && len(job.Inputs) < c.maxL0Files*2 {
+	targetLevel := plan.TargetLevel
+	if plan.Level == 0 && len(plan.Inputs) < c.maxL0Files*2 {
 		targetLevel = 1
 	}
 
-	seen := make(map[[32]byte]struct{}, 1024)
 	type chunkState struct {
 		builder       *segment.Builder
 		id            uint64
@@ -277,6 +221,7 @@ func (c *Compactor) runCompactionLegacy(ctx context.Context, job CompactionJob) 
 	}
 	var cur chunkState
 	outputs := make([]uint64, 0, 8)
+	segmentsDir := filepath.Join(c.dir, common.DirSegments)
 
 	ensureBuilder := func() {
 		if cur.builder != nil {
@@ -339,83 +284,200 @@ func (c *Compactor) runCompactionLegacy(ctx context.Context, job CompactionJob) 
 		return nil
 	}
 
-	for _, r := range readers {
-		_, _ = r.IterateTombstones(func(tk []byte) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			default:
+	type srcIter struct {
+		key   []byte
+		ok    bool
+		next  func() ([]byte, bool)
+		order int
+		tomb  bool
+	}
+
+	// Min-heap emulation using sorted slice for small N
+	h := make([]*srcIter, 0, len(readers)*2)
+	less := func(i, j int) bool {
+		cmp := bytes.Compare(h[i].key, h[j].key)
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return h[i].order > h[j].order
+	}
+	push := func(si *srcIter) {
+		if si != nil && si.ok {
+			h = append(h, si)
+			sort.Slice(h, less)
+		}
+	}
+	pop := func() *srcIter {
+		if len(h) == 0 {
+			return nil
+		}
+		x := h[0]
+		h = h[1:]
+		return x
+	}
+
+	for idx, r := range readers {
+		order := len(readers) - idx // newer first has higher order
+		advK, _ := r.StreamKeys()
+		if k, ok := advK(); ok {
+			push(&srcIter{key: k, ok: true, next: advK, order: order, tomb: false})
+		}
+		advT, _ := r.StreamTombstones()
+		if tk, ok := advT(); ok {
+			push(&srcIter{key: tk, ok: true, next: advT, order: order, tomb: true})
+		}
+	}
+
+	for len(h) > 0 {
+		si := pop()
+		curKey := append([]byte(nil), si.key...)
+		bestOrder := si.order
+		bestTomb := si.tomb
+		group := []*srcIter{si}
+		// Drain all entries with the same key
+		for len(h) > 0 && bytes.Equal(h[0].key, curKey) {
+			gj := pop()
+			group = append(group, gj)
+			if gj.order > bestOrder {
+				bestOrder = gj.order
+				bestTomb = gj.tomb
 			}
-			h := blake3.Sum256(tk)
-			if _, ok := seen[h]; ok {
-				return true
+		}
+		// Advance all group members
+		for _, gi := range group {
+			if nk, ok := gi.next(); ok {
+				gi.key = nk
+				gi.ok = true
+				push(gi)
 			}
-			ensureBuilder()
-			cur.builder.AddTombstone(tk)
-			seen[h] = struct{}{}
-			cur.approxBytes += int64(len(tk))
-			if err := maybeFlush(); err != nil {
-				return false
+		}
+		// Emit based on newest record type
+		ensureBuilder()
+		if bestTomb {
+			cur.builder.AddTombstone(curKey)
+			cur.approxBytes += int64(len(curKey))
+		} else {
+			if err := cur.builder.Add(curKey, curKey, false); err != nil {
+				return nil, fmt.Errorf("builder add: %w", err)
 			}
-			return true
-		})
-		_, _ = r.IterateKeys(func(k []byte) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			default:
-			}
-			h := blake3.Sum256(k)
-			if _, ok := seen[h]; ok {
-				return true
-			}
-			ensureBuilder()
-			if err := cur.builder.Add(k, k, false); err != nil {
-				c.logger.Warn("builder add failed during streaming compaction", "error", err)
-				seen[h] = struct{}{}
-				return true
-			}
-			seen[h] = struct{}{}
-			cur.approxBytes += int64(len(k))
+			cur.approxBytes += int64(len(curKey))
 			cur.acceptedCount++
-			if err := maybeFlush(); err != nil {
-				return false
+		}
+		if err := maybeFlush(); err != nil {
+			return nil, err
+		}
+		if c.ctx != nil {
+			select {
+			case <-c.ctx.Done():
+				return nil, c.ctx.Err()
+			default:
 			}
-			return true
-		})
+		}
 	}
 	if err := finalizeChunk(); err != nil {
-		return err
+		return nil, err
 	}
+
 	if len(outputs) == 0 {
-		c.logger.Info("compaction produced no output segments", "job", job.ID)
-		return nil
+		c.logger.Info("compaction produced no output segments", "reason", plan.Reason)
+		// If no output, we still need to remove old segments from manifest
+		if err := c.manifest.RemoveSegments(inputIDs); err != nil {
+			return nil, fmt.Errorf("remove old segments from manifest: %w", err)
+		}
+		return []*segment.Reader{}, nil
 	}
-	if err := c.manifest.RemoveSegments(job.Inputs); err != nil {
-		return fmt.Errorf("remove old segments from manifest: %w", err)
+
+	// Atomically update manifest: add new segments and remove old ones
+	if err := c.manifest.RemoveSegments(inputIDs); err != nil {
+		// This is a problematic state, new segments exist but old ones are not marked for deletion.
+		// A recovery mechanism might be needed in a production system.
+		return nil, fmt.Errorf("remove old segments from manifest: %w", err)
 	}
+
 	compactionInfo := manifest.CompactionInfo{
-		ID:        job.ID,
-		Level:     job.Level,
-		Inputs:    job.Inputs,
+		ID:        uint64(startTime.UnixNano()),
+		Level:     plan.Level,
+		Inputs:    inputIDs,
 		Outputs:   outputs,
 		StartTime: startTime.Unix(),
 		EndTime:   time.Now().Unix(),
-		Reason:    job.Reason,
+		Reason:    plan.Reason,
 	}
 	if err := c.manifest.RecordCompaction(compactionInfo); err != nil {
 		c.logger.Warn("failed to record compaction", "error", err)
 	}
-	c.logger.Info("compaction completed", "job", job.ID, "inputs", len(job.Inputs), "outputs", len(outputs), "level", fmt.Sprintf("L%d->L%d", job.Level, targetLevel))
-	return nil
+
+	c.logger.Info("compaction completed", "reason", plan.Reason, "duration", time.Since(startTime), "outputs", len(outputs))
+
+	// Create readers for the new segments
+	newReaders := make([]*segment.Reader, 0, len(outputs))
+	for _, outID := range outputs {
+		reader, err := segment.NewReader(outID, segmentsDir, c.logger, true) // Verify checksums on new segments
+		if err != nil {
+			// Clean up already created readers
+			for _, r := range newReaders {
+				r.Close()
+			}
+			return nil, fmt.Errorf("failed to open new segment reader %d: %w", outID, err)
+		}
+		newReaders = append(newReaders, reader)
+	}
+
+	return newReaders, nil
 }
 
 // TriggerCompaction manually triggers compaction.
 func (c *Compactor) TriggerCompaction() {
-	c.checkAndScheduleCompactions()
+	plan := c.Plan()
+	if plan == nil {
+		c.logger.Info("manual compaction: no work to do")
+		return
+	}
+	if _, err := c.Execute(plan); err != nil {
+		c.logger.Warn("manual compaction failed", "error", err)
+	}
 }
 
 // Helper functions
+
+func findOverlaps(inputs []manifest.SegmentInfo, candidates []manifest.SegmentInfo) []manifest.SegmentInfo {
+	if len(inputs) == 0 || len(candidates) == 0 {
+		return nil
+	}
+
+	// Get min/max key range for the input set
+	var minKey, maxKey []byte
+	for _, s := range inputs {
+		minB, _ := hex.DecodeString(s.MinKeyHex)
+		maxB, _ := hex.DecodeString(s.MaxKeyHex)
+		if len(minB) > 0 && (minKey == nil || bytes.Compare(minB, minKey) < 0) {
+			minKey = minB
+		}
+		if len(maxB) > 0 && (maxKey == nil || bytes.Compare(maxB, maxKey) > 0) {
+			maxKey = maxB
+		}
+	}
+
+	if minKey == nil || maxKey == nil {
+		return candidates // No range info, assume all overlap
+	}
+
+	var overlaps []manifest.SegmentInfo
+	for _, cand := range candidates {
+		candMin, _ := hex.DecodeString(cand.MinKeyHex)
+		candMax, _ := hex.DecodeString(cand.MaxKeyHex)
+		if len(candMin) == 0 || len(candMax) == 0 {
+			overlaps = append(overlaps, cand) // No range info, assume overlap
+			continue
+		}
+
+		// Check for range intersection: !(candMax < minKey || candMin > maxKey)
+		if !(bytes.Compare(candMax, minKey) < 0 || bytes.Compare(candMin, maxKey) > 0) {
+			overlaps = append(overlaps, cand)
+		}
+	}
+	return overlaps
+}
 
 func filterByLevel(segments []manifest.SegmentInfo, level int) []manifest.SegmentInfo {
 	var result []manifest.SegmentInfo
