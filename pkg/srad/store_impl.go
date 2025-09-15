@@ -30,6 +30,12 @@ type segItem struct {
 	err error
 }
 
+// writeRequest is a request to the dedicated WAL writer goroutine.
+type writeRequest struct {
+	entry *wal.WALEntry
+	err   chan error
+}
+
 // storeImpl is the main implementation of the Store interface.
 type storeImpl struct {
 	mu     sync.RWMutex
@@ -55,6 +61,11 @@ type storeImpl struct {
 	autotuneStop chan struct{}
 	rcuStop      chan struct{}
 
+	// WAL writer
+	writeCh chan *writeRequest
+	walStop chan struct{}
+	walWg   sync.WaitGroup
+
 	// Statistics
 	stats         *StatsCollector
 	lastFlushTime time.Time
@@ -73,6 +84,9 @@ type storeImpl struct {
 	readers       []*segment.Reader
 	manifest      *manifest.Manifest
 	compactor     *compaction.Compactor
+
+	// Frozen memtable snapshots visible to readers during flush
+	frozenSnaps []*memtable.Snapshot
 
 	// Wait group for background tasks
 	bgWg sync.WaitGroup
@@ -175,6 +189,7 @@ func Open(dir string, opts *Options) (Store, error) {
 			return nil, fmt.Errorf("initialize WAL: %w", err)
 		}
 		s.wal = w
+		s.writeCh = make(chan *writeRequest, 128) // Buffer for performance
 	}
 
 	// Initialize memtable
@@ -185,6 +200,42 @@ func Open(dir string, opts *Options) (Store, error) {
 		if err := s.replayWAL(); err != nil {
 			s.Close()
 			return nil, fmt.Errorf("replay WAL: %w", err)
+		}
+	} else if s.readonly {
+		// Read-only: best-effort WAL replay without creating/rotating files
+		walDir := filepath.Join(dir, common.DirWAL)
+		if err := wal.ReplayDir(walDir, s.logger, func(op uint8, key []byte, expiresAt time.Time) error {
+			switch op {
+			case common.OpInsert:
+				if expiresAt.IsZero() || time.Now().Before(expiresAt) {
+					if mt := s.memtablePtr.Load(); mt != nil {
+						if expiresAt.IsZero() {
+							if err := mt.InsertWithTTL(key, 0); err != nil {
+								return err
+							}
+						} else {
+							if err := mt.InsertWithExpiry(key, expiresAt); err != nil {
+								return err
+							}
+						}
+					} else {
+						return fmt.Errorf("memtable not initialized")
+					}
+				}
+			case common.OpDelete:
+				if mt := s.memtablePtr.Load(); mt != nil {
+					if err := mt.Delete(key); err != nil {
+						return err
+					}
+				} else {
+					return fmt.Errorf("memtable not initialized")
+				}
+			default:
+				s.logger.Warn("unknown operation in WAL (RO)", "op", op)
+			}
+			return nil
+		}); err != nil {
+			s.logger.Warn("failed to replay WAL in read-only mode", "error", err)
 		}
 	}
 
@@ -233,8 +284,12 @@ func (s *storeImpl) Close() error {
 
 	s.logger.Info("closing store", "dir", s.dir)
 
-	// Stop background tasks
+	// Block new/in-flight writes from reaching WAL while shutting it down.
+	// Ensures no goroutine can send on writeCh after it is closed by walWriter.
+	s.mtGuard.Lock()
+	// Stop background tasks, including WAL writer (waits for WAL goroutine to exit)
 	s.stopBackgroundTasks()
+	s.mtGuard.Unlock()
 
 	// Flush memtable if not read-only
 	if !s.readonly {
@@ -283,23 +338,39 @@ func (s *storeImpl) InsertWithTTL(key []byte, ttl time.Duration) error {
 		return common.ErrInvalidTTL
 	}
 
-	// Write to WAL for durability
-	if err := s.wal.WriteWithTTL(common.OpInsert, key, ttl); err != nil {
-		return fmt.Errorf("write to WAL: %w", err)
+	entry := &wal.WALEntry{
+		Op:  common.OpInsert,
+		Key: key,
+		TTL: ttl,
 	}
 
-	// Insert into current memtable (atomic load) under read guard
-	s.mtGuard.RLock()
+	req := &writeRequest{
+		entry: entry,
+		err:   make(chan error, 1),
+	}
+
+	// Use write lock to prevent flush during insert and WAL write
+	s.mtGuard.Lock()
 	mt := s.memtablePtr.Load()
 	if mt == nil {
-		s.mtGuard.RUnlock()
+		s.mtGuard.Unlock()
 		return fmt.Errorf("memtable not initialized")
 	}
 	err := mt.InsertWithTTL(key, ttl)
-	s.mtGuard.RUnlock()
 	if err != nil {
+		s.mtGuard.Unlock()
 		return fmt.Errorf("insert to memtable: %w", err)
 	}
+	// Send to WAL while holding lock
+	s.writeCh <- req
+	// Wait for confirmation while holding lock
+	if err := <-req.err; err != nil {
+		// Rollback
+		mt.Delete(key)
+		s.mtGuard.Unlock()
+		return fmt.Errorf("write to WAL: %w", err)
+	}
+	s.mtGuard.Unlock()
 
 	// Update statistics
 	s.stats.RecordInsert()
@@ -330,23 +401,36 @@ func (s *storeImpl) Delete(key []byte) error {
 		return common.ErrKeyTooLarge
 	}
 
-	// Write to WAL first
-	if err := s.wal.Write(common.OpDelete, key); err != nil {
-		return fmt.Errorf("write to WAL: %w", err)
+	entry := &wal.WALEntry{
+		Op:  common.OpDelete,
+		Key: key,
 	}
 
-	// Mark as deleted in memtable (tombstone) under read guard
-	s.mtGuard.RLock()
+	req := &writeRequest{
+		entry: entry,
+		err:   make(chan error, 1),
+	}
+
+	// Use write lock to prevent flush during delete and WAL write
+	s.mtGuard.Lock()
 	mt := s.memtablePtr.Load()
 	if mt == nil {
-		s.mtGuard.RUnlock()
+		s.mtGuard.Unlock()
 		return fmt.Errorf("memtable not initialized")
 	}
 	err := mt.Delete(key)
-	s.mtGuard.RUnlock()
 	if err != nil {
+		s.mtGuard.Unlock()
 		return fmt.Errorf("delete from memtable: %w", err)
 	}
+	// Send to WAL while holding lock
+	s.writeCh <- req
+	// Wait for confirmation while holding lock
+	if err := <-req.err; err != nil {
+		s.mtGuard.Unlock()
+		return fmt.Errorf("write to WAL: %w", err)
+	}
+	s.mtGuard.Unlock()
 
 	// Update statistics
 	s.stats.RecordDelete()
@@ -372,17 +456,11 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	// Update statistics
 	s.stats.RecordSearch()
 
-	// Create iterators for memtable and segments
+	// Snapshot readers and frozenSnaps under short RLock, then release
 	s.mu.RLock()
-	// If no readers yet (e.g., after flush), try to load them
-	if len(s.readers) == 0 {
-		s.mu.RUnlock()
-		s.mu.Lock()
-		_ = s.loadSegments()
-		s.mu.Unlock()
-		s.mu.RLock()
-	}
-	defer s.mu.RUnlock()
+	readersSnap := append([]*segment.Reader(nil), s.readers...)
+	frozenSnapList := append([]*memtable.Snapshot(nil), s.frozenSnaps...)
+	s.mu.RUnlock()
 
 	// Use a snapshot to avoid racing with concurrent writers
 	var memIter *memtable.Iterator
@@ -390,6 +468,15 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	if mt := s.memtablePtr.Load(); mt != nil {
 		memSnap = mt.Snapshot()
 		memIter = memSnap.RegexSearch(re)
+	}
+
+	// Build iterators for frozen snapshots
+	frozenIters := make([]*memtable.Iterator, 0, len(frozenSnapList))
+	for _, fs := range frozenSnapList {
+		if fs == nil {
+			continue
+		}
+		frozenIters = append(frozenIters, fs.RegexSearch(re))
 	}
 	// Seed seen with memtable tombstones only (do not preload segment tombstones globally)
 	seen := make(map[string]struct{}, 1024)
@@ -404,6 +491,51 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			}
 		}
 	}
+
+	// Exact-match fast path: anchored literal ^...$ and small limit
+	exactLiteral := []byte(nil)
+	if re != nil {
+		pat := re.String()
+		if len(pat) >= 3 && pat[0] == '^' && pat[len(pat)-1] == '$' {
+			if lit, _ := re.LiteralPrefix(); lit != "" {
+				exactLiteral = []byte(lit)
+			}
+		}
+	}
+	// Prefer exact path when user requests few results
+	if exactLiteral != nil && (q.Limit <= 1 || q.Mode == CountOnly) {
+		// proceed with exact path below
+	} else if exactLiteral != nil {
+		// keep exactLiteral but we may still choose streaming later; no-op
+	}
+
+	// If we have an exact literal and no segments, resolve from memtable snapshots only
+	if exactLiteral != nil && len(readersSnap) == 0 {
+		items := make([]segItem, 0, 2)
+		if memSnap != nil {
+			if v := memSnap.GetValue(exactLiteral); v != nil && !v.IsExpired() {
+				op := common.OpInsert
+				if v.Tombstone() {
+					op = common.OpDelete
+				}
+				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
+			}
+		}
+		for _, fs := range frozenSnapList {
+			if fs == nil {
+				continue
+			}
+			if v := fs.GetValue(exactLiteral); v != nil && !v.IsExpired() {
+				op := common.OpInsert
+				if v.Tombstone() {
+					op = common.OpDelete
+				}
+				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
+			}
+		}
+		return &listIterator{items: items, idx: 0, mode: q.Mode, limit: q.Limit}, nil
+	}
+
 	// If pattern is broad (nil or ".*"), bypass memtable regex iterator and stream all memtable keys via channel
 	broad := false
 	if re == nil {
@@ -416,18 +548,85 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	if broad {
 		memIter = nil
 	}
-	// If no segments, return simple iterator
-	if len(s.readers) == 0 {
+	// If no segments, return simple iterator but include frozen snapshots
+	if len(readersSnap) == 0 {
 		return &simpleIterator{
-			memIter: memIter,
-			mode:    q.Mode,
-			limit:   q.Limit,
-			count:   0,
+			memIter:     memIter,
+			frozenIters: frozenIters,
+			mode:        q.Mode,
+			limit:       q.Limit,
+			count:       0,
 		}, nil
 	}
 
+	// Early exact-match path: try memtable + direct segment Get without streaming
+	if exactLiteral != nil {
+		items := make([]segItem, 0, 4)
+		// from memtable snapshot
+		if memSnap != nil {
+			v := memSnap.GetValue(exactLiteral)
+			if v != nil && !v.IsExpired() {
+				op := common.OpInsert
+				if v.Tombstone() {
+					op = common.OpDelete
+				}
+				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
+			}
+		}
+		// from frozen snapshots
+		for _, fs := range frozenSnapList {
+			if fs == nil {
+				continue
+			}
+			v := fs.GetValue(exactLiteral)
+			if v != nil && !v.IsExpired() {
+				op := common.OpInsert
+				if v.Tombstone() {
+					op = common.OpDelete
+				}
+				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
+			}
+		}
+		// query segments newest-first and stop early when limit reached
+		selected := append([]*segment.Reader(nil), readersSnap...)
+		sort.Slice(selected, func(i, j int) bool {
+			mi := selected[i].GetMetadata()
+			mj := selected[j].GetMetadata()
+			if mi == nil || mj == nil {
+				return false
+			}
+			if mi.CreatedAtUnix != mj.CreatedAtUnix {
+				return mi.CreatedAtUnix > mj.CreatedAtUnix
+			}
+			return selected[i].GetSegmentID() > selected[j].GetSegmentID()
+		})
+		for _, r := range selected {
+			if ctx.Err() != nil {
+				break
+			}
+			if re != nil && !r.MayContain(re) {
+				continue
+			}
+			r.IncRef()
+			val, ok := r.Get(exactLiteral)
+			if ok && len(val) > 0 {
+				// filter out tombstone quickly
+				if r.HasTombstoneExact(ctx, exactLiteral) {
+					r.Release()
+					continue
+				}
+				items = append(items, segItem{id: r.GetSegmentID(), key: append([]byte(nil), exactLiteral...), op: common.OpInsert})
+			}
+			r.Release()
+			if q.Limit > 0 && len(items) >= q.Limit {
+				break
+			}
+		}
+		return &listIterator{items: items, idx: 0, mode: q.Mode, limit: q.Limit}, nil
+	}
+
 	// Choose relevant readers and order newest-first
-	selected := s.selectRelevantReaders(re, q)
+	selected := s.selectRelevantReaders(readersSnap, re, q)
 	// If pattern is nil or ".*", disable filter pruning by scanning all readers
 	unsafeBroadScan := false
 	if re == nil {
@@ -439,7 +638,7 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	}
 	if unsafeBroadScan {
 		// override with all readers newest-first
-		selected = append([]*segment.Reader(nil), s.readers...)
+		selected = append([]*segment.Reader(nil), readersSnap...)
 	}
 	sort.Slice(selected, func(i, j int) bool {
 		mi := selected[i].GetMetadata()
@@ -454,6 +653,8 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	})
 
 	out := make(chan segItem, 1024)
+	// Create a cancellable context for the background producer
+	pctx, cancel := context.WithCancel(ctx)
 	go func(readers []*segment.Reader) {
 		defer close(out)
 		// For broad scans, emit all memtable keys first via channel
@@ -462,14 +663,18 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			emitted := 0
 			for _, k := range all {
 				select {
-				case <-ctx.Done():
+				case <-pctx.Done():
 					return
 				default:
 				}
 				if re != nil && !re.Match(k) {
 					continue
 				}
-				out <- segItem{id: 0, key: append([]byte(nil), k...), op: common.OpInsert}
+				select {
+				case out <- segItem{id: 0, key: append([]byte(nil), k...), op: common.OpInsert}:
+				case <-pctx.Done():
+					return
+				}
 				emitted++
 			}
 			s.logger.Info("broad scan emitted memtable keys", "count", emitted)
@@ -481,20 +686,22 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				}
 			}
 			r.IncRef()
-			// ensure release regardless of how we exit
-			defer r.Release()
-			// preload this reader's tombstones to suppress older dupes
-			_, _ = r.IterateTombstones(func(tk []byte) bool {
-				seenMu.Lock()
-				seen[string(tk)] = struct{}{}
-				seenMu.Unlock()
-				return true
-			})
+			// preload tombstones only when not an exact-match fast path
+			if exactLiteral == nil {
+				_, _ = r.IterateTombstones(func(tk []byte) bool {
+					seenMu.Lock()
+					seen[string(tk)] = struct{}{}
+					seenMu.Unlock()
+					return true
+				})
+			}
 			emitted := 0
-			adv := r.StreamKeys()
+			adv, closeFn := r.StreamKeys()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-pctx.Done():
+					closeFn()
+					r.Release()
 					return
 				default:
 				}
@@ -505,28 +712,42 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				if re != nil && !re.Match(k) {
 					continue
 				}
-				out <- segItem{id: r.GetSegmentID(), key: append([]byte(nil), k...), op: common.OpInsert}
+				// Exact fast path: skip send if tombstoned in this reader
+				if exactLiteral != nil {
+					if r.HasTombstoneExact(pctx, exactLiteral) {
+						continue
+					}
+				}
+				select {
+				case out <- segItem{id: r.GetSegmentID(), key: append([]byte(nil), k...), op: common.OpInsert}:
+				case <-pctx.Done():
+					closeFn()
+					r.Release()
+					return
+				}
 				emitted++
 			}
+			closeFn()
+			r.Release()
 			s.logger.Info("broad scan emitted segment keys", "segment", r.GetSegmentID(), "count", emitted)
 		}
 	}(selected)
 
 	// Drain into merged iterator (memtable first)
 	return &parallelMergedIterator{
-		memIter: memIter,
-		in:      out,
-		seen:    seen,
-		seenMu:  seenMu,
-		mode:    q.Mode,
-		limit:   q.Limit,
-		cancel:  nil,
+		memIter:     memIter,
+		frozenIters: frozenIters,
+		in:          out,
+		seen:        seen,
+		seenMu:      seenMu,
+		mode:        q.Mode,
+		limit:       q.Limit,
+		cancel:      cancel,
 	}, nil
 }
 
 // selectRelevantReaders picks a prioritized subset of readers to scan without building global indexes.
-func (s *storeImpl) selectRelevantReaders(re *regexp.Regexp, q *QueryOptions) []*segment.Reader {
-	readers := s.readers
+func (s *storeImpl) selectRelevantReaders(readers []*segment.Reader, re *regexp.Regexp, q *QueryOptions) []*segment.Reader {
 	if len(readers) == 0 {
 		return readers
 	}
@@ -673,14 +894,15 @@ func fnv32(b []byte) uint32 {
 
 // parallelMergedIterator merges memtable and channel of segment results.
 type parallelMergedIterator struct {
-	memIter *memtable.Iterator
-	in      chan segItem
-	seen    map[string]struct{}
-	seenMu  *sync.Mutex
-	mode    QueryMode
-	limit   int
-	count   int
-	cur     struct {
+	memIter     *memtable.Iterator
+	frozenIters []*memtable.Iterator
+	in          chan segItem
+	seen        map[string]struct{}
+	seenMu      *sync.Mutex
+	mode        QueryMode
+	limit       int
+	count       int
+	cur         struct {
 		id  uint64
 		key []byte
 		op  uint8
@@ -718,6 +940,36 @@ func (it *parallelMergedIterator) Next(ctx context.Context) bool {
 		return true
 	}
 	it.memIter = nil
+	// then drain frozen snapshots (one by one)
+	for len(it.frozenIters) > 0 {
+		cur := it.frozenIters[0]
+		if cur == nil {
+			it.frozenIters = it.frozenIters[1:]
+			continue
+		}
+		if cur.Next(ctx) {
+			k := cur.Key()
+			ks := string(k)
+			it.seenMu.Lock()
+			if _, ok := it.seen[ks]; ok {
+				it.seenMu.Unlock()
+				continue
+			}
+			it.seen[ks] = struct{}{}
+			it.seenMu.Unlock()
+			it.cur.key = k
+			it.cur.id = cur.SeqNum()
+			if cur.IsTombstone() {
+				it.cur.op = common.OpDelete
+			} else {
+				it.cur.op = common.OpInsert
+			}
+			it.count++
+			return true
+		}
+		_ = cur.Close()
+		it.frozenIters = it.frozenIters[1:]
+	}
 	// then read from segments channel
 	for it.in != nil {
 		select {
@@ -769,6 +1021,46 @@ func (it *parallelMergedIterator) Close() error {
 	}
 	return nil
 }
+
+// listIterator is a simple iterator over a prepared list of segItems.
+type listIterator struct {
+	items []segItem
+	idx   int
+	mode  QueryMode
+	limit int
+	cur   segItem
+	err   error
+}
+
+func (it *listIterator) Next(ctx context.Context) bool {
+	if it.limit > 0 && it.idx >= it.limit {
+		return false
+	}
+	if it.idx >= len(it.items) {
+		return false
+	}
+	// respect cancellation but allow quick exit
+	select {
+	case <-ctx.Done():
+		it.err = ctx.Err()
+		return false
+	default:
+	}
+	it.cur = it.items[it.idx]
+	it.idx++
+	return true
+}
+
+func (it *listIterator) Err() error { return it.err }
+func (it *listIterator) ID() uint64 { return it.cur.id }
+func (it *listIterator) String() []byte {
+	if it.mode == CountOnly {
+		return nil
+	}
+	return it.cur.key
+}
+func (it *listIterator) Op() uint8    { return it.cur.op }
+func (it *listIterator) Close() error { return nil }
 
 // PrefixScan returns an iterator over keys starting with the given prefix.
 func (s *storeImpl) PrefixScan(ctx context.Context, prefix []byte, q *QueryOptions) (Iterator, error) {
@@ -888,340 +1180,56 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		return common.ErrReadOnly
 	}
 
-	// Prepare inputs under lock
 	s.mu.Lock()
-	if len(s.readers) == 0 {
-		if err := s.loadSegments(); err != nil {
-			s.logger.Warn("failed to load segments before compaction", "error", err)
-		}
+	if s.compactor == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("compactor not initialized")
 	}
-	segmentsDir := filepath.Join(s.dir, common.DirSegments)
-	readersSnapshot := append([]*segment.Reader(nil), s.readers...)
-	// Increment refcounts to protect lifetime during compaction
-	for _, r := range readersSnapshot {
-		r.IncRef()
+
+	plan := s.compactor.Plan()
+	if plan == nil {
+		s.mu.Unlock()
+		s.logger.Info("compaction triggered manually, but no work to be done")
+		return nil
 	}
 	s.mu.Unlock()
 
-	// Partition readers by first-byte bucket (0..255) folded to P buckets
-	parts := s.opts.BuildRangePartitions
-	if parts <= 1 {
-		parts = 1
-	}
-	buckets := make([][]*segment.Reader, parts)
-	for _, r := range readersSnapshot {
-		// Heuristic: use metadata minKey to choose bucket; fallback 0
-		minK, _ := r.MinKey()
-		idx := 0
-		if len(minK) > 0 {
-			idx = int(minK[0]) * parts / 256
-			if idx >= parts {
-				idx = parts - 1
-			}
-		}
-		buckets[idx] = append(buckets[idx], r)
+	// Execute compaction plan
+	newReaders, err := s.compactor.Execute(plan)
+	if err != nil {
+		return fmt.Errorf("failed to execute compaction plan: %w", err)
 	}
 
-	// If range partition collapses, fallback to hash-based distribution for better parallelism
-	if parts > 1 {
-		nonEmpty := 0
-		for i := 0; i < parts; i++ {
-			if len(buckets[i]) > 0 {
-				nonEmpty++
-			}
-		}
-		if nonEmpty <= 1 {
-			for i := 0; i < parts; i++ {
-				buckets[i] = buckets[i][:0]
-			}
-			for _, r := range readersSnapshot {
-				minK, _ := r.MinKey()
-				var idx int
-				if len(minK) > 0 {
-					idx = int(fnv32(minK) % uint32(parts))
-				} else {
-					idx = int(r.GetSegmentID() % uint64(parts))
-				}
-				buckets[idx] = append(buckets[idx], r)
-			}
-			s.logger.Info("compaction using hash-based partitioning", "parts", parts)
-		}
-	}
-
-	// Dedup set across all inputs (newest wins) kept per bucket scope
-	type compRes struct {
-		readers []*segment.Reader
-		err     error
-	}
-	out := make(chan compRes, parts)
-	var wg sync.WaitGroup
-	for b := 0; b < parts; b++ {
-		rs := buckets[b]
-		if len(rs) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(rs []*segment.Reader) {
-			defer wg.Done()
-			// Reuse existing single-bucket compaction but scoped to rs
-			// --- begin single-bucket from original code (trimmed) ---
-			const chunkTargetBytes = int64(512 * 1024 * 1024)
-			type chunkState struct {
-				builder       *segment.Builder
-				id            uint64
-				approxBytes   int64
-				acceptedCount uint64
-				liveAdded     bool
-			}
-			var cur chunkState
-			newReaders := make([]*segment.Reader, 0, 8)
-			ensureBuilder := func() {
-				if cur.builder != nil {
-					return
-				}
-				cur.id = atomic.AddUint64(&s.nextSegmentID, 1)
-				cur.builder = segment.NewBuilder(cur.id, common.LevelL0, segmentsDir, s.logger)
-				cur.approxBytes = 0
-				cur.acceptedCount = 0
-				cur.liveAdded = false
-				// propagate builder config
-				bloomFPR := s.opts.PrefixBloomFPR
-				if bloomFPR <= 0 {
-					bloomFPR = common.DefaultBloomFPR
-				}
-				prefixLen := s.opts.PrefixBloomMaxPrefixLen
-				if prefixLen <= 0 {
-					prefixLen = int(common.DefaultPrefixBloomLength)
-				}
-				cur.builder.ConfigureFilters(bloomFPR, prefixLen, s.opts.EnableTrigramFilter)
-				cur.builder.ConfigureBuild(s.opts.BuildMaxShards, s.opts.BuildShardMinKeys, s.opts.BloomAdaptiveMinKeys)
-			}
-			finalizeChunk := func() error {
-				if cur.builder == nil {
-					return nil
-				}
-				if !cur.liveAdded {
-					cur.builder.DropAllTombstones()
-				}
-				md, err := cur.builder.Build()
-				if err != nil {
-					s.logger.Warn("compaction built minimal segment", "error", err)
-					cur.builder = nil
-					cur.id = 0
-					cur.approxBytes = 0
-					cur.acceptedCount = 0
-					cur.liveAdded = false
-					return nil
-				}
-				reader, rerr := segment.NewReader(cur.id, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
-				if rerr == nil {
-					newReaders = append(newReaders, reader)
-				} else {
-					s.logger.Warn("failed to open reader for compacted chunk", "id", cur.id, "error", rerr)
-				}
-				if s.manifest != nil {
-					info := manifest.SegmentInfo{ID: cur.id, Level: common.LevelL0, NumKeys: md.Counts.Accepted}
-					info.Size = s.computeSegmentSize(cur.id)
-					if minb, err := md.GetMinKey(); err == nil {
-						info.MinKeyHex = fmt.Sprintf("%x", minb)
-					}
-					if maxb, err := md.GetMaxKey(); err == nil {
-						info.MaxKeyHex = fmt.Sprintf("%x", maxb)
-					}
-					if err := s.manifest.AddSegment(info); err != nil {
-						s.logger.Warn("failed to add compacted segment to manifest", "error", err)
-					}
-				}
-				cur.builder = nil
-				cur.id = 0
-				cur.approxBytes = 0
-				cur.acceptedCount = 0
-				cur.liveAdded = false
-				return nil
-			}
-			maybeFlush := func() error {
-				if cur.approxBytes >= chunkTargetBytes {
-					return finalizeChunk()
-				}
-				return nil
-			}
-			// Sources for this bucket only
-			type srcIter struct {
-				key   []byte
-				ok    bool
-				next  func() ([]byte, bool)
-				order int
-			}
-			less := func(a, b *srcIter) bool {
-				cmp := bytes.Compare(a.key, b.key)
-				if cmp != 0 {
-					return cmp < 0
-				}
-				return a.order > b.order
-			}
-			srcs := make([]*srcIter, 0, len(rs))
-			type tsIter struct {
-				key  []byte
-				ok   bool
-				next func() ([]byte, bool)
-			}
-			tsHeap := make([]*tsIter, 0, len(rs))
-			tsLess := func(i, j int) bool { return bytes.Compare(tsHeap[i].key, tsHeap[j].key) < 0 }
-			pushTS := func(ti *tsIter) {
-				if ti.ok {
-					tsHeap = append(tsHeap, ti)
-					sort.Slice(tsHeap, tsLess)
-				}
-			}
-			popTS := func() *tsIter {
-				if len(tsHeap) == 0 {
-					return nil
-				}
-				x := tsHeap[0]
-				tsHeap = tsHeap[1:]
-				return x
-			}
-			// readers
-			for idx := len(rs) - 1; idx >= 0; idx-- {
-				r := rs[idx]
-				advance := r.StreamKeys()
-				k, ok := advance()
-				srcs = append(srcs, &srcIter{key: k, ok: ok, next: advance, order: idx + 1})
-				advT := r.StreamTombstones()
-				if tk, tok := advT(); tok {
-					pushTS(&tsIter{key: tk, ok: tok, next: advT})
-				}
-			}
-			h := make([]*srcIter, 0, len(srcs))
-			push := func(si *srcIter) {
-				if si.ok {
-					h = append(h, si)
-					sort.Slice(h, func(i, j int) bool { return less(h[i], h[j]) })
-				}
-			}
-			pop := func() *srcIter {
-				if len(h) == 0 {
-					return nil
-				}
-				x := h[0]
-				h = h[1:]
-				return x
-			}
-			for _, siter := range srcs {
-				push(siter)
-			}
-			var curKey []byte
-			for len(h) > 0 {
-				si := pop()
-				if si.key == nil && si.ok {
-					if k, ok := si.next(); ok {
-						si.key = k
-						si.ok = true
-						push(si)
-					}
-					continue
-				}
-				emit := false
-				if curKey == nil || !bytes.Equal(si.key, curKey) {
-					curKey = append([]byte(nil), si.key...)
-					emit = true
-				}
-				if emit {
-					for {
-						if len(tsHeap) == 0 {
-							break
-						}
-						if bytes.Compare(tsHeap[0].key, curKey) < 0 {
-							ti := popTS()
-							if nk, ok := ti.next(); ok {
-								ti.key = nk
-								ti.ok = true
-								pushTS(ti)
-							}
-							continue
-						}
-						break
-					}
-					if len(tsHeap) > 0 && bytes.Equal(tsHeap[0].key, curKey) {
-						ti := popTS()
-						if nk, ok := ti.next(); ok {
-							ti.key = nk
-							ti.ok = true
-							pushTS(ti)
-						}
-					} else {
-						ensureBuilder()
-						if err := cur.builder.Add(curKey, curKey, false); err != nil {
-							out <- compRes{nil, fmt.Errorf("builder add: %w", err)}
-							return
-						}
-						cur.approxBytes += int64(len(curKey))
-						cur.acceptedCount++
-						cur.liveAdded = true
-						if err := maybeFlush(); err != nil {
-							out <- compRes{nil, err}
-							return
-						}
-					}
-				}
-				if k, ok := si.next(); ok {
-					si.key = k
-					si.ok = true
-					push(si)
-				}
-			}
-			if err := finalizeChunk(); err != nil {
-				out <- compRes{nil, err}
-				return
-			}
-			out <- compRes{readers: newReaders, err: nil}
-			// --- end bucket compaction ---
-		}(rs)
-	}
-	go func() { wg.Wait(); close(out) }()
-
-	// Replace readers: if produced new segments, swap in; if none, keep current
+	// Update store's readers
 	s.mu.Lock()
-	var newReadersAll []*segment.Reader
-	for r := range out {
-		if r.err != nil {
-			// Decrement refs before returning
-			for _, rr := range readersSnapshot {
-				rr.DecRef()
-			}
-			s.mu.Unlock()
-			return r.err
-		}
-		newReadersAll = append(newReadersAll, r.readers...)
-	}
-	if len(newReadersAll) > 0 {
-		oldReaders := s.readers
-		s.readers = newReadersAll
-		// Release old readers; faktyczne zamkniecie nastąpi przy refcnt==0
-		for _, old := range oldReaders {
-			old.Release()
-		}
-	}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
-	// Remove old segments from manifest
-	if s.manifest != nil {
-		if len(s.segments) > 0 {
-			oldIDs := make([]uint64, 0, len(s.segments))
-			for _, md := range s.segments {
-				oldIDs = append(oldIDs, md.SegmentID)
-			}
-			_ = s.manifest.RemoveSegments(oldIDs)
-		}
+	// This logic needs to be robust. We should replace the old readers with the new ones.
+	// First, build a map of old segment IDs that were part of the compaction.
+	compactedIDs := make(map[uint64]struct{})
+	for _, s := range plan.Inputs {
+		compactedIDs[s.ID] = struct{}{}
+	}
+	for _, s := range plan.Overlaps {
+		compactedIDs[s.ID] = struct{}{}
 	}
 
-	// Replace in-memory segments metadata with none for now
-	s.mu.Lock()
-	s.segments = nil
-	s.mu.Unlock()
+	// Create a new list of readers, keeping the ones not compacted and adding the new ones.
+	var updatedReaders []*segment.Reader
+	for _, r := range s.readers {
+		if _, found := compactedIDs[r.GetSegmentID()]; !found {
+			updatedReaders = append(updatedReaders, r)
+		} else {
+			// This reader's segment was compacted, release it.
+			r.Release()
+		}
+	}
+	updatedReaders = append(updatedReaders, newReaders...)
+	s.readers = updatedReaders
 
-	// Refresh stats after compaction
+	// Refresh stats
 	s.updateStatsFromManifest()
+
 	return nil
 }
 
@@ -1255,7 +1263,7 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 			// Rebuild filters from keys stream
 			// Load keys via StreamKeys and feed a temporary builder's filter routines
 			var keys [][]byte
-			adv := reader.StreamKeys()
+			adv, closeFn := reader.StreamKeys()
 			for {
 				k, ok := adv()
 				if !ok {
@@ -1265,6 +1273,7 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 				copy(kk, k)
 				keys = append(keys, kk)
 			}
+			closeFn()
 			_ = reader.Close()
 			b := segment.NewBuilder(seg.ID, common.LevelL0, dir, logger)
 			// Only configure filters; skip values and LOUDS
@@ -1277,10 +1286,7 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 				prefixLen = int(common.DefaultPrefixBloomLength)
 			}
 			b.ConfigureFilters(bloomFPR, prefixLen, s.opts.EnableTrigramFilter)
-			// Inject keys and build only filters files
-			// Hack: populate b.keys, then call internal filter build
-			// Safer: reuse buildFilters API after setting keys
-			// We do minimal approach: export keys via AddFromPairs
+			// Inject keys and build filters using public API
 			tombs := make([]bool, len(keys))
 			if err := b.AddFromPairs(keys, tombs); err != nil {
 				continue
@@ -1308,6 +1314,45 @@ func (s *storeImpl) PruneWAL() error {
 	}
 	seq := s.wal.CurrentSeq()
 	return s.wal.DeleteOldFiles(seq)
+}
+
+// PurgeObsoleteSegments removes non-active segment directories immediately.
+// WARNING: This bypasses the RCU grace period and should only be used when
+// you are sure no readers are referencing old segments.
+func (s *storeImpl) PurgeObsoleteSegments() error {
+	if s.manifest == nil {
+		return fmt.Errorf("manifest not initialized")
+	}
+	active := s.manifest.GetActiveSegments()
+	activeMap := make(map[string]struct{}, len(active))
+	for _, seg := range active {
+		activeMap[fmt.Sprintf("%016d", seg.ID)] = struct{}{}
+	}
+	segmentsDir := filepath.Join(s.dir, common.DirSegments)
+	entries, err := os.ReadDir(segmentsDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if _, ok := activeMap[name]; ok {
+			continue
+		}
+		// Skip in-progress builds
+		if _, err := os.Stat(filepath.Join(segmentsDir, name, ".building")); err == nil {
+			continue
+		}
+		// Skip directories without metadata (incomplete)
+		if _, err := os.Stat(filepath.Join(segmentsDir, name, "segment.json")); err != nil {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(segmentsDir, name))
+		s.logger.Info("purged obsolete segment dir", "name", name)
+	}
+	return nil
 }
 
 // Flush forces a flush of the memtable to disk.
@@ -1339,12 +1384,14 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	baseID := atomic.AddUint64(&s.nextSegmentID, 1)
 	segmentsDir := filepath.Join(s.dir, common.DirSegments)
 	s.mtGuard.Unlock()
-	s.mu.Unlock()
 
 	s.logger.Info("starting flush", "entries", oldCount)
 
-	// Snapshot the frozen memtable after swap
+	// Snapshot the frozen memtable after swap and publish under lock
 	snapshot := oldMem.Snapshot()
+	s.frozenSnaps = append(s.frozenSnaps, snapshot)
+	// Now release store lock
+	s.mu.Unlock()
 
 	// Partition count
 	parts := s.opts.BuildRangePartitions
@@ -1501,6 +1548,25 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	s.updateStatsFromManifest()
 	s.mu.Unlock()
 
+	// Remove frozen snapshot from visibility once flush completes
+	s.mu.Lock()
+	if len(s.frozenSnaps) > 0 {
+		// remove the first matching snapshot reference
+		idx := -1
+		for i, sn := range s.frozenSnaps {
+			if sn == snapshot {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			last := len(s.frozenSnaps) - 1
+			s.frozenSnaps[idx] = s.frozenSnaps[last]
+			s.frozenSnaps = s.frozenSnaps[:last]
+		}
+	}
+	s.mu.Unlock()
+
 	// Sync WAL after persisting segments
 	if err := s.wal.Sync(); err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
@@ -1653,8 +1719,76 @@ func (s *storeImpl) triggerFlush() {
 	}
 }
 
+// walWriter is a dedicated goroutine for writing to the WAL.
+// It batches writes together ("group commit") to improve performance.
+func (s *storeImpl) walWriter() {
+	defer s.walWg.Done()
+	requests := make([]*writeRequest, 0, 128)
+	entries := make([]*wal.WALEntry, 0, 128)
+
+	for {
+		var firstReq *writeRequest
+
+		select {
+		case <-s.walStop:
+			// Drain any remaining requests on shutdown
+			close(s.writeCh)
+			for req := range s.writeCh {
+				requests = append(requests, req)
+			}
+			if len(requests) > 0 {
+				s.flushWALRequests(&requests, &entries)
+			}
+			return
+		case firstReq = <-s.writeCh:
+			requests = append(requests, firstReq)
+		}
+
+		// Batching: try to collect more requests that are already waiting
+	collectMore:
+		for len(requests) < cap(requests) {
+			select {
+			case req := <-s.writeCh:
+				requests = append(requests, req)
+			default:
+				// No more requests waiting
+				break collectMore
+			}
+		}
+
+		s.flushWALRequests(&requests, &entries)
+	}
+}
+
+func (s *storeImpl) flushWALRequests(requests *[]*writeRequest, entries *[]*wal.WALEntry) {
+	if len(*requests) == 0 {
+		return
+	}
+
+	// Prepare entries for WriteBatch
+	for _, req := range *requests {
+		*entries = append(*entries, req.entry)
+	}
+
+	err := s.wal.WriteBatch(*entries)
+
+	// Notify all requesters
+	for _, req := range *requests {
+		req.err <- err
+	}
+
+	// Reset slices for next batch
+	*requests = (*requests)[:0]
+	*entries = (*entries)[:0]
+}
+
 // startBackgroundTasks starts all background tasks.
 func (s *storeImpl) startBackgroundTasks() {
+	// WAL writer task (start first)
+	s.walStop = make(chan struct{})
+	s.walWg.Add(1)
+	go s.walWriter()
+
 	// Flush task
 	if !s.opts.DisableAutoFlush {
 		s.flushStop = make(chan struct{})
@@ -1691,6 +1825,12 @@ func (s *storeImpl) startBackgroundTasks() {
 
 // stopBackgroundTasks stops all background tasks.
 func (s *storeImpl) stopBackgroundTasks() {
+	// Stop WAL writer first to ensure all pending writes are flushed before closing WAL.
+	if s.walStop != nil {
+		close(s.walStop)
+	}
+	s.walWg.Wait()
+
 	// Stop flush task
 	if s.flushStop != nil {
 		close(s.flushStop)
@@ -1752,7 +1892,7 @@ func (s *storeImpl) flushTask() {
 func (s *storeImpl) compactionTask() {
 	defer s.bgWg.Done()
 
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(10 * time.Second) // Check for compaction work every 10 seconds
 	defer ticker.Stop()
 
 	for {
@@ -1760,13 +1900,43 @@ func (s *storeImpl) compactionTask() {
 		case <-s.compactStop:
 			return
 		case <-ticker.C:
-			// Naive background compaction: if too many segment readers, compact
-			s.mu.RLock()
-			readerCount := len(s.readers)
-			s.mu.RUnlock()
-			if readerCount > 4 {
-				_ = s.CompactNow(context.Background())
+			// Planning is done without any store-level lock.
+			// It relies on the manifest's internal lock for a consistent view.
+			plan := s.compactor.Plan()
+
+			if plan == nil {
+				continue // No work to do
 			}
+
+			// The execution is the long-running part, also without a store-level lock.
+			// It will atomically update the manifest upon completion.
+			_, err := s.compactor.Execute(plan)
+			if err != nil {
+				s.logger.Error("background compaction failed", "error", err)
+				continue
+			}
+
+			// After a successful compaction, the source of truth (the manifest) has changed.
+			// The safest and most robust way to update the store's in-memory state
+			// is to reload all segment readers from the manifest. This prevents race conditions
+			// where another operation (like a flush) could have changed the segment list
+			// while compaction was running.
+			s.mu.Lock()
+			s.logger.Info("compaction finished, reloading segment readers to reflect changes")
+
+			// Release all old readers. They will be closed once no search is using them.
+			for _, r := range s.readers {
+				r.Release()
+			}
+
+			// Clear and reload from the manifest's source of truth.
+			s.readers = nil
+			s.segments = nil
+			if err := s.loadSegments(); err != nil {
+				s.logger.Error("failed to reload segments after compaction", "error", err)
+			}
+			s.updateStatsFromManifest()
+			s.mu.Unlock()
 		}
 	}
 }
@@ -1775,7 +1945,7 @@ func (s *storeImpl) compactionTask() {
 func (s *storeImpl) autotuneTask() {
 	defer s.bgWg.Done()
 
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(10 * time.Second) // Check for compaction work every 10 seconds
 	defer ticker.Stop()
 
 	for {
@@ -1783,21 +1953,49 @@ func (s *storeImpl) autotuneTask() {
 		case <-s.autotuneStop:
 			return
 		case <-ticker.C:
-			// Simple autotuning heuristic:
-			// - If write rate is high, increase memtable target up to 2x
-			// - If query rate is high, bias caches up to configured budgets
-			s.stats.Refresh()
-			st := s.stats.GetStats()
-			// Adjust memtable size
-			if st.WritesPerSecond > 500 { // threshold heuristic
-				newTarget := s.opts.MemtableTargetBytes * 2
-				if newTarget > common.DefaultMemtableTargetBytes*8 {
-					newTarget = common.DefaultMemtableTargetBytes * 8
-				}
-				s.Tune(TuningParams{MemtableTargetBytes: &newTarget})
+			s.mu.RLock()
+			if s.compactor == nil {
+				s.mu.RUnlock()
+				continue
 			}
-			// No-op else branch could shrink over time; keep simple for now
-			_ = st
+			plan := s.compactor.Plan()
+			s.mu.RUnlock()
+
+			if plan == nil {
+				continue // No work to do
+			}
+
+			newReaders, err := s.compactor.Execute(plan)
+			if err != nil {
+				s.logger.Error("background compaction failed", "error", err)
+				continue
+			}
+			if newReaders == nil {
+				continue // Compaction resulted in no new segments
+			}
+
+			// Update store's readers state
+			s.mu.Lock()
+			compactedIDs := make(map[uint64]struct{})
+			for _, s := range plan.Inputs {
+				compactedIDs[s.ID] = struct{}{}
+			}
+			for _, s := range plan.Overlaps {
+				compactedIDs[s.ID] = struct{}{}
+			}
+
+			var updatedReaders []*segment.Reader
+			for _, r := range s.readers {
+				if _, found := compactedIDs[r.GetSegmentID()]; !found {
+					updatedReaders = append(updatedReaders, r)
+				} else {
+					r.Release() // Decrement ref count for old reader
+				}
+			}
+			updatedReaders = append(updatedReaders, newReaders...)
+			s.readers = updatedReaders
+			s.updateStatsFromManifest()
+			s.mu.Unlock()
 		}
 	}
 }
