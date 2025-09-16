@@ -2160,6 +2160,9 @@ func (s *storeImpl) autotuneTask() {
 		case <-s.autotuneStop:
 			return
 		case <-ticker.C:
+			if atomic.LoadInt32(&s.compactionPauseCount) > 0 {
+				continue
+			}
 			s.mu.RLock()
 			if s.compactor == nil {
 				s.mu.RUnlock()
@@ -2167,40 +2170,23 @@ func (s *storeImpl) autotuneTask() {
 			}
 			plan := s.compactor.Plan()
 			s.mu.RUnlock()
-
 			if plan == nil {
-				continue // No work to do
+				continue
 			}
-
-			newReaders, err := s.compactor.Execute(plan)
-			if err != nil {
+			if _, err := s.compactor.Execute(plan); err != nil {
 				s.logger.Error("background compaction failed", "error", err)
 				continue
 			}
-			if newReaders == nil {
-				continue // Compaction resulted in no new segments
-			}
-
-			// Update store's readers state
 			s.mu.Lock()
-			compactedIDs := make(map[uint64]struct{})
-			for _, s := range plan.Inputs {
-				compactedIDs[s.ID] = struct{}{}
-			}
-			for _, s := range plan.Overlaps {
-				compactedIDs[s.ID] = struct{}{}
-			}
-
-			var updatedReaders []*segment.Reader
+			s.logger.Info("compaction finished, reloading segment readers to reflect changes")
 			for _, r := range s.readers {
-				if _, found := compactedIDs[r.GetSegmentID()]; !found {
-					updatedReaders = append(updatedReaders, r)
-				} else {
-					r.Release() // Decrement ref count for old reader
-				}
+				r.Release()
 			}
-			updatedReaders = append(updatedReaders, newReaders...)
-			s.readers = updatedReaders
+			s.readers = nil
+			s.segments = nil
+			if err := s.loadSegments(); err != nil {
+				s.logger.Error("failed to reload segments after compaction", "error", err)
+			}
 			s.updateStatsFromManifest()
 			s.mu.Unlock()
 		}
