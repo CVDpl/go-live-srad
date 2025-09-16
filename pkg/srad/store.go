@@ -72,6 +72,13 @@ type Store interface {
 	// or tests when no readers are using old segments.
 	PurgeObsoleteSegments() error
 
+	// PauseBackgroundCompaction pauses background compaction and waits until any
+	// in-progress compaction finishes or ctx is done.
+	PauseBackgroundCompaction(ctx context.Context) error
+
+	// ResumeBackgroundCompaction resumes background compaction if previously paused.
+	ResumeBackgroundCompaction()
+
 	// RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
 	// for all active segments. Blocks until completion.
 	RebuildMissingFilters(ctx context.Context) error

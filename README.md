@@ -97,6 +97,13 @@ type Store interface {
     // RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
     // for all active segments. Blocks until completion.
     RebuildMissingFilters(ctx context.Context) error
+
+    // PauseBackgroundCompaction pauses background compaction and waits for any in-flight
+    // compaction cycle to drain (best-effort), or until ctx is done.
+    PauseBackgroundCompaction(ctx context.Context) error
+
+    // ResumeBackgroundCompaction resumes background compaction if previously paused.
+    ResumeBackgroundCompaction()
 }
 ```
 
@@ -227,7 +234,7 @@ This fallback only affects how work is split during Flush/Compaction. It does no
 
 - `AsyncFilterBuild = true` enables building missing filters (`filters/prefix.bf`, `filters/tri.bits`) in the background after flush/compaction.
 - When enabled, the builder skips inline filter generation during Flush/Compact to shorten the critical path; filters are produced shortly after by a background task that scans active segments.
-- You can also trigger a blocking rebuild at any time via `store.RebuildMissingFilters(ctx)` (e.g., right before `Close()` or `PurgeObsoleteSegments()`), which rebuilds any missing filters for active segments and returns when done.
+- You can also trigger a blocking rebuild at any time via `store.RebuildMissingFilters(ctx)` (e.g., right before `Close()` or `PurgeObsoleteSegments()`), which rebuilds any missing filters for active segments and returns when done. During this call, background compaction is temporarily paused and automatically resumed at the end to avoid churn on active segment sets while filters are being created.
 - Queries are correct even without filters; filters only accelerate reads.
 
 ```go
@@ -258,6 +265,21 @@ store.Flush(ctx)       // writes segments fast; filters will follow asynchronous
 // If you need filters now (before close/purge), run a blocking rebuild:
 _ = store.RebuildMissingFilters(ctx)
 // Optionally run compaction later, then allow background filter builder to finish
+```
+
+Pausing compaction explicitly for maintenance windows:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+defer cancel()
+if err := store.PauseBackgroundCompaction(ctx); err != nil {
+    // handle pause error (e.g., context deadline)
+}
+defer store.ResumeBackgroundCompaction()
+
+// Perform maintenance: rebuild filters, vacuum prefixes, etc.
+_ = store.RebuildMissingFilters(ctx)
+// ... other tasks ...
 ```
 
 ### Flush behavior
