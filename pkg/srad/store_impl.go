@@ -1490,7 +1490,6 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		return nil // Nothing to flush
 	}
 	// Reserve a new base segment ID and cache dir while under lock
-	baseID := atomic.AddUint64(&s.nextSegmentID, 1)
 	segmentsDir := filepath.Join(s.dir, common.DirSegments)
 	s.mtGuard.Unlock()
 
@@ -1552,7 +1551,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 
 	if parts == 1 {
 		// Single builder path (existing)
-		segID := baseID
+		segID := atomic.AddUint64(&s.nextSegmentID, 1)
 		builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
 		cfgBuilder(builder)
 		s.logger.Info("flush plan: single-partition prepared", "segment_id", segID, "entries", oldCount)
