@@ -282,6 +282,18 @@ _ = store.RebuildMissingFilters(ctx)
 // ... other tasks ...
 ```
 
+Pausing compaction without a deadline:
+
+```go
+// No deadline: Pause waits best-effort for in-flight cycles to drain
+if err := store.PauseBackgroundCompaction(context.Background()); err != nil {
+    // handle unexpected error
+}
+defer store.ResumeBackgroundCompaction()
+
+// Maintenance work...
+```
+
 ### Flush behavior
 
 - Flush uses a freeze-and-swap strategy: first swap the `memtable` for a new one under a short lock, then build the segment from the frozen copy outside the lock. New inserts are minimally blocked and never lost from view.
