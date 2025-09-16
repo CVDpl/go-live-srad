@@ -1332,10 +1332,18 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 			_ = os.MkdirAll(filtersDir, 0755)
 			// Build requested filters
 			if needBloom {
-				_ = b.BuildBloomOnly(filtersDir)
+				if err := b.BuildBloomOnly(filtersDir); err != nil {
+					logger.Warn("failed to build bloom filter (async)", "segment", seg.ID, "error", err)
+				} else {
+					logger.Info("built bloom filter (async)", "segment", seg.ID)
+				}
 			}
 			if needTri && s.opts.EnableTrigramFilter {
-				_ = b.BuildTrigramOnly(filtersDir)
+				if err := b.BuildTrigramOnly(filtersDir); err != nil {
+					logger.Warn("failed to build trigram filter (async)", "segment", seg.ID, "error", err)
+				} else {
+					logger.Info("built trigram filter (async)", "segment", seg.ID)
+				}
 			}
 		}
 	}()
@@ -1404,10 +1412,18 @@ func (s *storeImpl) RebuildMissingFilters(ctx context.Context) error {
 			continue
 		}
 		if needBloom {
-			_ = b.BuildBloomOnly(filtersDir)
+			if err := b.BuildBloomOnly(filtersDir); err != nil {
+				logger.Warn("failed to build bloom filter", "segment", seg.ID, "error", err)
+			} else {
+				logger.Info("built bloom filter", "segment", seg.ID)
+			}
 		}
 		if needTri {
-			_ = b.BuildTrigramOnly(filtersDir)
+			if err := b.BuildTrigramOnly(filtersDir); err != nil {
+				logger.Warn("failed to build trigram filter", "segment", seg.ID, "error", err)
+			} else {
+				logger.Info("built trigram filter", "segment", seg.ID)
+			}
 		}
 	}
 	return nil
