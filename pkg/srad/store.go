@@ -148,6 +148,11 @@ type Options struct {
 	// WALFlushEveryBytes triggers buffer flush after approximately this many bytes written (0 = disabled).
 	WALFlushEveryBytes int
 
+	// WALFlushEveryInterval triggers time-based flush at this interval (0 = disabled).
+	// When >0, a background ticker flushes the WAL buffer periodically even if
+	// WALFlushEveryBytes threshold is not reached. This reduces RPO at the cost of more flushes.
+	WALFlushEveryInterval time.Duration
+
 	// PrefixBloomFPR sets Bloom filter target false positive rate (0 => default).
 	PrefixBloomFPR float64
 	// PrefixBloomMaxPrefixLen limits prefix length added to Bloom (0 => default).
@@ -361,6 +366,7 @@ func DefaultOptions() *Options {
 		WALSyncOnEveryWrite:         false,
 		WALFlushOnEveryWrite:        false,
 		WALFlushEveryBytes:          int(common.WALBufferSize),
+		WALFlushEveryInterval:       0,
 		PrefixBloomFPR:              common.DefaultBloomFPR,
 		PrefixBloomMaxPrefixLen:     int(common.DefaultPrefixBloomLength),
 		EnableTrigramFilter:         true,

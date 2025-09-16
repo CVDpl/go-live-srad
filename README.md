@@ -219,6 +219,7 @@ type Options struct {
     WALSyncOnEveryWrite  bool
     WALFlushOnEveryWrite bool
     WALFlushEveryBytes   int
+    WALFlushEveryInterval time.Duration
 
     // Prefix Bloom filter controls.
     // PrefixBloomFPR: target false‑positive rate. Default: 0.01
@@ -662,6 +663,7 @@ SRAD uses a write-ahead log (WAL) for durability. By default, the WAL buffers wr
 - `WALSyncOnEveryWrite` (bool): call `fsync` after each WAL write. Safest but slowest.
 - `WALFlushOnEveryWrite` (bool): flush the userspace buffer after each write (no `fsync`). Faster than sync but still reduces loss on process crash.
 - `WALFlushEveryBytes` (int): flush after approximately this many bytes are written. Defaults to the WAL buffer size (256KB).
+- `WALFlushEveryInterval` (time.Duration): periodic time-based flush (0 = disabled). When >0, a background ticker flushes the WAL buffer at this interval even if the byte threshold is not reached.
 
 Recommendations:
 - Production: keep `WALFlushEveryBytes = 256KB` (default). Enable `RotateWALOnFlush` to make pruning effective. Periodically call `PruneWAL()`.
@@ -673,6 +675,7 @@ Example:
 opts := srad.DefaultOptions()
 opts.WALFlushEveryBytes = 512 * 1024 // 512KB
 opts.RotateWALOnFlush = true         // rotate on each flush
+opts.WALFlushEveryInterval = 2 * time.Second // also flush every 2s
 store, _ := srad.Open(dir, opts)
 ```
 

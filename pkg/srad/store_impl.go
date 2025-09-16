@@ -1933,6 +1933,12 @@ func (s *storeImpl) walWriter() {
 	requests := make([]*writeRequest, 0, 128)
 	entries := make([]*wal.WALEntry, 0, 128)
 
+	var flushTicker *time.Ticker
+	if s.opts.WALFlushEveryInterval > 0 {
+		flushTicker = time.NewTicker(s.opts.WALFlushEveryInterval)
+		defer flushTicker.Stop()
+	}
+
 	for {
 		var firstReq *writeRequest
 
@@ -1947,6 +1953,17 @@ func (s *storeImpl) walWriter() {
 				s.flushWALRequests(&requests, &entries)
 			}
 			return
+		case <-func() <-chan time.Time {
+			if flushTicker != nil {
+				return flushTicker.C
+			}
+			return nil
+		}():
+			// Periodic flush (best-effort): if nothing pending, still call Flush()
+			// to push any WAL buffer content to OS even without new requests.
+			if err := s.wal.Flush(); err != nil {
+				s.logger.Warn("periodic WAL flush failed", "error", err)
+			}
 		case firstReq = <-s.writeCh:
 			requests = append(requests, firstReq)
 		}
