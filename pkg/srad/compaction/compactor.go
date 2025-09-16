@@ -159,6 +159,9 @@ func (c *Compactor) Plan() *CompactionPlan {
 // Execute runs a compaction job described by the plan.
 // It returns the list of new segment readers and an error if any.
 func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
+	if plan == nil {
+		return nil, fmt.Errorf("compaction plan is nil")
+	}
 	startTime := time.Now()
 	c.logger.Info("starting compaction", "reason", plan.Reason, "level", plan.Level, "inputs", len(plan.Inputs), "overlaps", len(plan.Overlaps))
 
@@ -230,7 +233,12 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		if cur.builder != nil {
 			return
 		}
-		cur.id = c.alloc()
+		// Fallback alloc if not configured
+		if c.alloc == nil {
+			cur.id = uint64(time.Now().UnixNano())
+		} else {
+			cur.id = c.alloc()
+		}
 		cur.builder = segment.NewBuilder(cur.id, targetLevel, segmentsDir, c.logger)
 		if c.configureBuilder != nil {
 			c.configureBuilder(cur.builder)
