@@ -68,35 +68,63 @@ func main() {
 
 ```go
 type Store interface {
+    // Close closes the store and releases all resources.
     Close() error
+
+    // Insert adds a string to the store.
     Insert(s []byte) error
-    InsertWithTTL(s []byte, ttl time.Duration) error
+
+    // Delete removes a string from the store.
     Delete(s []byte) error
+
+    // InsertWithTTL inserts a string with expiration time
+    InsertWithTTL(s []byte, ttl time.Duration) error
+
+    // RegexSearch performs a regex search on the store.
     RegexSearch(ctx context.Context, re *regexp.Regexp, q *QueryOptions) (Iterator, error)
+
+    // PrefixScan returns an iterator over keys starting with the given prefix.
     PrefixScan(ctx context.Context, prefix []byte, q *QueryOptions) (Iterator, error)
+
+    // RangeScan returns an iterator over keys in [start, end) lexicographic range.
+    // If end is nil or empty, iteration continues to the end.
     RangeScan(ctx context.Context, start, end []byte, q *QueryOptions) (Iterator, error)
+
+    // Stats returns current statistics for the store.
     Stats() Stats
+
+    // RefreshStats forces a refresh of statistics.
     RefreshStats()
+
+    // Tune adjusts tuning parameters at runtime.
     Tune(params TuningParams)
+
+    // CompactNow triggers immediate compaction.
     CompactNow(ctx context.Context) error
+
+    // Flush forces a flush of the memtable to disk.
     Flush(ctx context.Context) error
+
+    // RCUEnabled returns whether RCU is enabled.
     RCUEnabled() bool
+
+    // AdvanceRCU advances the RCU epoch.
     AdvanceRCU(ctx context.Context) error
+
+    // VacuumPrefix removes all keys with the specified prefix.
     VacuumPrefix(ctx context.Context, prefix []byte) error
+
+    // SetAutotunerEnabled enables or disables the autotuner.
     SetAutotunerEnabled(enabled bool)
-    // Delete obsolete WAL files older than the current WAL sequence.
-    // Note: pruning is not automatic; call this explicitly. Pruning removes only
-    // files with sequence < current and never truncates the active WAL. Enabling
-    // RotateWALOnFlush makes older files eligible for pruning immediately.
+
+    // PruneWAL deletes obsolete WAL files that are older than the current WAL sequence.
+    // Effective primarily when WAL rotation is enabled on flush; otherwise it only
+    // removes fully older WAL files, never truncating the current one.
     PruneWAL() error
 
     // PurgeObsoleteSegments removes non-active segment directories immediately (dangerous).
     // Bypasses the RCU grace period; only for maintenance when no readers use old segments.
     PurgeObsoleteSegments() error
-
-    // RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
-    // for all active segments. Blocks until completion.
-    RebuildMissingFilters(ctx context.Context) error
 
     // PauseBackgroundCompaction pauses background compaction and waits for any in-flight
     // compaction cycle to drain (best-effort), or until ctx is done.
@@ -108,6 +136,10 @@ type Store interface {
     // SetAsyncFilterBuild toggles asynchronous filter building at runtime.
     // When disabled, filters are built inline during Flush/Compact.
     SetAsyncFilterBuild(enabled bool)
+
+    // RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
+    // for all active segments. Blocks until completion.
+    RebuildMissingFilters(ctx context.Context) error
 }
 ```
 
@@ -115,57 +147,134 @@ type Store interface {
 
 ```go
 type Options struct {
-    // Core
-    ReadOnly                  bool
-    Parallelism               int
-    VerifyChecksumsOnLoad     bool
-    MemtableTargetBytes       int64
-    CacheLabelAdvanceBytes    int64
-    CacheNFATransitionBytes   int64
-    EnableRCU                 bool
-    RCUCleanupInterval        time.Duration
-    Logger                    Logger
-    DisableAutotuner          bool
-    DisableAutoFlush          bool
-    DefaultTTL                time.Duration
+    // ReadOnly opens the store in read-only mode.
+    // Default: false
+    ReadOnly bool
+
+    // Parallelism sets the maximum number of parallel operations.
+    // Default: 4
+    Parallelism int
+
+    // VerifyChecksumsOnLoad enables CRC verification when loading segments.
+    // Default: false (enable in maintenance tools)
+    VerifyChecksumsOnLoad bool
+
+    // MemtableTargetBytes sets the target size for the memtable before flushing.
+    // Default: 512 MiB
+    MemtableTargetBytes int64
+
+    // Cache sizes for query engine caches.
+    // Default: 32 MiB each
+    CacheLabelAdvanceBytes  int64
+    CacheNFATransitionBytes int64
+
+    // EnableRCU enables Read‑Copy‑Update for lock‑free reads.
+    // Default: true
+    EnableRCU bool
+
+    // RCUCleanupInterval sets the interval for RCU cleanup.
+    // Default: 30s
+    RCUCleanupInterval time.Duration
+
+    // Logger provides structured logging.
+    // Default: JSON logger to stderr (NewDefaultLogger)
+    Logger Logger
+
+    // DisableAutotuner disables automatic tuning.
+    // Default: false
+    DisableAutotuner bool
+
+    // DisableAutoFlush disables periodic background flush.
+    // Default: false
+    DisableAutoFlush bool
+
+    // DefaultTTL sets default time‑to‑live for inserted keys (0 = never expire).
+    // Default: 0
+    DefaultTTL time.Duration
+
+    // DisableBackgroundCompaction disables background LSM compaction.
+    // Default: false
     DisableBackgroundCompaction bool
 
-    // WAL / durability
-    RotateWALOnFlush          bool
-    WALRotateSize             int64
-    WALMaxFileSize            int64
-    WALBufferSize             int
-    WALSyncOnEveryWrite       bool
-    WALFlushOnEveryWrite      bool
-    WALFlushEveryBytes        int
+    // RotateWALOnFlush rotates WAL after each flush.
+    // Default: false
+    RotateWALOnFlush bool
 
-    // Filters
-    PrefixBloomFPR            float64 // default 0.01
-    PrefixBloomMaxPrefixLen   int     // default 16
-    EnableTrigramFilter       bool    // default true
+    // WALRotateSize overrides rotation size (bytes).
+    // Default: 0 => use built‑in default (128 MiB)
+    WALRotateSize int64
 
-    // Build parallelization (0 => auto defaults)
-    BuildMaxShards            int
-    BuildShardMinKeys         int
-    BloomAdaptiveMinKeys      int
+    // WALMaxFileSize overrides max single WAL size (bytes).
+    // Default: 0 => use built‑in default (1 GiB)
+    WALMaxFileSize int64
 
-    // Range partitioning and async filters
-    BuildRangePartitions      int
-    AsyncFilterBuild          bool
+    // WALBufferSize overrides WAL write buffer size (bytes).
+    // Default: 0 => use built‑in default (256 KiB)
+    WALBufferSize int
 
-    // LOUDS build controls
-    // DisableLOUDSBuild: when true, LOUDS index is not built during Flush/Compact.
-    // Readers will fall back to keys.dat streaming and filters. Exact lookups
-    // are still correct but may be slower without LOUDS.
-    DisableLOUDSBuild         bool
-    // AutoDisableLOUDSMinKeys: when >0 and a build processes at least this many
-    // keys, LOUDS build is skipped regardless of DisableLOUDSBuild.
-    AutoDisableLOUDSMinKeys   int
-    // ForceTrieBuild: when true, always build the trie even for sorted inputs
-    // (overrides the streaming LOUDS fast-path). Useful for benchmarking.
-    ForceTrieBuild            bool
+    // Durability knobs:
+    // WALSyncOnEveryWrite: fsync after each write (safest, slowest). Default: false
+    // WALFlushOnEveryWrite: flush userspace buffer after each write. Default: false
+    // WALFlushEveryBytes: flush after approx N bytes. Default: WALBufferSize
+    WALSyncOnEveryWrite  bool
+    WALFlushOnEveryWrite bool
+    WALFlushEveryBytes   int
+
+    // Prefix Bloom filter controls.
+    // PrefixBloomFPR: target false‑positive rate. Default: 0.01
+    // PrefixBloomMaxPrefixLen: max prefix length to add. Default: 16
+    // EnableTrigramFilter: build trigram filter. Default: true
+    PrefixBloomFPR          float64
+    PrefixBloomMaxPrefixLen int
+    EnableTrigramFilter     bool
+
+    // Build parallelization (0 => auto defaults).
+    // BuildMaxShards: cap internal shards per build task. Default: 8
+    // BuildShardMinKeys: below this, use 1 shard. Default: 200_000
+    // BloomAdaptiveMinKeys: above this, reduce Bloom prefix work. Default: 10_000_000
+    BuildMaxShards       int
+    BuildShardMinKeys    int
+    BloomAdaptiveMinKeys int
+
+    // Range‑partitioned build (1 = disabled). Default: 1
+    BuildRangePartitions int
+
+    // AsyncFilterBuild: when true, skip inline filter build; build later in background.
+    // Default: false
+    AsyncFilterBuild bool
+
+    // ForceTrieBuild forces trie build even for sorted inputs (for benchmarks/tests).
+    // Default: false
+    ForceTrieBuild bool
+
+    // DisableLOUDSBuild disables LOUDS index build (Readers use keys.dat + filters).
+    // Default: false
+    DisableLOUDSBuild bool
+
+    // AutoDisableLOUDSMinKeys: when >0 and number of keys >= threshold, skip LOUDS.
+    // Default: 0 (disabled)
+    AutoDisableLOUDSMinKeys int
+
+    // GCPercentDuringTrie sets temporary runtime GC percent during trie build (0 = unchanged).
+    // Default: 0
+    GCPercentDuringTrie int
 }
 ```
+
+### QueryOptions
+
+```go
+type QueryOptions struct {
+    Limit           int           // max results (0 = unlimited)
+    Mode            QueryMode     // CountOnly | EmitIDs | EmitStrings
+    Order           TraversalOrder// DFS | BFS | Auto
+    MaxParallelism  int           // max segments to search in parallel
+    FilterThreshold float64       // selectivity threshold for using filters
+    CachePolicy     CachePolicy   // Default | Aggressive | Minimal | None
+}
+```
+
+### Examples
 
 Example tuning for building large segments:
 ```go
