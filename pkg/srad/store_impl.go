@@ -2454,3 +2454,11 @@ func (s *storeImpl) ResumeBackgroundCompaction() {
 	}
 	s.logger.Info("background compaction resumed")
 }
+
+// SetAsyncFilterBuild toggles asynchronous filter building at runtime.
+func (s *storeImpl) SetAsyncFilterBuild(enabled bool) {
+	s.mu.Lock()
+	s.opts.AsyncFilterBuild = enabled
+	s.mu.Unlock()
+	s.logger.Info("async filter build updated", "enabled", enabled)
+}

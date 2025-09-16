@@ -104,6 +104,10 @@ type Store interface {
 
     // ResumeBackgroundCompaction resumes background compaction if previously paused.
     ResumeBackgroundCompaction()
+
+    // SetAsyncFilterBuild toggles asynchronous filter building at runtime.
+    // When disabled, filters are built inline during Flush/Compact.
+    SetAsyncFilterBuild(enabled bool)
 }
 ```
 
@@ -283,6 +287,34 @@ _ = store.RebuildMissingFilters(ctx)
 ```
 
 Nested pauses: SRAD uses a pause counter; compaction is paused while the counter > 0. Calls to `RebuildMissingFilters` increment/decrement the counter around the rebuild but do not resume compaction if you paused it earlier (i.e., an outer pause keeps compaction paused until you call `ResumeBackgroundCompaction` the same number of times).
+
+Runtime toggle for AsyncFilterBuild:
+
+```go
+// Build filters inline during maintenance
+store.SetAsyncFilterBuild(false)
+// ... Flush/Compact/RebuildMissingFilters ...
+// Return to background filter build afterwards (optional)
+store.SetAsyncFilterBuild(true)
+```
+
+Example maintenance/conversion flow:
+
+```go
+ctx := context.Background()
+_ = store.PauseBackgroundCompaction(ctx)
+defer store.ResumeBackgroundCompaction()
+
+store.SetAsyncFilterBuild(false)              // build filters inline
+_ = store.Flush(ctx)                          // persist
+_ = store.CompactNow(ctx)                     // optional: compact immediately
+_ = store.RebuildMissingFilters(ctx)          // ensure filters present
+_ = store.PruneWAL()                          // drop old WAL files
+_ = store.AdvanceRCU(ctx)                     // advance RCU epoch
+_ = store.PurgeObsoleteSegments()             // remove obsolete segment dirs (dangerous)
+store.SetAsyncFilterBuild(true)               // optional: back to async
+_ = store.Close()
+```
 
 Pausing compaction without a deadline:
 

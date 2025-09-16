@@ -79,6 +79,10 @@ type Store interface {
 	// ResumeBackgroundCompaction resumes background compaction if previously paused.
 	ResumeBackgroundCompaction()
 
+	// SetAsyncFilterBuild toggles asynchronous filter building at runtime.
+	// When disabled, filters are built inline during Flush/Compact.
+	SetAsyncFilterBuild(enabled bool)
+
 	// RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters
 	// for all active segments. Blocks until completion.
 	RebuildMissingFilters(ctx context.Context) error
