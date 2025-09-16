@@ -1354,6 +1354,13 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 
 // RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters for active segments.
 func (s *storeImpl) RebuildMissingFilters(ctx context.Context) error {
+	prev := atomic.LoadInt32(&s.compactionPaused)
+	atomic.StoreInt32(&s.compactionPaused, 1)
+	defer func() {
+		if prev == 0 {
+			atomic.StoreInt32(&s.compactionPaused, 0)
+		}
+	}()
 	if s.manifest == nil {
 		return nil
 	}
