@@ -61,8 +61,8 @@ type storeImpl struct {
 	autotuneStop chan struct{}
 	rcuStop      chan struct{}
 
-	// Coordination flags
-	compactionPaused int32 // 0 running, 1 paused
+	// Coordination counters
+	compactionPauseCount int32 // >0 means paused
 
 	// WAL writer
 	writeCh chan *writeRequest
@@ -1354,13 +1354,8 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 
 // RebuildMissingFilters synchronously rebuilds missing Bloom/Trigram filters for active segments.
 func (s *storeImpl) RebuildMissingFilters(ctx context.Context) error {
-	prev := atomic.LoadInt32(&s.compactionPaused)
-	atomic.StoreInt32(&s.compactionPaused, 1)
-	defer func() {
-		if prev == 0 {
-			atomic.StoreInt32(&s.compactionPaused, 0)
-		}
-	}()
+	atomic.AddInt32(&s.compactionPauseCount, 1)
+	defer atomic.AddInt32(&s.compactionPauseCount, -1)
 	if s.manifest == nil {
 		return nil
 	}
@@ -2448,7 +2443,7 @@ func createDirIfNotExists(dir string) error {
 // PauseBackgroundCompaction pauses background compaction and waits for any ongoing
 // Execute() call to return or until ctx is done.
 func (s *storeImpl) PauseBackgroundCompaction(ctx context.Context) error {
-	atomic.StoreInt32(&s.compactionPaused, 1)
+	atomic.AddInt32(&s.compactionPauseCount, 1)
 	// Best-effort: wait for compaction loop to observe pause and drain in-flight Execute.
 	// We don't have a dedicated in-flight counter; poll briefly.
 	deadline := time.Now().Add(5 * time.Second)
@@ -2468,6 +2463,8 @@ func (s *storeImpl) PauseBackgroundCompaction(ctx context.Context) error {
 
 // ResumeBackgroundCompaction resumes background compaction if paused.
 func (s *storeImpl) ResumeBackgroundCompaction() {
-	atomic.StoreInt32(&s.compactionPaused, 0)
+	if atomic.AddInt32(&s.compactionPauseCount, -1) < 0 {
+		atomic.StoreInt32(&s.compactionPauseCount, 0)
+	}
 	s.logger.Info("background compaction resumed")
 }

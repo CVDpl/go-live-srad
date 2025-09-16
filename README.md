@@ -282,6 +282,8 @@ _ = store.RebuildMissingFilters(ctx)
 // ... other tasks ...
 ```
 
+Nested pauses: SRAD uses a pause counter; compaction is paused while the counter > 0. Calls to `RebuildMissingFilters` increment/decrement the counter around the rebuild but do not resume compaction if you paused it earlier (i.e., an outer pause keeps compaction paused until you call `ResumeBackgroundCompaction` the same number of times).
+
 Pausing compaction without a deadline:
 
 ```go
