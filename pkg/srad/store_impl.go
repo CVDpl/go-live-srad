@@ -2115,10 +2115,19 @@ func (s *storeImpl) compactionTask() {
 				continue // No work to do
 			}
 
+			// Re-check pause right before executing to avoid race with pause engaged after planning.
+			if atomic.LoadInt32(&s.compactionPauseCount) > 0 {
+				continue
+			}
+
 			// The execution is the long-running part, also without a store-level lock.
 			// It will atomically update the manifest upon completion.
 			_, err := s.compactor.Execute(plan)
 			if err != nil {
+				if atomic.LoadInt32(&s.closed) == 1 || atomic.LoadInt32(&s.compactionPauseCount) > 0 {
+					// Suppress errors while shutting down or paused
+					continue
+				}
 				s.logger.Error("background compaction failed", "error", err)
 				continue
 			}
@@ -2173,7 +2182,14 @@ func (s *storeImpl) autotuneTask() {
 			if plan == nil {
 				continue
 			}
+			// Re-check pause right before executing to avoid race with pause engaged after planning.
+			if atomic.LoadInt32(&s.compactionPauseCount) > 0 {
+				continue
+			}
 			if _, err := s.compactor.Execute(plan); err != nil {
+				if atomic.LoadInt32(&s.closed) == 1 || atomic.LoadInt32(&s.compactionPauseCount) > 0 {
+					continue
+				}
 				s.logger.Error("background compaction failed", "error", err)
 				continue
 			}
