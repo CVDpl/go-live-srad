@@ -67,15 +67,45 @@ type Reader struct {
 }
 
 // IncRef increments the reader's reference count.
-func (r *Reader) IncRef() { atomic.AddInt32(&r.refcnt, 1) }
+// Returns false if the reader is already closed.
+func (r *Reader) IncRef() bool {
+	for {
+		current := atomic.LoadInt32(&r.refcnt)
+		if current <= 0 {
+			// Reader is already closed or being closed
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&r.refcnt, current, current+1) {
+			return true
+		}
+		// CAS failed, retry
+	}
+}
 
 // DecRef decrements the reference count.
-func (r *Reader) DecRef() { atomic.AddInt32(&r.refcnt, -1) }
+func (r *Reader) DecRef() {
+	r.Release()
+}
 
 // Release decrements refcount and closes resources when it reaches zero.
+// Uses atomic compare-and-swap to prevent race conditions.
 func (r *Reader) Release() {
-	if atomic.AddInt32(&r.refcnt, -1) == 0 {
-		r.internalClose()
+	for {
+		current := atomic.LoadInt32(&r.refcnt)
+		if current <= 0 {
+			// Already at zero or negative (closed)
+			return
+		}
+
+		newCount := current - 1
+		if atomic.CompareAndSwapInt32(&r.refcnt, current, newCount) {
+			if newCount == 0 {
+				// We successfully decremented to zero, we're responsible for cleanup
+				r.internalClose()
+			}
+			return
+		}
+		// CAS failed, retry
 	}
 }
 

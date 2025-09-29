@@ -752,16 +752,37 @@ func (w *WAL) DeleteOldFiles(beforeSeq uint64) error {
 		return fmt.Errorf("list WAL files: %w", err)
 	}
 
+	if len(files) == 0 {
+		return nil // No files to delete
+	}
+
+	var deleteErrors []error
+	deletedCount := 0
+
 	for _, path := range files {
 		seq := w.extractSequence(path)
-		if seq < beforeSeq {
+		if seq < beforeSeq && seq > 0 { // Safety: never delete seq 0, and ensure valid seq
 			if err := os.Remove(path); err != nil {
-				w.logger.Warn("failed to delete old WAL file", "path", path, "error", err)
-				// Continue with other files
+				deleteErrors = append(deleteErrors, fmt.Errorf("delete %s (seq %d): %w", path, seq, err))
+				w.logger.Warn("failed to delete old WAL file", "path", path, "seq", seq, "error", err)
 			} else {
+				deletedCount++
 				w.logger.Info("deleted old WAL file", "path", path, "seq", seq)
 			}
 		}
+	}
+
+	if len(deleteErrors) > 0 {
+		// Log summary of errors but don't fail if some files were deleted successfully
+		w.logger.Warn("some WAL file deletions failed", "failed", len(deleteErrors), "succeeded", deletedCount)
+		if deletedCount == 0 {
+			// If no files were deleted successfully, return error
+			return fmt.Errorf("failed to delete any old WAL files: %v", deleteErrors)
+		}
+	}
+
+	if deletedCount > 0 {
+		w.logger.Info("WAL cleanup completed", "deleted", deletedCount, "failed", len(deleteErrors))
 	}
 
 	return nil

@@ -261,6 +261,11 @@ func Open(dir string, opts *Options) (Store, error) {
 		s.logger.Warn("failed to load segments", "error", err)
 	}
 
+	// Safety check for orphaned segments (segments on disk not in manifest)
+	if err := s.detectOrphanedSegments(); err != nil {
+		s.logger.Warn("failed to detect orphaned segments", "error", err)
+	}
+
 	// Update stats based on loaded manifest/segments
 	s.updateStatsFromManifest()
 
@@ -328,11 +333,35 @@ func (s *storeImpl) Close() error {
 	s.stopBackgroundTasks()
 	s.mtGuard.Unlock()
 
-	// Flush memtable if not read-only
+	// Flush memtable if not read-only (with timeout to prevent hanging)
 	if !s.readonly {
 		if mt := s.memtablePtr.Load(); mt != nil && (mt.Count() > 0 || mt.DeletedCount() > 0) {
-			if err := s.Flush(context.Background()); err != nil {
-				s.logger.Error("failed to flush on close", "error", err)
+			entryCount := mt.Count() + mt.DeletedCount()
+			s.logger.Info("flushing memtable during close", "entries", entryCount)
+
+			// Use timeout to prevent hanging on close
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			if err := s.Flush(ctx); err != nil {
+				s.logger.Error("failed to flush memtable during close - data may be lost",
+					"error", err,
+					"entries", entryCount,
+					"note", "Memtable data will be preserved in WAL if WAL sync succeeded")
+
+				// Try to sync WAL at least to preserve data
+				if s.wal != nil {
+					if syncErr := s.wal.Sync(); syncErr != nil {
+						s.logger.Error("failed to sync WAL during close after flush failure - potential data loss",
+							"flush_error", err,
+							"sync_error", syncErr,
+							"entries", entryCount)
+					} else {
+						s.logger.Info("WAL synced successfully after flush failure - data preserved for recovery", "entries", entryCount)
+					}
+				}
+			} else {
+				s.logger.Info("memtable flushed successfully during close", "entries", entryCount)
 			}
 		}
 	}
@@ -654,7 +683,10 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			if re != nil && !r.MayContain(re) {
 				continue
 			}
-			r.IncRef()
+			if !r.IncRef() {
+				// Reader is being closed, skip it
+				continue
+			}
 			val, ok := r.Get(exactLiteral)
 			if ok && len(val) > 0 {
 				// filter out tombstone quickly
@@ -732,7 +764,10 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 					continue
 				}
 			}
-			r.IncRef()
+			if !r.IncRef() {
+				// Reader is being closed, skip it
+				continue
+			}
 			// preload tombstones only when not an exact-match fast path
 			if exactLiteral == nil {
 				_, _ = r.IterateTombstones(func(tk []byte) bool {
@@ -1688,7 +1723,52 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	}
 	s.logger.Info("flush stage: collected results", "segments", len(mds), "duration", time.Since(collectStart))
 
-	// Update in-memory state and manifest under lock
+	// Prepare manifest entries for all segments first
+	var manifestInfos []manifest.SegmentInfo
+	if s.manifest != nil {
+		for _, md := range mds {
+			info := manifest.SegmentInfo{
+				ID:      md.SegmentID,
+				Level:   common.LevelL0,
+				NumKeys: md.Counts.Accepted,
+				Size:    s.computeSegmentSize(md.SegmentID),
+			}
+			if minb, err := md.GetMinKey(); err == nil {
+				info.MinKeyHex = fmt.Sprintf("%x", minb)
+			}
+			if maxb, err := md.GetMaxKey(); err == nil {
+				info.MaxKeyHex = fmt.Sprintf("%x", maxb)
+			}
+			manifestInfos = append(manifestInfos, info)
+		}
+
+		// Atomically add all segments to manifest first
+		// If this fails, we need to clean up segment files and fail the flush
+		s.logger.Info("attempting atomic manifest update", "segments", len(manifestInfos))
+		if err := s.manifest.AddSegments(manifestInfos); err != nil {
+			s.logger.Error("failed to add segments to manifest - cleaning up segment files", "error", err, "segments", len(mds))
+			// Clean up segment files since manifest update failed
+			cleanupFailed := 0
+			for _, md := range mds {
+				segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", md.SegmentID))
+				if err := os.RemoveAll(segmentPath); err != nil {
+					cleanupFailed++
+					s.logger.Warn("failed to clean up segment file after manifest failure", "id", md.SegmentID, "path", segmentPath, "error", err)
+				} else {
+					s.logger.Info("cleaned up segment file after manifest failure", "id", md.SegmentID, "path", segmentPath)
+				}
+			}
+			if cleanupFailed > 0 {
+				s.logger.Error("cleanup incomplete - some orphaned segment files may remain", "failed_cleanups", cleanupFailed)
+			}
+			// Rollback: reinsert snapshot into current memtable to avoid data loss
+			s.rollbackSnapshotIntoMemtable(snapshot)
+			return fmt.Errorf("atomic manifest update failed: %w", err)
+		}
+		s.logger.Info("atomic manifest update succeeded", "segments", len(manifestInfos))
+	}
+
+	// Update in-memory state after successful manifest update
 	applyStart := time.Now()
 	s.mu.Lock()
 	for _, md := range mds {
@@ -1698,18 +1778,6 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			s.readers = append(s.readers, reader)
 		} else {
 			s.logger.Warn("failed to open reader for new segment", "id", md.SegmentID, "error", rerr)
-		}
-		if s.manifest != nil {
-			info := manifest.SegmentInfo{ID: md.SegmentID, Level: common.LevelL0, NumKeys: md.Counts.Accepted, Size: s.computeSegmentSize(md.SegmentID)}
-			if minb, err := md.GetMinKey(); err == nil {
-				info.MinKeyHex = fmt.Sprintf("%x", minb)
-			}
-			if maxb, err := md.GetMaxKey(); err == nil {
-				info.MaxKeyHex = fmt.Sprintf("%x", maxb)
-			}
-			if err := s.manifest.AddSegment(info); err != nil {
-				s.logger.Warn("failed to add segment to manifest", "error", err)
-			}
 		}
 	}
 	// Refresh stats after flush
@@ -1746,7 +1814,19 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	// Rotate WAL to start a fresh file after flush
 	if s.wal != nil && s.opts.RotateWALOnFlush {
 		if err := s.wal.Rotate(); err != nil {
-			s.logger.Warn("failed to rotate WAL after flush", "error", err)
+			s.logger.Error("failed to rotate WAL after flush", "error", err)
+			return fmt.Errorf("rotate WAL after flush: %w", err)
+		}
+	}
+
+	// Automatically prune old WAL files after successful flush
+	// This is safe because data is now persisted in segments and manifest
+	if s.wal != nil {
+		if err := s.PruneWAL(); err != nil {
+			s.logger.Warn("failed to prune old WAL files after flush", "error", err)
+			// Don't fail the flush for WAL cleanup issues
+		} else {
+			s.logger.Info("pruned old WAL files after flush")
 		}
 	}
 
@@ -2160,35 +2240,62 @@ func (s *storeImpl) compactionTask() {
 			}
 
 			// After a successful compaction, the source of truth (the manifest) has changed.
-			// The safest and most robust way to update the store's in-memory state
-			// is to reload all segment readers from the manifest. This prevents race conditions
-			// where another operation (like a flush) could have changed the segment list
-			// while compaction was running.
-			s.mu.Lock()
+			// Reload segments without creating a gap in query access
 			s.logger.Info("compaction finished, reloading segment readers to reflect changes")
 
-			// Release all old readers. They will be closed once no search is using them.
-			for _, r := range s.readers {
+			// Load new segments first (outside of critical section)
+			segmentsDir := filepath.Join(s.dir, common.DirSegments)
+			var newSegments []*segment.Metadata
+			var newReaders []*segment.Reader
+
+			if s.manifest != nil {
+				active := s.manifest.GetActiveSegments()
+				for _, seg := range active {
+					segmentID := seg.ID
+					// Load segment metadata
+					metadataPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segmentID), "segment.json")
+					metadata, err := segment.LoadFromFile(metadataPath)
+					if err != nil {
+						s.logger.Warn("failed to load segment metadata during reload", "id", segmentID, "error", err)
+						continue
+					}
+					reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+					if err != nil {
+						s.logger.Warn("failed to create segment reader during reload", "id", segmentID, "error", err)
+						continue
+					}
+					newSegments = append(newSegments, metadata)
+					newReaders = append(newReaders, reader)
+				}
+			}
+
+			// Atomic swap under lock to prevent query access gap
+			s.mu.Lock()
+			oldReaders := s.readers
+
+			// Install new readers and segments atomically
+			s.readers = newReaders
+			s.segments = newSegments
+			s.updateStatsFromManifest()
+
+			s.mu.Unlock()
+
+			// Release old readers after the swap (outside critical section)
+			for _, r := range oldReaders {
 				r.Release()
 			}
 
-			// Clear and reload from the manifest's source of truth.
-			s.readers = nil
-			s.segments = nil
-			if err := s.loadSegments(); err != nil {
-				s.logger.Error("failed to reload segments after compaction", "error", err)
-			}
-			s.updateStatsFromManifest()
-			s.mu.Unlock()
+			s.logger.Info("segment readers reloaded successfully", "new_count", len(newReaders), "old_count", len(oldReaders))
 		}
 	}
 }
 
 // autotuneTask is the background autotuning task.
+// This performs actual parameter tuning based on performance metrics.
 func (s *storeImpl) autotuneTask() {
 	defer s.bgWg.Done()
 
-	ticker := time.NewTicker(10 * time.Second) // Check for compaction work every 10 seconds
+	ticker := time.NewTicker(30 * time.Second) // Check for tuning opportunities every 30 seconds
 	defer ticker.Stop()
 
 	for {
@@ -2196,42 +2303,216 @@ func (s *storeImpl) autotuneTask() {
 		case <-s.autotuneStop:
 			return
 		case <-ticker.C:
-			if atomic.LoadInt32(&s.compactionPauseCount) > 0 {
-				continue
+			if atomic.LoadInt32(&s.closed) == 1 {
+				return
 			}
-			s.mu.RLock()
-			if s.compactor == nil {
-				s.mu.RUnlock()
-				continue
-			}
-			plan := s.compactor.Plan()
-			s.mu.RUnlock()
-			if plan == nil {
-				continue
-			}
-			// Re-check pause right before executing to avoid race with pause engaged after planning.
-			if atomic.LoadInt32(&s.compactionPauseCount) > 0 {
-				continue
-			}
-			if _, err := s.compactor.Execute(plan); err != nil {
-				if atomic.LoadInt32(&s.closed) == 1 || atomic.LoadInt32(&s.compactionPauseCount) > 0 {
-					continue
-				}
-				s.logger.Error("background compaction failed", "error", err)
-				continue
-			}
-			s.mu.Lock()
-			s.logger.Info("compaction finished, reloading segment readers to reflect changes")
-			for _, r := range s.readers {
-				r.Release()
-			}
-			s.readers = nil
-			s.segments = nil
-			if err := s.loadSegments(); err != nil {
-				s.logger.Error("failed to reload segments after compaction", "error", err)
-			}
-			s.updateStatsFromManifest()
-			s.mu.Unlock()
+			// Actual autotuning logic would go here
+			// For now, this is a placeholder that doesn't duplicate compaction logic
+			s.performAutotuning()
+		}
+	}
+}
+
+// performAutotuning analyzes performance metrics and adjusts parameters
+func (s *storeImpl) performAutotuning() {
+	if !s.autotunerEnabled {
+		return
+	}
+
+	// Get current statistics
+	stats := s.stats.GetStats()
+	s.logger.Debug("autotuning analysis starting",
+		"writes_per_sec", stats.WritesPerSecond,
+		"queries_per_sec", stats.QueriesPerSecond,
+		"p99_latency_ms", stats.LatencyP99.Milliseconds(),
+		"total_bytes", stats.TotalBytes)
+
+	var adjustmentsMade []string
+	changesMade := false
+
+	// 1. Memtable Size Tuning
+	if newSize := s.tuneMemtableSize(stats); newSize != s.opts.MemtableTargetBytes {
+		s.mu.Lock()
+		oldSize := s.opts.MemtableTargetBytes
+		s.opts.MemtableTargetBytes = newSize
+		s.mu.Unlock()
+
+		adjustmentsMade = append(adjustmentsMade, fmt.Sprintf("memtable: %d -> %d bytes", oldSize, newSize))
+		changesMade = true
+	}
+
+	// 2. Cache Size Tuning
+	if newLabelCache := s.tuneLabelAdvanceCache(stats); newLabelCache != s.opts.CacheLabelAdvanceBytes {
+		s.mu.Lock()
+		oldSize := s.opts.CacheLabelAdvanceBytes
+		s.opts.CacheLabelAdvanceBytes = newLabelCache
+		s.mu.Unlock()
+
+		adjustmentsMade = append(adjustmentsMade, fmt.Sprintf("label_cache: %d -> %d bytes", oldSize, newLabelCache))
+		changesMade = true
+	}
+
+	if newNFACache := s.tuneNFATransitionCache(stats); newNFACache != s.opts.CacheNFATransitionBytes {
+		s.mu.Lock()
+		oldSize := s.opts.CacheNFATransitionBytes
+		s.opts.CacheNFATransitionBytes = newNFACache
+		s.mu.Unlock()
+
+		adjustmentsMade = append(adjustmentsMade, fmt.Sprintf("nfa_cache: %d -> %d bytes", oldSize, newNFACache))
+		changesMade = true
+	}
+
+	// 3. Compaction Tuning (adjust compactor thresholds if needed)
+	s.tuneCompactionBehavior(stats)
+
+	// Save changes to disk if any were made
+	if changesMade {
+		if err := s.saveTuning(); err != nil {
+			s.logger.Warn("failed to save autotuning changes", "error", err)
+		} else {
+			s.logger.Info("autotuning adjustments applied", "changes", adjustmentsMade)
+		}
+	}
+
+	s.logger.Debug("autotuning analysis completed",
+		"adjustments_made", len(adjustmentsMade),
+		"changes", adjustmentsMade)
+}
+
+// tuneMemtableSize adjusts memtable size based on write patterns and flush frequency
+func (s *storeImpl) tuneMemtableSize(stats Stats) int64 {
+	const (
+		minMemtableSize = 16 * 1024 * 1024  // 16MB minimum
+		maxMemtableSize = 512 * 1024 * 1024 // 512MB maximum
+	)
+
+	current := s.opts.MemtableTargetBytes
+
+	// High write rate with low latency -> increase memtable size
+	if stats.WritesPerSecond > 1000 && stats.LatencyP99 < 100*time.Millisecond {
+		newSize := int64(float64(current) * 1.5)
+		if newSize <= maxMemtableSize {
+			s.logger.Debug("increasing memtable size due to high write rate", "writes_per_sec", stats.WritesPerSecond)
+			return newSize
+		}
+	}
+
+	// High latency or memory pressure -> decrease memtable size
+	if stats.LatencyP99 > 500*time.Millisecond || stats.TotalBytes > 10*1024*1024*1024 { // 10GB
+		newSize := int64(float64(current) * 0.8)
+		if newSize >= minMemtableSize {
+			s.logger.Debug("decreasing memtable size due to high latency or memory pressure",
+				"p99_latency_ms", stats.LatencyP99.Milliseconds(),
+				"total_bytes", stats.TotalBytes)
+			return newSize
+		}
+	}
+
+	// Low write rate -> optimize for memory usage
+	if stats.WritesPerSecond < 10 && current > minMemtableSize*2 {
+		newSize := int64(float64(current) * 0.9)
+		if newSize >= minMemtableSize {
+			s.logger.Debug("decreasing memtable size due to low write rate", "writes_per_sec", stats.WritesPerSecond)
+			return newSize
+		}
+	}
+
+	return current
+}
+
+// tuneLabelAdvanceCache adjusts label advance cache size based on hit rates
+func (s *storeImpl) tuneLabelAdvanceCache(stats Stats) int64 {
+	const (
+		minCacheSize = 1 * 1024 * 1024  // 1MB minimum
+		maxCacheSize = 64 * 1024 * 1024 // 64MB maximum
+	)
+
+	current := s.opts.CacheLabelAdvanceBytes
+	hitRate := stats.LabelAdvanceHitRate
+
+	// Low hit rate -> increase cache size
+	if hitRate < 0.7 && current < maxCacheSize {
+		newSize := int64(float64(current) * 1.3)
+		if newSize <= maxCacheSize {
+			s.logger.Debug("increasing label advance cache due to low hit rate", "hit_rate", hitRate)
+			return newSize
+		}
+	}
+
+	// Very high hit rate -> can reduce cache size slightly
+	if hitRate > 0.95 && current > minCacheSize*2 {
+		newSize := int64(float64(current) * 0.9)
+		if newSize >= minCacheSize {
+			s.logger.Debug("decreasing label advance cache due to very high hit rate", "hit_rate", hitRate)
+			return newSize
+		}
+	}
+
+	return current
+}
+
+// tuneNFATransitionCache adjusts NFA transition cache size based on hit rates
+func (s *storeImpl) tuneNFATransitionCache(stats Stats) int64 {
+	const (
+		minCacheSize = 2 * 1024 * 1024   // 2MB minimum
+		maxCacheSize = 128 * 1024 * 1024 // 128MB maximum
+	)
+
+	current := s.opts.CacheNFATransitionBytes
+	hitRate := stats.NFATransHitRate
+
+	// Low hit rate and high query load -> increase cache
+	if hitRate < 0.8 && stats.QueriesPerSecond > 100 && current < maxCacheSize {
+		newSize := int64(float64(current) * 1.4)
+		if newSize <= maxCacheSize {
+			s.logger.Debug("increasing NFA transition cache due to low hit rate and high query load",
+				"hit_rate", hitRate, "queries_per_sec", stats.QueriesPerSecond)
+			return newSize
+		}
+	}
+
+	// Very high hit rate with low query load -> can reduce cache
+	if hitRate > 0.98 && stats.QueriesPerSecond < 10 && current > minCacheSize*2 {
+		newSize := int64(float64(current) * 0.85)
+		if newSize >= minCacheSize {
+			s.logger.Debug("decreasing NFA transition cache due to very high hit rate and low query load",
+				"hit_rate", hitRate, "queries_per_sec", stats.QueriesPerSecond)
+			return newSize
+		}
+	}
+
+	return current
+}
+
+// tuneCompactionBehavior adjusts compaction behavior based on level statistics
+func (s *storeImpl) tuneCompactionBehavior(stats Stats) {
+	if s.compactor == nil {
+		return
+	}
+
+	// Check for excessive segments in L0
+	l0Segments, hasL0 := stats.SegmentCounts[0]
+	if hasL0 && l0Segments > 8 {
+		s.logger.Info("detected high L0 segment count - compaction may need tuning",
+			"l0_segments", l0Segments)
+		// Note: In a more advanced implementation, we could adjust compactor thresholds here
+	}
+
+	// Check tombstone ratios
+	for level, tombstoneRatio := range stats.TombstoneFractions {
+		if tombstoneRatio > 0.3 { // More than 30% tombstones
+			s.logger.Info("high tombstone ratio detected",
+				"level", level,
+				"tombstone_ratio", tombstoneRatio)
+			// Note: Could trigger more aggressive compaction for this level
+		}
+	}
+
+	// Check for size imbalances between levels
+	if l0Size, hasL0 := stats.LevelSizes[0]; hasL0 {
+		if l1Size, hasL1 := stats.LevelSizes[1]; hasL1 && l0Size > l1Size*2 {
+			s.logger.Info("L0 size significantly larger than L1 - may need more aggressive L0->L1 compaction",
+				"l0_size", l0Size, "l1_size", l1Size)
 		}
 	}
 }
@@ -2407,6 +2688,168 @@ func (s *storeImpl) loadTuning() error {
 		s.opts.CacheNFATransitionBytes = *cfg.CacheNFATransitionBytes
 	}
 	return nil
+}
+
+// detectOrphanedSegments detects segments on disk that are not tracked in the manifest.
+// This is a safety mechanism to detect data that might have been lost due to manifest update failures.
+func (s *storeImpl) detectOrphanedSegments() error {
+	if s.manifest == nil {
+		return nil // Can't detect orphans without manifest
+	}
+
+	segmentsDir := filepath.Join(s.dir, common.DirSegments)
+	if _, err := os.Stat(segmentsDir); os.IsNotExist(err) {
+		return nil // No segments directory
+	}
+
+	// Get segments from manifest
+	manifestSegments := s.manifest.GetActiveSegments()
+	manifestMap := make(map[uint64]bool)
+	for _, seg := range manifestSegments {
+		manifestMap[seg.ID] = true
+	}
+
+	// Scan filesystem for segment directories
+	entries, err := os.ReadDir(segmentsDir)
+	if err != nil {
+		return fmt.Errorf("read segments directory: %w", err)
+	}
+
+	var orphans []uint64
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Parse segment ID
+		var segmentID uint64
+		if _, err := fmt.Sscanf(entry.Name(), "%d", &segmentID); err != nil {
+			continue
+		}
+
+		// Skip in-progress builds
+		segmentPath := filepath.Join(segmentsDir, entry.Name())
+		if _, err := os.Stat(filepath.Join(segmentPath, ".building")); err == nil {
+			continue
+		}
+
+		// Check if segment has metadata file (indicates it's a complete segment)
+		if _, err := os.Stat(filepath.Join(segmentPath, "segment.json")); err != nil {
+			continue
+		}
+
+		// Check if it's in manifest
+		if !manifestMap[segmentID] {
+			orphans = append(orphans, segmentID)
+		}
+	}
+
+	if len(orphans) > 0 {
+		s.logger.Warn("detected orphaned segments - attempting automatic recovery",
+			"orphaned_segments", orphans,
+			"count", len(orphans),
+			"note", "This indicates a previous flush partially failed. Attempting to recover data.")
+
+		// Attempt automatic recovery by adding orphaned segments to manifest
+		recovered, failed := s.recoverOrphanedSegments(orphans, segmentsDir)
+
+		if len(recovered) > 0 {
+			s.logger.Info("successfully recovered orphaned segments",
+				"recovered_segments", recovered,
+				"count", len(recovered))
+
+			// Reload segments to include recovered ones
+			s.mu.Lock()
+			if err := s.loadSegments(); err != nil {
+				s.logger.Error("failed to reload segments after recovery", "error", err)
+			} else {
+				s.updateStatsFromManifest()
+				s.logger.Info("segments reloaded after recovery")
+			}
+			s.mu.Unlock()
+		}
+
+		if len(failed) > 0 {
+			s.logger.Error("failed to recover some orphaned segments",
+				"failed_segments", failed,
+				"count", len(failed),
+				"note", "These segments may contain lost data - manual intervention required")
+		}
+	}
+
+	return nil
+}
+
+// recoverOrphanedSegments attempts to recover orphaned segments by adding them to the manifest.
+// Returns lists of successfully recovered and failed segment IDs.
+func (s *storeImpl) recoverOrphanedSegments(orphanIDs []uint64, segmentsDir string) (recovered []uint64, failed []uint64) {
+	var segmentInfos []manifest.SegmentInfo
+
+	for _, segmentID := range orphanIDs {
+		segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segmentID))
+
+		// Load segment metadata to get key information
+		metadataPath := filepath.Join(segmentPath, "segment.json")
+		metadata, err := segment.LoadFromFile(metadataPath)
+		if err != nil {
+			s.logger.Warn("failed to load metadata for orphaned segment", "id", segmentID, "error", err)
+			failed = append(failed, segmentID)
+			continue
+		}
+
+		// Create segment info for manifest
+		info := manifest.SegmentInfo{
+			ID:      segmentID,
+			Level:   common.LevelL0, // Assume L0 for recovered segments
+			NumKeys: metadata.Counts.Accepted,
+			Size:    s.computeSegmentSize(segmentID),
+		}
+
+		// Add min/max key info if available
+		if minb, err := metadata.GetMinKey(); err == nil {
+			info.MinKeyHex = fmt.Sprintf("%x", minb)
+		}
+		if maxb, err := metadata.GetMaxKey(); err == nil {
+			info.MaxKeyHex = fmt.Sprintf("%x", maxb)
+		}
+
+		segmentInfos = append(segmentInfos, info)
+
+		s.logger.Info("prepared orphaned segment for recovery",
+			"id", segmentID,
+			"keys", metadata.Counts.Accepted,
+			"size", info.Size)
+	}
+
+	if len(segmentInfos) == 0 {
+		s.logger.Warn("no orphaned segments could be prepared for recovery")
+		return nil, orphanIDs
+	}
+
+	// Atomically add all recovered segments to manifest
+	s.logger.Info("adding recovered segments to manifest", "count", len(segmentInfos))
+	if err := s.manifest.AddSegments(segmentInfos); err != nil {
+		s.logger.Error("failed to add recovered segments to manifest", "error", err)
+		// If manifest update fails, all segments are considered failed
+		return nil, orphanIDs
+	}
+
+	// All segments were recovered successfully
+	for _, info := range segmentInfos {
+		recovered = append(recovered, info.ID)
+	}
+
+	s.logger.Info("orphaned segments recovery completed",
+		"recovered", len(recovered),
+		"total_keys_recovered", func() uint64 {
+			var total uint64
+			for _, info := range segmentInfos {
+				total += info.NumKeys
+			}
+			return total
+		}())
+
+	return recovered, failed
 }
 
 // saveTuning saves tuning parameters to disk.

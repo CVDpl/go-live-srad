@@ -215,6 +215,16 @@ func (m *Manifest) save() error {
 
 // AddSegment adds a new segment to the manifest.
 func (m *Manifest) AddSegment(info SegmentInfo) error {
+	return m.AddSegments([]SegmentInfo{info})
+}
+
+// AddSegments adds multiple segments to the manifest atomically.
+// Either all segments are added successfully or none are added.
+func (m *Manifest) AddSegments(infos []SegmentInfo) error {
+	if len(infos) == 0 {
+		return nil
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -229,9 +239,12 @@ func (m *Manifest) AddSegment(info SegmentInfo) error {
 	// Copy existing segments
 	copy(newVersion.Segments, m.current.Segments)
 
-	// Add new segment
-	info.Created = time.Now().Unix()
-	newVersion.Segments = append(newVersion.Segments, info)
+	// Add new segments
+	now := time.Now().Unix()
+	for _, info := range infos {
+		info.Created = now
+		newVersion.Segments = append(newVersion.Segments, info)
+	}
 
 	// Save new version
 	oldVersion := m.current

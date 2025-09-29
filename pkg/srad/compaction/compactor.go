@@ -248,6 +248,9 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		cur.approxBytes = 0
 		cur.acceptedCount = 0
 	}
+	// Collect segment infos for atomic manifest update
+	var pendingSegmentInfos []manifest.SegmentInfo
+
 	finalizeChunk := func() error {
 		if cur.builder == nil {
 			return nil
@@ -283,9 +286,8 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 			}
 			info.Size = total
 		}
-		if err := c.manifest.AddSegment(info); err != nil {
-			return fmt.Errorf("add segment to manifest: %w", err)
-		}
+		// Don't add to manifest yet - collect for atomic update
+		pendingSegmentInfos = append(pendingSegmentInfos, info)
 		outputs = append(outputs, cur.id)
 		cur.builder = nil
 		cur.id = 0
@@ -403,10 +405,34 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		return []*segment.Reader{}, nil
 	}
 
-	// Atomically update manifest: add new segments and remove old ones
+	// ATOMIC COMPACTION UPDATE: Add all new segments and remove old ones atomically
+	c.logger.Info("performing atomic compaction manifest update", "new_segments", len(pendingSegmentInfos), "removing_segments", len(inputIDs))
+
+	// Add new segments first
+	if err := c.manifest.AddSegments(pendingSegmentInfos); err != nil {
+		c.logger.Error("failed to add new segments to manifest - cleaning up segment files", "error", err)
+		// Clean up segment files since manifest update failed
+		cleanupFailed := 0
+		for _, segID := range outputs {
+			segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID))
+			if err := os.RemoveAll(segmentPath); err != nil {
+				cleanupFailed++
+				c.logger.Warn("failed to clean up segment file after manifest failure", "id", segID, "path", segmentPath, "error", err)
+			} else {
+				c.logger.Info("cleaned up segment file after manifest failure", "id", segID, "path", segmentPath)
+			}
+		}
+		if cleanupFailed > 0 {
+			c.logger.Error("cleanup incomplete - some orphaned segment files may remain", "failed_cleanups", cleanupFailed)
+		}
+		return nil, fmt.Errorf("atomic compaction manifest update failed: %w", err)
+	}
+
+	// Remove old segments after successful addition of new ones
 	if err := c.manifest.RemoveSegments(inputIDs); err != nil {
-		// This is a problematic state, new segments exist but old ones are not marked for deletion.
-		// A recovery mechanism might be needed in a production system.
+		c.logger.Error("failed to remove old segments from manifest after adding new ones", "error", err, "new_segments", outputs, "old_segments", inputIDs)
+		// This is a problematic state, new segments exist and old ones are not marked for deletion.
+		// Log extensively for recovery purposes but continue - the system is still functional
 		return nil, fmt.Errorf("remove old segments from manifest: %w", err)
 	}
 
@@ -422,6 +448,8 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 	if err := c.manifest.RecordCompaction(compactionInfo); err != nil {
 		c.logger.Warn("failed to record compaction", "error", err)
 	}
+
+	c.logger.Info("atomic compaction manifest update completed", "new_segments", len(outputs), "removed_segments", len(inputIDs))
 
 	c.logger.Info("compaction completed", "reason", plan.Reason, "duration", time.Since(startTime), "outputs", len(outputs))
 
