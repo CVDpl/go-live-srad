@@ -399,6 +399,11 @@ func (s *storeImpl) InsertWithTTL(key []byte, ttl time.Duration) error {
 		return fmt.Errorf("insert to memtable: %w", err)
 	}
 	// Send to WAL while holding lock
+	// Check if store is still open before sending to avoid panic on closed channel
+	if atomic.LoadInt32(&s.closed) == 1 {
+		s.mtGuard.Unlock()
+		return common.ErrClosed
+	}
 	s.writeCh <- req
 	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
@@ -461,6 +466,11 @@ func (s *storeImpl) Delete(key []byte) error {
 		return fmt.Errorf("delete from memtable: %w", err)
 	}
 	// Send to WAL while holding lock
+	// Check if store is still open before sending to avoid panic on closed channel
+	if atomic.LoadInt32(&s.closed) == 1 {
+		s.mtGuard.Unlock()
+		return common.ErrClosed
+	}
 	s.writeCh <- req
 	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
