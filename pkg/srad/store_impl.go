@@ -93,6 +93,9 @@ type storeImpl struct {
 
 	// Wait group for background tasks
 	bgWg sync.WaitGroup
+
+	// Tracks in-progress flush operations to allow graceful shutdown
+	flushWg sync.WaitGroup
 }
 
 // updateStatsFromManifest refreshes StatsCollector using the manifest's active segments.
@@ -363,6 +366,19 @@ func (s *storeImpl) Close() error {
 			} else {
 				s.logger.Info("memtable flushed successfully during close", "entries", entryCount)
 			}
+		}
+
+		// Wait briefly for any in-progress flush to complete to avoid truncating segment writes
+		done := make(chan struct{})
+		go func() {
+			s.flushWg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// ok
+		case <-time.After(10 * time.Second):
+			s.logger.Warn("timed out waiting for in-progress flush to finish during close")
 		}
 	}
 
@@ -1538,6 +1554,10 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 
 	start := time.Now()
 
+	// Mark flush as in-progress to allow Close() to wait for completion
+	s.flushWg.Add(1)
+	defer s.flushWg.Done()
+
 	// Prevent concurrent Flush (best-effort) and serialize with in-flight writes
 	s.mu.Lock()
 	// Block writers from swapping memtable while we swap by taking write lock on mtGuard
@@ -1629,7 +1649,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		addDone := time.Now()
 		s.logger.Info("flush stage: builder input added", "segment_id", segID, "duration", addDone.Sub(flushPlanStart))
 		buildStart := time.Now()
-		md, err := builder.Build()
+		md, err := builder.BuildWithContext(ctx)
 		if err != nil {
 			s.rollbackSnapshotIntoMemtable(snapshot)
 			return fmt.Errorf("build segment: %w", err)
@@ -1689,22 +1709,43 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			wg.Add(1)
 			go func(pid int) {
 				defer wg.Done()
+
+				// Panic recovery to prevent goroutine crashes from hanging flush
+				defer func() {
+					if r := recover(); r != nil {
+						s.logger.Error("panic in partition builder goroutine",
+							"partition", pid,
+							"panic", r,
+							"note", "This indicates a serious bug in segment building")
+						segID := atomic.AddUint64(&s.nextSegmentID, 1)
+						results <- partResult{id: segID, err: fmt.Errorf("partition builder panic: %v", r)}
+					}
+				}()
+
 				segID := atomic.AddUint64(&s.nextSegmentID, 1)
+				s.logger.Info("flush stage: starting partition build", "partition", pid, "segment_id", segID, "keys", len(buckets[pid]))
+
 				builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
 				cfgBuilder(builder)
+
 				partStart := time.Now()
 				if err := builder.AddFromPairs(buckets[pid], btombs[pid]); err != nil {
+					s.logger.Error("failed to add partition pairs to builder", "partition", pid, "segment_id", segID, "error", err)
 					results <- partResult{id: segID, err: fmt.Errorf("add partition: %w", err)}
 					return
 				}
 				s.logger.Info("flush stage: partition input added", "partition", pid, "segment_id", segID, "keys", len(buckets[pid]), "duration", time.Since(partStart))
+
 				buildStart := time.Now()
-				md, err := builder.Build()
+				s.logger.Debug("flush stage: starting partition build phase", "partition", pid, "segment_id", segID)
+				md, err := builder.BuildWithContext(ctx)
 				if err != nil {
+					s.logger.Error("failed to build partition segment", "partition", pid, "segment_id", segID, "error", err)
 					results <- partResult{id: segID, err: fmt.Errorf("build partition: %w", err)}
 					return
 				}
 				s.logger.Info("flush stage: partition built", "partition", pid, "segment_id", segID, "duration", time.Since(buildStart))
+
 				results <- partResult{id: segID, md: md, err: nil}
 			}(p)
 		}
@@ -1714,14 +1755,46 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	// Collect results
 	var mds []*segment.Metadata
 	collectStart := time.Now()
-	for r := range results {
-		if r.err != nil {
-			s.rollbackSnapshotIntoMemtable(snapshot)
-			return r.err
+	s.logger.Info("flush stage: waiting for partition results", "expected_partitions", parts)
+
+	resultsReceived := 0
+
+	// Add context timeout protection to prevent infinite hanging
+	resultsDone := make(chan bool, 1)
+	var collectError error
+
+	go func() {
+		defer func() { resultsDone <- true }()
+		for r := range results {
+			resultsReceived++
+			s.logger.Debug("flush stage: received result", "result_number", resultsReceived, "segment_id", r.id, "has_error", r.err != nil)
+
+			if r.err != nil {
+				s.logger.Error("flush stage: partition failed", "segment_id", r.id, "error", r.err, "rolling_back", true)
+				collectError = r.err
+				return
+			}
+			mds = append(mds, r.md)
 		}
-		mds = append(mds, r.md)
+	}()
+
+	// Wait for results with context timeout
+	select {
+	case <-resultsDone:
+		if collectError != nil {
+			s.rollbackSnapshotIntoMemtable(snapshot)
+			return collectError
+		}
+		s.logger.Info("flush stage: collected results", "segments", len(mds), "results_received", resultsReceived, "duration", time.Since(collectStart))
+	case <-ctx.Done():
+		s.logger.Error("flush stage: timeout waiting for partition results",
+			"timeout", ctx.Err(),
+			"results_received", resultsReceived,
+			"expected", parts,
+			"note", "This indicates partition building is taking too long or goroutines are stuck")
+		s.rollbackSnapshotIntoMemtable(snapshot)
+		return fmt.Errorf("flush timeout: %w", ctx.Err())
 	}
-	s.logger.Info("flush stage: collected results", "segments", len(mds), "duration", time.Since(collectStart))
 
 	// Prepare manifest entries for all segments first
 	var manifestInfos []manifest.SegmentInfo

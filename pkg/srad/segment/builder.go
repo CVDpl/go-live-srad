@@ -3,6 +3,7 @@ package segment
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -255,6 +256,11 @@ func (b *Builder) SetSkipFilters(skip bool) { b.skipFilterBuild = skip }
 
 // Build creates the segment files.
 func (b *Builder) Build() (*Metadata, error) {
+	return b.BuildWithContext(context.Background())
+}
+
+// BuildWithContext creates the segment files with context support.
+func (b *Builder) BuildWithContext(ctx context.Context) (*Metadata, error) {
 	if len(b.keys) == 0 && len(b.tombstoneKeys) == 0 {
 		return nil, fmt.Errorf("no keys to build segment")
 	}
@@ -318,8 +324,13 @@ func (b *Builder) Build() (*Metadata, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			b.logger.Info("starting filters build", "segment_id", b.segmentID, "keys", len(b.keys))
+			start := time.Now()
 			if err := b.buildFilters(filtersDir); err != nil {
+				b.logger.Error("filters build failed", "segment_id", b.segmentID, "error", err)
 				errCh <- err
+			} else {
+				b.logger.Info("filters build completed", "segment_id", b.segmentID, "duration", time.Since(start))
 			}
 		}()
 	}
@@ -327,8 +338,13 @@ func (b *Builder) Build() (*Metadata, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		b.logger.Info("starting keys file write", "segment_id", b.segmentID, "keys", len(b.keys))
+		start := time.Now()
 		if err := b.writeKeysFile(keysPath); err != nil {
+			b.logger.Error("keys file write failed", "segment_id", b.segmentID, "error", err)
 			errCh <- err
+		} else {
+			b.logger.Info("keys file write completed", "segment_id", b.segmentID, "duration", time.Since(start))
 		}
 	}()
 	// expiry.dat (optional, but write even if empty to preserve alignment when present)
@@ -336,9 +352,14 @@ func (b *Builder) Build() (*Metadata, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			b.logger.Info("starting expiry file write", "segment_id", b.segmentID, "keys", len(b.keys))
+			start := time.Now()
 			expPath := filepath.Join(segmentDir, "expiry.dat")
 			if err := b.writeExpiryFile(expPath); err != nil {
+				b.logger.Error("expiry file write failed", "segment_id", b.segmentID, "error", err)
 				errCh <- err
+			} else {
+				b.logger.Info("expiry file write completed", "segment_id", b.segmentID, "duration", time.Since(start))
 			}
 		}()
 	}
@@ -347,9 +368,14 @@ func (b *Builder) Build() (*Metadata, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			b.logger.Info("starting tombstones file write", "segment_id", b.segmentID, "tombstone_keys", len(b.tombstoneKeys))
+			start := time.Now()
 			tombPath := filepath.Join(segmentDir, "tombstones.dat")
 			if err := b.writeTombstonesFile(tombPath); err != nil {
+				b.logger.Error("tombstones file write failed", "segment_id", b.segmentID, "error", err)
 				errCh <- err
+			} else {
+				b.logger.Info("tombstones file write completed", "segment_id", b.segmentID, "duration", time.Since(start))
 			}
 		}()
 	}
@@ -363,18 +389,44 @@ func (b *Builder) Build() (*Metadata, error) {
 		b.logger.Info("trie build skipped (streaming LOUDS)", "id", b.segmentID, "keys", len(b.keys))
 	} else {
 		// Build trie structure (simplified for now)
-		b.logger.Info("trie build start", "id", b.segmentID, "keys", len(b.keys))
+		b.logger.Info("trie build start", "id", b.segmentID, "keys", len(b.keys), "note", "This may take a while for large datasets")
 		trieStart := time.Now()
 		gcPrev := -2
 		if b.trieGCPercent != 0 {
 			// Save current GC percent and apply temporary policy
 			gcPrev = debug.SetGCPercent(b.trieGCPercent)
+			b.logger.Debug("adjusted GC percent for trie build", "old", gcPrev, "new", b.trieGCPercent)
 		}
+
+		// Monitor memory usage during trie build for large datasets
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		startMem := m.Alloc
+
 		trie = b.buildTrie()
+
+		runtime.ReadMemStats(&m)
+		memUsed := m.Alloc - startMem
+
 		if b.trieGCPercent != 0 {
 			_ = debug.SetGCPercent(gcPrev)
 		}
-		b.logger.Info("trie build done", "id", b.segmentID, "duration", time.Since(trieStart))
+
+		trieDuration := time.Since(trieStart)
+		b.logger.Info("trie build done",
+			"id", b.segmentID,
+			"duration", trieDuration,
+			"memory_used_mb", memUsed/(1024*1024),
+			"keys_per_sec", float64(len(b.keys))/trieDuration.Seconds())
+
+		// Warn if trie build took excessively long
+		if trieDuration > 2*time.Minute {
+			b.logger.Warn("trie build took unusually long",
+				"id", b.segmentID,
+				"duration", trieDuration,
+				"keys", len(b.keys),
+				"note", "Consider using alreadySorted flag or reducing dataset size")
+		}
 	}
 
 	// Build LOUDS synchronously
@@ -384,13 +436,34 @@ func (b *Builder) Build() (*Metadata, error) {
 	}
 	b.logger.Info("step done", "id", b.segmentID, "step", "LOUDS", "duration", time.Since(localStart))
 
-	// Wait for parallel tasks
-	wg.Wait()
-	close(errCh)
-	for e := range errCh {
-		if e != nil {
-			return nil, e
+	// Wait for parallel tasks with context cancellation support
+	done := make(chan struct{})
+	var waitError error
+
+	go func() {
+		wg.Wait()
+		close(errCh)
+		for e := range errCh {
+			if e != nil {
+				waitError = e
+				break
+			}
 		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if waitError != nil {
+			return nil, waitError
+		}
+		// All goroutines completed successfully
+	case <-ctx.Done():
+		b.logger.Warn("segment build cancelled by context",
+			"id", b.segmentID,
+			"keys", len(b.keys),
+			"reason", ctx.Err())
+		return nil, fmt.Errorf("segment build cancelled: %w", ctx.Err())
 	}
 	b.logger.Info("segment core build done", "id", b.segmentID, "duration", time.Since(stepStart))
 

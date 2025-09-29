@@ -255,7 +255,11 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		if cur.builder == nil {
 			return nil
 		}
-		md, err := cur.builder.Build()
+		ctx := context.Background()
+		if c.ctx != nil {
+			ctx = c.ctx
+		}
+		md, err := cur.builder.BuildWithContext(ctx)
 		if err != nil {
 			return fmt.Errorf("build segment: %w", err)
 		}
