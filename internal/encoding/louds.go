@@ -160,6 +160,7 @@ func NewLOUDSFromSortedKeys(keys [][]byte) *LOUDS {
 		cur = next
 	}
 
+	// +1 for root node, which is the parent of all first-level edges
 	nodesTotal := edgesTotal + 1
 	bitLen := 2*nodesTotal + 2
 	louds := &LOUDS{
@@ -172,82 +173,94 @@ func NewLOUDSFromSortedKeys(keys [][]byte) *LOUDS {
 	}
 
 	// Pass 2: emit LOUDS bit runs, labels, and accept
+	// Super root (node 0): 10 - has one child (the actual root)
 	louds.bits.Set(0)
 	louds.bits.Clear(1)
 	bitPos := uint64(2)
-	nodeIdx := uint64(1) // child nodes indices (1-based)
+
+	// nodeIdx tracks CHILD nodes as we emit their labels
+	// Node 1 is root's first child, node 2 is second child, etc.
+	nodeIdx := uint64(1)
+
+	// Process level by level using BFS-style groups
 	cur = []group{{0, len(keys), 0}}
 	for len(cur) > 0 {
 		next := make([]group, 0, len(cur)*2)
 		for _, g := range cur {
-			// Enumerate child buckets in byte order (already ensured by sorted keys)
+			// For each group (representing a parent node), collect its children
+			// by grouping keys by their byte at depth g.depth
+
+			// Skip keys that end at this depth (they mark the parent as accepting)
 			i := g.start
-			// Skip keys that end here (leaf at current prefix)
-			for i < g.end {
-				if len(keys[i]) <= g.depth {
-					i++
-					continue
-				}
-				break
+			for i < g.end && len(keys[i]) <= g.depth {
+				i++
 			}
-			// Count children first to set run
-			// But we can set runs iteratively by accumulating contiguous buckets
-			// We will collect buckets to set run once
+
+			// Collect children by grouping by next byte
 			childStarts := make([]int, 0, 8)
 			childEnds := make([]int, 0, 8)
 			childLabels := make([]byte, 0, 8)
+
 			for i < g.end {
+				// Skip keys that end here
 				if len(keys[i]) <= g.depth {
 					i++
 					continue
 				}
+
+				// Start of a child bucket with label keys[i][g.depth]
 				lb := keys[i][g.depth]
 				j := i + 1
-				for j < g.end {
-					if len(keys[j]) <= g.depth {
-						j++
-						continue
-					}
-					if keys[j][g.depth] != lb {
-						break
-					}
+
+				// Find all keys with same next byte
+				for j < g.end && len(keys[j]) > g.depth && keys[j][g.depth] == lb {
 					j++
 				}
+
 				childStarts = append(childStarts, i)
 				childEnds = append(childEnds, j)
 				childLabels = append(childLabels, lb)
 				i = j
 			}
-			// Set LOUDS 1-run for this node's children
+
+			// Emit LOUDS bit sequence for this parent node
+			// 1-run for children + labels + accept bits
 			if n := uint64(len(childLabels)); n > 0 {
 				louds.bits.SetRun(bitPos, n)
 				bitPos += n
-				// Append labels and accept bits, enqueue children
+
 				for idx := 0; idx < len(childLabels); idx++ {
 					louds.labels = append(louds.labels, childLabels[idx])
-					// Accept: exists key with exact length depth+1 in [start,end)
+
+					// Check if this child is accepting (has a key that ends at depth+1)
 					s, e := childStarts[idx], childEnds[idx]
 					leaf := false
+					targetLen := g.depth + 1
 					for t := s; t < e; t++ {
-						if len(keys[t]) == g.depth+1 {
+						if len(keys[t]) == targetLen {
 							leaf = true
 							break
 						}
-						// early break because sorted by bytes first, but lengths may vary; we scan segment fully
 					}
 					if leaf {
 						louds.accept.Set(nodeIdx)
 					}
+
+					// Enqueue this child for next level
 					next = append(next, group{s, e, g.depth + 1})
 					nodeIdx++
 				}
 			}
-			// End-of-children marker
+
+			// End-of-children marker (0 bit)
 			louds.bits.Clear(bitPos)
 			bitPos++
 		}
 		cur = next
 	}
+
+	// Build RankSelect support structure for efficient navigation
+	louds.rs = NewRankSelect(louds.bits)
 
 	return louds
 }

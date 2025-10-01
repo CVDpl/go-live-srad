@@ -104,7 +104,7 @@ func (m *Memtable) InsertWithTTL(key []byte, ttl time.Duration) error {
 	}
 
 	oldSize := m.root.cachedSize
-	m.insertNode(m.root, keyCopy, value)
+	m.insertNodeWithPrefix(m.root, nil, keyCopy, keyCopy, value)
 	newSize := m.root.cachedSize
 
 	atomic.AddInt64(&m.size, newSize-oldSize)
@@ -134,7 +134,7 @@ func (m *Memtable) InsertWithExpiry(key []byte, expiresAt time.Time) error {
 		expiresAt: expiresAt,
 	}
 	oldSize := m.root.cachedSize
-	m.insertNode(m.root, keyCopy, value)
+	m.insertNodeWithPrefix(m.root, nil, keyCopy, keyCopy, value)
 	newSize := m.root.cachedSize
 	atomic.AddInt64(&m.size, newSize-oldSize)
 	atomic.AddInt64(&m.count, 1)
@@ -167,7 +167,7 @@ func (m *Memtable) Delete(key []byte) error {
 	}
 
 	oldSize := m.root.cachedSize
-	m.insertNode(m.root, keyCopy, value)
+	m.insertNodeWithPrefix(m.root, nil, keyCopy, keyCopy, value)
 	newSize := m.root.cachedSize
 
 	atomic.AddInt64(&m.size, newSize-oldSize)
@@ -176,23 +176,31 @@ func (m *Memtable) Delete(key []byte) error {
 	return nil
 }
 
-// insertNode inserts a value into the tree rooted at node.
-func (m *Memtable) insertNode(node *Node, key []byte, value *Value) {
+// insertNodeWithPrefix inserts a value into the tree rooted at node, tracking the prefix.
+// prefix: the path from root to this node
+// key: the remaining key suffix to insert
+// fullKey: the complete original key being inserted
+func (m *Memtable) insertNodeWithPrefix(node *Node, prefix []byte, key []byte, fullKey []byte, value *Value) {
 	// Update cached size
 	defer func() {
 		node.updateCachedSize()
 	}()
 
+	// Build current full key path
+	currentKey := make([]byte, len(prefix)+len(node.label))
+	copy(currentKey, prefix)
+	copy(currentKey[len(prefix):], node.label)
+
 	// If this is a leaf node with a value
 	if node.value != nil {
-		if bytes.Equal(node.value.data, key) {
+		if bytes.Equal(node.value.data, fullKey) {
 			// Replace existing value
 			node.value = value
 			return
 		}
 
 		// Need to split this leaf into an internal node
-		m.splitLeaf(node, key, value)
+		m.splitLeafWithPrefix(node, currentKey, fullKey, value)
 		return
 	}
 
@@ -211,8 +219,10 @@ func (m *Memtable) insertNode(node *Node, key []byte, value *Value) {
 				child.value = value
 				return
 			}
-			// Continue searching in child
-			m.insertNode(child, key[commonLen:], value)
+			// Continue searching in child - make a copy to avoid shared backing array
+			remainingKey := make([]byte, len(key)-commonLen)
+			copy(remainingKey, key[commonLen:])
+			m.insertNodeWithPrefix(child, currentKey, remainingKey, fullKey, value)
 			return
 		}
 
@@ -224,17 +234,21 @@ func (m *Memtable) insertNode(node *Node, key []byte, value *Value) {
 
 		// Partial match - split the edge
 		m.splitEdge(node, i, commonLen, nil)
-		remainingKey := key[commonLen:]
+		// Make a copy to avoid shared backing array
+		remainingKey := make([]byte, len(key)-commonLen)
+		copy(remainingKey, key[commonLen:])
 
 		// Insert into the new intermediate node
 		intermediateNode := node.children[i]
-		m.insertNode(intermediateNode, remainingKey, value)
+		m.insertNodeWithPrefix(intermediateNode, currentKey, remainingKey, fullKey, value)
 		return
 	}
 
-	// No matching child - create new child
+	// No matching child - create new child with a copy to avoid shared backing array
+	keyCopy := make([]byte, len(key))
+	copy(keyCopy, key)
 	newChild := &Node{
-		label: key,
+		label: keyCopy,
 		value: value,
 	}
 
@@ -242,30 +256,41 @@ func (m *Memtable) insertNode(node *Node, key []byte, value *Value) {
 	node.children = insertSorted(node.children, newChild)
 }
 
-// splitLeaf splits a leaf node when it needs to become an internal node.
-func (m *Memtable) splitLeaf(leaf *Node, newKey []byte, newValue *Value) {
+// splitLeafWithPrefix splits a leaf node when it needs to become an internal node.
+// currentFullKey is the full key path to this node (prefix + node.label).
+// newFullKey is the complete new key being inserted.
+func (m *Memtable) splitLeafWithPrefix(leaf *Node, currentFullKey []byte, newFullKey []byte, newValue *Value) {
 	existingKey := leaf.value.data
 	existingValue := leaf.value
 
 	// Clear the leaf value (it becomes internal)
 	leaf.value = nil
 
-	// Find common prefix
-	commonLen := commonPrefixLength(existingKey, newKey)
+	// Find common prefix between the FULL keys
+	commonLen := commonPrefixLength(existingKey, newFullKey)
+
+	// Now compute what the remaining suffixes should be RELATIVE to currentFullKey
+	// currentFullKey is the path to this node, but leaf.label might be part of existingKey
+	// We need to compute the suffix after the common prefix
+	prefixLen := len(currentFullKey)
 
 	if commonLen == len(existingKey) {
 		// Existing key is a prefix of new key
 		leaf.value = existingValue
-		remainingNew := newKey[commonLen:]
+		// remainingNew is relative to the CURRENT node position (after currentFullKey)
+		remainingNew := make([]byte, len(newFullKey)-prefixLen)
+		copy(remainingNew, newFullKey[prefixLen:])
 		newChild := &Node{
 			label: remainingNew,
 			value: newValue,
 		}
 		leaf.children = []*Node{newChild}
-	} else if commonLen == len(newKey) {
+	} else if commonLen == len(newFullKey) {
 		// New key is a prefix of existing key
 		leaf.value = newValue
-		remainingExisting := existingKey[commonLen:]
+		// remainingExisting is relative to the CURRENT node position
+		remainingExisting := make([]byte, len(existingKey)-prefixLen)
+		copy(remainingExisting, existingKey[prefixLen:])
 		existingChild := &Node{
 			label: remainingExisting,
 			value: existingValue,
@@ -273,8 +298,12 @@ func (m *Memtable) splitLeaf(leaf *Node, newKey []byte, newValue *Value) {
 		leaf.children = []*Node{existingChild}
 	} else {
 		// Keys diverge - create two children
-		remainingExisting := existingKey[commonLen:]
-		remainingNew := newKey[commonLen:]
+		// Both are relative to the COMMON PREFIX, not currentFullKey
+		// So we need to split at commonLen, create intermediate if needed
+		remainingExisting := make([]byte, len(existingKey)-commonLen)
+		copy(remainingExisting, existingKey[commonLen:])
+		remainingNew := make([]byte, len(newFullKey)-commonLen)
+		copy(remainingNew, newFullKey[commonLen:])
 
 		existingChild := &Node{
 			label: remainingExisting,
@@ -301,14 +330,18 @@ func (m *Memtable) splitEdge(parent *Node, childIndex int, splitPoint int,
 
 	child := parent.children[childIndex]
 
-	// Create intermediate node with common prefix
+	// Create intermediate node with common prefix - make a copy to avoid shared backing array
+	intermediateLabel := make([]byte, splitPoint)
+	copy(intermediateLabel, child.label[:splitPoint])
 	intermediate := &Node{
-		label: child.label[:splitPoint],
+		label: intermediateLabel,
 		value: intermediateValue,
 	}
 
-	// Update child's label to remaining suffix
-	child.label = child.label[splitPoint:]
+	// Update child's label to remaining suffix - make a copy to avoid shared backing array
+	childSuffix := make([]byte, len(child.label)-splitPoint)
+	copy(childSuffix, child.label[splitPoint:])
+	child.label = childSuffix
 
 	// Add child to intermediate node
 	intermediate.children = []*Node{child}
@@ -363,8 +396,10 @@ func (m *Memtable) GetAll() [][]byte {
 
 // collectAll recursively collects all keys.
 func (m *Memtable) collectAll(node *Node, prefix []byte, result *[][]byte) {
-	// Build current key
-	currentKey := append(prefix, node.label...)
+	// Build current key - create a fresh slice to avoid append reusing backing array
+	currentKey := make([]byte, len(prefix)+len(node.label))
+	copy(currentKey, prefix)
+	copy(currentKey[len(prefix):], node.label)
 
 	// If this node has a value and it's not a tombstone
 	if node.value != nil && !node.value.tombstone {
@@ -557,7 +592,10 @@ func (s *Snapshot) findValue(node *Node, targetKey, prefix []byte) *Value {
 
 // collectAll recursively collects all keys from snapshot.
 func (s *Snapshot) collectAll(node *Node, prefix []byte, result *[][]byte) {
-	currentKey := append(prefix, node.label...)
+	// Create a fresh slice to avoid append reusing backing array
+	currentKey := make([]byte, len(prefix)+len(node.label))
+	copy(currentKey, prefix)
+	copy(currentKey[len(prefix):], node.label)
 
 	if node.value != nil && !node.value.tombstone && !node.value.IsExpired() {
 		keyCopy := make([]byte, len(currentKey))
@@ -576,7 +614,11 @@ func (s *Snapshot) GetAllWithTombstones() ([][]byte, []bool) {
 	var tombs []bool
 	var walk func(node *Node, prefix []byte)
 	walk = func(node *Node, prefix []byte) {
-		currentKey := append(prefix, node.label...)
+		// Create a fresh slice to avoid append reusing backing array
+		currentKey := make([]byte, len(prefix)+len(node.label))
+		copy(currentKey, prefix)
+		copy(currentKey[len(prefix):], node.label)
+
 		if node.value != nil && !node.value.IsExpired() {
 			k := make([]byte, len(currentKey))
 			copy(k, currentKey)
@@ -598,7 +640,11 @@ func (s *Snapshot) GetAllWithMeta() ([][]byte, []bool, []int64) {
 	var exps []int64
 	var walk func(node *Node, prefix []byte)
 	walk = func(node *Node, prefix []byte) {
-		currentKey := append(prefix, node.label...)
+		// Create a fresh slice to avoid append reusing backing array
+		currentKey := make([]byte, len(prefix)+len(node.label))
+		copy(currentKey, prefix)
+		copy(currentKey[len(prefix):], node.label)
+
 		if node.value != nil && !node.value.IsExpired() {
 			k := make([]byte, len(currentKey))
 			copy(k, currentKey)

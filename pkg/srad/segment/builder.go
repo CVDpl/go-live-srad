@@ -854,7 +854,7 @@ func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
 	// Build LOUDS without Rank/Select to speed up flush; readers will rebuild RS
 	var louds *encoding.LOUDS
 	if b.alreadySorted {
-		// Prefer streaming LOUDS builder from sorted keys
+		// Prefer streaming LOUDS builder from sorted keys (fast path)
 		louds = encoding.NewLOUDSFromSortedKeys(b.keys)
 	} else {
 		louds = encoding.NewLOUDSNoRS(encodingTrie)
