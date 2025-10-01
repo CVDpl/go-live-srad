@@ -656,9 +656,43 @@ Contributions are welcome! Please ensure:
 
 This project is licensed under the BSD 3-Clause License. See the `LICENSE` file for details.
 
-## WAL Durability
+## WAL Durability and Crash Recovery
 
-SRAD uses a write-ahead log (WAL) for durability. By default, the WAL buffers writes in userspace and flushes them periodically. You can tune durability-vs-latency using the following options:
+SRAD uses a write-ahead log (WAL) for durability. All write operations (`Insert`, `Delete`) are first written to the WAL before being applied to the memtable, ensuring that data survives system crashes.
+
+### Automatic Recovery
+
+**WAL replay happens automatically on every `Open()`**. When you open a store after a crash:
+
+1. SRAD reads all WAL files in sequence order
+2. Replays all operations (Insert/Delete) into a fresh memtable
+3. Restores the exact state as of the last confirmed write
+4. Makes all recovered data immediately available for queries
+
+**No manual intervention required** - crash recovery is completely automatic.
+
+Example crash scenario:
+```go
+// Before crash
+store, _ := srad.Open("./data", nil)
+store.Insert([]byte("key1"))  // ✅ Confirmed - written to WAL
+store.Insert([]byte("key2"))  // ✅ Confirmed - written to WAL
+store.Insert([]byte("key3"))  // ✅ Confirmed - written to WAL
+// 💥 System crash before flush to segments
+
+// After restart
+store, _ := srad.Open("./data", nil)
+// ✅ All three keys automatically recovered from WAL
+// ✅ Immediately available for search
+iter, _ := store.RegexSearch(ctx, regexp.MustCompile(".*"), nil)
+// Returns: key1, key2, key3
+```
+
+**Durability guarantee**: If `Insert()` or `Delete()` returns successfully (no error), the operation is durable and will survive crashes.
+
+### Durability Configuration
+
+By default, the WAL buffers writes in userspace and flushes them periodically. You can tune durability-vs-latency using the following options:
 
 - `WALSyncOnEveryWrite` (bool): call `fsync` after each WAL write. Safest but slowest.
 - `WALFlushOnEveryWrite` (bool): flush the userspace buffer after each write (no `fsync`). Faster than sync but still reduces loss on process crash.
@@ -666,9 +700,9 @@ SRAD uses a write-ahead log (WAL) for durability. By default, the WAL buffers wr
 - `WALFlushEveryInterval` (time.Duration): periodic time-based flush (0 = disabled). When >0, a background ticker flushes the WAL buffer at this interval even if the byte threshold is not reached.
 
 Recommendations:
-- Production: keep `WALFlushEveryBytes = 256KB` (default). Enable `RotateWALOnFlush` to make pruning effective. Periodically call `PruneWAL()`.
-- Maximum durability: set `WALSyncOnEveryWrite = true` (expect higher latency).
-- Lowest latency: leave all off, at the cost of higher data-loss window on process crash.
+- **Production**: keep `WALFlushEveryBytes = 256KB` (default). Enable `RotateWALOnFlush` to make pruning effective. Periodically call `PruneWAL()`.
+- **Maximum durability**: set `WALSyncOnEveryWrite = true` (expect higher latency, but zero data loss on system crash).
+- **Lowest latency**: leave all off, at the cost of higher data-loss window on process crash (only in-memory buffer at risk).
 
 Example:
 ```go
@@ -678,6 +712,14 @@ opts.RotateWALOnFlush = true         // rotate on each flush
 opts.WALFlushEveryInterval = 2 * time.Second // also flush every 2s
 store, _ := srad.Open(dir, opts)
 ```
+
+### WAL Corruption Handling
+
+If a WAL file is corrupted during replay:
+- Corrupted files are automatically quarantined (renamed with `.corrupt` suffix)
+- Partially written records at the end of a file are truncated to the last valid offset
+- Recovery continues with remaining valid WAL files
+- Only operations that were successfully confirmed before the corruption point are lost
 
 ### Search concurrency and correctness
 
