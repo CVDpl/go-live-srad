@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -753,25 +754,23 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 
-	// Add finalizer as safety net for unclosed files
-	fileClosed := false
-	var closeOnce func()
-	closeOnce = func() {
-		if !fileClosed {
-			fileClosed = true
+	// Use sync.Once for thread-safe close (multiple goroutines might call closeFn)
+	var closeOnce sync.Once
+	closeFunc := func() {
+		closeOnce.Do(func() {
 			_ = f.Close()
-		}
+		})
 	}
 
 	br := bufio.NewReaderSize(f, 1<<20)
 	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicKeys, common.VersionSegment) != nil {
-		closeOnce()
+		closeFunc()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var count uint32
 	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		closeOnce()
+		closeFunc()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	// Best-effort load expiries so we can filter during streaming
@@ -783,14 +782,14 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 		for i < count {
 			var kl uint32
 			if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
-				closeOnce()
+				closeFunc()
 				return nil, false
 			}
 			var k []byte
 			if kl > 0 {
 				k = make([]byte, kl)
 				if _, err := io.ReadFull(br, k); err != nil {
-					closeOnce()
+					closeFunc()
 					return nil, false
 				}
 			}
@@ -802,10 +801,10 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 			}
 			return k, true
 		}
-		closeOnce()
+		closeFunc()
 		return nil, false
 	}
-	return adv, closeOnce
+	return adv, closeFunc
 }
 
 // StreamTombstones provides a streaming closure over tombstones.dat.
@@ -818,50 +817,48 @@ func (r *Reader) StreamTombstones() (advance func() ([]byte, bool), closeFn func
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 
-	// Add finalizer as safety net for unclosed files
-	fileClosed := false
-	var closeOnce func()
-	closeOnce = func() {
-		if !fileClosed {
-			fileClosed = true
+	// Use sync.Once for thread-safe close (multiple goroutines might call closeFn)
+	var closeOnce sync.Once
+	closeFunc := func() {
+		closeOnce.Do(func() {
 			_ = f.Close()
-		}
+		})
 	}
 
 	br := bufio.NewReaderSize(f, 1<<20)
 	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicTombs, common.VersionSegment) != nil {
-		closeOnce()
+		closeFunc()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var count uint32
 	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		closeOnce()
+		closeFunc()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var i uint32
 	adv := func() ([]byte, bool) {
 		if i >= count {
-			closeOnce()
+			closeFunc()
 			return nil, false
 		}
 		var kl uint32
 		if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
-			closeOnce()
+			closeFunc()
 			return nil, false
 		}
 		var k []byte
 		if kl > 0 {
 			k = make([]byte, kl)
 			if _, err := io.ReadFull(br, k); err != nil {
-				closeOnce()
+				closeFunc()
 				return nil, false
 			}
 		}
 		i++
 		return k, true
 	}
-	return adv, closeOnce
+	return adv, closeFunc
 }
 
 // SegmentIterator iterates over keys in a segment.

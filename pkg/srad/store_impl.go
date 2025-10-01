@@ -2140,12 +2140,17 @@ func (s *storeImpl) triggerFlush() {
 // It batches writes together ("group commit") to improve performance.
 func (s *storeImpl) walWriter() {
 	defer s.walWg.Done()
+
+	// Track if we've already closed the channel to prevent double-close panic
+	channelClosed := false
+
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("panic in WAL writer goroutine", "panic", r)
-			// Ensure channel is closed on panic to prevent writer hangs
-			if s.writeCh != nil {
+			// Close channel only if not already closed
+			if s.writeCh != nil && !channelClosed {
 				close(s.writeCh)
+				channelClosed = true
 			}
 		}
 	}()
@@ -2164,7 +2169,10 @@ func (s *storeImpl) walWriter() {
 		select {
 		case <-s.walStop:
 			// Drain any remaining requests on shutdown
-			close(s.writeCh)
+			if !channelClosed {
+				close(s.writeCh)
+				channelClosed = true
+			}
 			for req := range s.writeCh {
 				requests = append(requests, req)
 			}
