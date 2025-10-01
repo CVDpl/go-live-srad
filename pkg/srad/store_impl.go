@@ -368,18 +368,11 @@ func (s *storeImpl) Close() error {
 			}
 		}
 
-		// Wait briefly for any in-progress flush to complete to avoid truncating segment writes
-		done := make(chan struct{})
-		go func() {
-			s.flushWg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-			// ok
-		case <-time.After(10 * time.Second):
-			s.logger.Warn("timed out waiting for in-progress flush to finish during close")
-		}
+		// Wait for any in-progress flush to complete to avoid truncating segment writes
+		// No timeout - we must ensure all data is safely written to disk
+		s.logger.Info("waiting for flush to complete before closing")
+		s.flushWg.Wait()
+		s.logger.Info("flush completed, proceeding with close")
 	}
 
 	// Close WAL
