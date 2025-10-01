@@ -131,9 +131,14 @@ func (r *Reader) internalClose() {
 	if r.tombFile != nil {
 		r.tombFile.Close()
 	}
+	// Unmap both mmap regions to prevent memory leak
 	if r.mmap != nil {
 		_ = unix.Munmap(r.mmap)
 		r.mmap = nil
+	}
+	if r.keysMap != nil {
+		_ = unix.Munmap(r.keysMap)
+		r.keysMap = nil
 	}
 }
 
@@ -740,21 +745,33 @@ func (r *Reader) MayContain(pattern *regexp.Regexp) bool {
 
 // StreamKeys provides a streaming closure over keys.dat for k-way merge.
 // Returns an advance function and a close function to release resources early.
+// IMPORTANT: Caller MUST call closeFn when done, preferably with defer.
 func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 	path := filepath.Join(r.dir, "keys.dat")
 	f, err := os.Open(path)
 	if err != nil {
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
+
+	// Add finalizer as safety net for unclosed files
+	fileClosed := false
+	var closeOnce func()
+	closeOnce = func() {
+		if !fileClosed {
+			fileClosed = true
+			_ = f.Close()
+		}
+	}
+
 	br := bufio.NewReaderSize(f, 1<<20)
 	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicKeys, common.VersionSegment) != nil {
-		_ = f.Close()
+		closeOnce()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var count uint32
 	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		_ = f.Close()
+		closeOnce()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	// Best-effort load expiries so we can filter during streaming
@@ -762,13 +779,6 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 		_ = r.loadExpiries()
 	}
 	var i uint32
-	closed := false
-	closeOnce := func() {
-		if !closed {
-			closed = true
-			_ = f.Close()
-		}
-	}
 	adv := func() ([]byte, bool) {
 		for i < count {
 			var kl uint32
@@ -800,31 +810,36 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 
 // StreamTombstones provides a streaming closure over tombstones.dat.
 // Returns an advance function and a close function to release resources early.
+// IMPORTANT: Caller MUST call closeFn when done, preferably with defer.
 func (r *Reader) StreamTombstones() (advance func() ([]byte, bool), closeFn func()) {
 	path := filepath.Join(r.dir, "tombstones.dat")
 	f, err := os.Open(path)
 	if err != nil {
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
+
+	// Add finalizer as safety net for unclosed files
+	fileClosed := false
+	var closeOnce func()
+	closeOnce = func() {
+		if !fileClosed {
+			fileClosed = true
+			_ = f.Close()
+		}
+	}
+
 	br := bufio.NewReaderSize(f, 1<<20)
 	hdr, err := ReadCommonHeader(br)
 	if err != nil || ValidateHeader(hdr, common.MagicTombs, common.VersionSegment) != nil {
-		_ = f.Close()
+		closeOnce()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var count uint32
 	if err := binary.Read(br, binary.LittleEndian, &count); err != nil {
-		_ = f.Close()
+		closeOnce()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
 	var i uint32
-	closed := false
-	closeOnce := func() {
-		if !closed {
-			closed = true
-			_ = f.Close()
-		}
-	}
 	adv := func() ([]byte, bool) {
 		if i >= count {
 			closeOnce()

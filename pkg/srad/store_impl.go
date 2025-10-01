@@ -571,6 +571,8 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		frozenIters = append(frozenIters, fs.RegexSearch(re))
 	}
 	// Seed seen with memtable tombstones only (do not preload segment tombstones globally)
+	// Use bounded map with LRU-style eviction to prevent unbounded growth
+	const maxSeenSize = 100000 // Limit to 100k entries
 	seen := make(map[string]struct{}, 1024)
 	seenMu := &sync.Mutex{}
 	if memSnap != nil {
@@ -578,6 +580,20 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		for i := range keys {
 			if tombs[i] {
 				seenMu.Lock()
+				// Prevent unbounded growth
+				if len(seen) >= maxSeenSize {
+					// Clear oldest half when limit reached (simple eviction strategy)
+					newSeen := make(map[string]struct{}, maxSeenSize/2)
+					count := 0
+					for k := range seen {
+						if count >= maxSeenSize/2 {
+							break
+						}
+						newSeen[k] = struct{}{}
+						count++
+					}
+					seen = newSeen
+				}
 				seen[string(keys[i])] = struct{}{}
 				seenMu.Unlock()
 			}
@@ -752,6 +768,12 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	pctx, cancel := context.WithCancel(ctx)
 	go func(readers []*segment.Reader) {
 		defer close(out)
+		defer func() {
+			// Cleanup: release any readers that weren't released during iteration
+			if r := recover(); r != nil {
+				s.logger.Error("panic in regex search producer goroutine", "panic", r)
+			}
+		}()
 		// For broad scans, emit all memtable keys first via channel
 		if broad && memSnap != nil {
 			all := memSnap.GetAll()
@@ -1024,6 +1046,21 @@ func (it *parallelMergedIterator) Next(ctx context.Context) bool {
 		if _, ok := it.seen[ks]; ok {
 			it.seenMu.Unlock()
 			continue
+		}
+		// Prevent unbounded growth of seen map
+		const maxSeenSize = 100000
+		if len(it.seen) >= maxSeenSize {
+			// Clear oldest half when limit reached
+			newSeen := make(map[string]struct{}, maxSeenSize/2)
+			count := 0
+			for k := range it.seen {
+				if count >= maxSeenSize/2 {
+					break
+				}
+				newSeen[k] = struct{}{}
+				count++
+			}
+			it.seen = newSeen
 		}
 		it.seen[ks] = struct{}{}
 		it.seenMu.Unlock()
@@ -1344,12 +1381,22 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 	}
 	// Best-effort background job
 	go func() {
+		// Check if store is closed before starting work
+		if atomic.LoadInt32(&s.closed) == 1 {
+			return
+		}
+
 		s.mu.RLock()
 		active := s.manifest.GetActiveSegments()
 		dir := filepath.Join(s.dir, common.DirSegments)
 		logger := s.logger
 		s.mu.RUnlock()
+
 		for _, seg := range active {
+			// Check for shutdown on each iteration
+			if atomic.LoadInt32(&s.closed) == 1 {
+				return
+			}
 			// Open reader and check filters
 			reader, err := segment.NewReader(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad)
 			if err != nil {
@@ -2093,6 +2140,15 @@ func (s *storeImpl) triggerFlush() {
 // It batches writes together ("group commit") to improve performance.
 func (s *storeImpl) walWriter() {
 	defer s.walWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("panic in WAL writer goroutine", "panic", r)
+			// Ensure channel is closed on panic to prevent writer hangs
+			if s.writeCh != nil {
+				close(s.writeCh)
+			}
+		}
+	}()
 	requests := make([]*writeRequest, 0, 128)
 	entries := make([]*wal.WALEntry, 0, 128)
 
@@ -2320,6 +2376,7 @@ func (s *storeImpl) compactionTask() {
 			segmentsDir := filepath.Join(s.dir, common.DirSegments)
 			var newSegments []*segment.Metadata
 			var newReaders []*segment.Reader
+			var loadErr error
 
 			if s.manifest != nil {
 				active := s.manifest.GetActiveSegments()
@@ -2330,16 +2387,36 @@ func (s *storeImpl) compactionTask() {
 					metadata, err := segment.LoadFromFile(metadataPath)
 					if err != nil {
 						s.logger.Warn("failed to load segment metadata during reload", "id", segmentID, "error", err)
-						continue
+						// Cleanup already loaded readers before continuing
+						for _, r := range newReaders {
+							r.Close()
+						}
+						newReaders = newReaders[:0]
+						newSegments = newSegments[:0]
+						loadErr = fmt.Errorf("load metadata for segment %d: %w", segmentID, err)
+						break
 					}
 					reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
 					if err != nil {
 						s.logger.Warn("failed to create segment reader during reload", "id", segmentID, "error", err)
-						continue
+						// Cleanup already loaded readers before continuing
+						for _, r := range newReaders {
+							r.Close()
+						}
+						newReaders = newReaders[:0]
+						newSegments = newSegments[:0]
+						loadErr = fmt.Errorf("create reader for segment %d: %w", segmentID, err)
+						break
 					}
 					newSegments = append(newSegments, metadata)
 					newReaders = append(newReaders, reader)
 				}
+			}
+
+			// If loading failed, skip the swap and keep old readers
+			if loadErr != nil {
+				s.logger.Error("failed to reload segments after compaction, keeping old readers", "error", loadErr)
+				continue
 			}
 
 			// Atomic swap under lock to prevent query access gap

@@ -338,13 +338,23 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		return x
 	}
 
+	// Track closers to ensure cleanup
+	var closers []func()
+	defer func() {
+		for _, closer := range closers {
+			closer()
+		}
+	}()
+
 	for idx, r := range readers {
 		order := len(readers) - idx // newer first has higher order
-		advK, _ := r.StreamKeys()
+		advK, closeK := r.StreamKeys()
+		closers = append(closers, closeK)
 		if k, ok := advK(); ok {
 			push(&srcIter{key: k, ok: true, next: advK, order: order, tomb: false})
 		}
-		advT, _ := r.StreamTombstones()
+		advT, closeT := r.StreamTombstones()
+		closers = append(closers, closeT)
 		if tk, ok := advT(); ok {
 			push(&srcIter{key: tk, ok: true, next: advT, order: order, tomb: true})
 		}
