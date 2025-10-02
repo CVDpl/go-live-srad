@@ -9,12 +9,15 @@ import (
 
 // simpleIterator is a simple implementation of Iterator for memtable-only queries.
 type simpleIterator struct {
-	memIter     *memtable.Iterator
-	frozenIters []*memtable.Iterator
-	mode        QueryMode
-	limit       int
-	count       int
-	current     struct {
+	memIter       *memtable.Iterator
+	memSnap       *memtable.Snapshot // COW: Need to Release() when done
+	frozenIters   []*memtable.Iterator
+	preloadedKeys [][]byte // For broad scans when memIter is nil
+	preloadedIdx  int
+	mode          QueryMode
+	limit         int
+	count         int
+	current       struct {
 		id  uint64
 		key []byte
 		op  uint8
@@ -27,6 +30,22 @@ func (it *simpleIterator) Next(ctx context.Context) bool {
 	// Check limit
 	if it.limit > 0 && it.count >= it.limit {
 		return false
+	}
+
+	// For broad scans, iterate through preloaded keys first
+	if len(it.preloadedKeys) > 0 && it.preloadedIdx < len(it.preloadedKeys) {
+		// Check context before returning preloaded keys
+		select {
+		case <-ctx.Done():
+			it.err = ctx.Err()
+			return false
+		default:
+		}
+		it.current.key = it.preloadedKeys[it.preloadedIdx]
+		it.current.op = 0 // OpInsert
+		it.preloadedIdx++
+		it.count++
+		return true
 	}
 
 	// Advance memtable iterator first
@@ -108,6 +127,9 @@ func (it *simpleIterator) Op() uint8 {
 
 // Close releases resources associated with the iterator.
 func (it *simpleIterator) Close() error {
-	// Nothing to close for now
+	// COW: Release snapshot to decrement refcounts
+	if it.memSnap != nil {
+		it.memSnap.Release()
+	}
 	return nil
 }

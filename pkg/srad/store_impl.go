@@ -30,6 +30,11 @@ type segItem struct {
 	err error
 }
 
+// segBatch is a batch of items for efficient channel communication.
+type segBatch struct {
+	items []segItem
+}
+
 // writeRequest is a request to the dedicated WAL writer goroutine.
 type writeRequest struct {
 	entry *wal.WALEntry
@@ -96,6 +101,9 @@ type storeImpl struct {
 
 	// Tracks in-progress flush operations to allow graceful shutdown
 	flushWg sync.WaitGroup
+
+	// Memory pooling for hot-path allocations
+	memPool *MemoryPool
 }
 
 // updateStatsFromManifest refreshes StatsCollector using the manifest's active segments.
@@ -173,6 +181,7 @@ func Open(dir string, opts *Options) (Store, error) {
 		autotunerEnabled: !opts.DisableAutotuner,
 		rcuEnabled:       opts.EnableRCU,
 		stats:            NewStatsCollector(),
+		memPool:          NewMemoryPool(),
 	}
 
 	// Initialize WAL if not read-only
@@ -389,7 +398,75 @@ func (s *storeImpl) Close() error {
 
 // Insert adds a string to the store.
 func (s *storeImpl) Insert(key []byte) error {
-	return s.InsertWithTTL(key, s.opts.DefaultTTL)
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return common.ErrClosed
+	}
+
+	if s.readonly {
+		return common.ErrReadOnly
+	}
+
+	// Validate before WAL write
+	if len(key) == 0 {
+		return common.ErrEmptyKey
+	}
+	if len(key) > common.MaxKeySize {
+		return common.ErrKeyTooLarge
+	}
+
+	ttl := s.opts.DefaultTTL
+	if ttl < 0 || ttl > common.MaxTTL {
+		return common.ErrInvalidTTL
+	}
+
+	entry := &wal.WALEntry{
+		Op:  common.OpInsert,
+		Key: key,
+		TTL: ttl,
+	}
+
+	req := &writeRequest{
+		entry: entry,
+		err:   make(chan error, 1),
+	}
+
+	// Use write lock to prevent flush during insert and WAL write
+	s.mtGuard.Lock()
+	mt := s.memtablePtr.Load()
+	if mt == nil {
+		s.mtGuard.Unlock()
+		return fmt.Errorf("memtable not initialized")
+	}
+	err := mt.InsertWithTTL(key, ttl)
+	if err != nil {
+		s.mtGuard.Unlock()
+		return fmt.Errorf("insert to memtable: %w", err)
+	}
+	// Send to WAL while holding lock
+	// Check if store is still open before sending to avoid panic on closed channel
+	if atomic.LoadInt32(&s.closed) == 1 {
+		s.mtGuard.Unlock()
+		return common.ErrClosed
+	}
+	s.writeCh <- req
+	// Wait for confirmation while holding lock
+	if err := <-req.err; err != nil {
+		// Rollback
+		mt.Delete(key)
+		s.mtGuard.Unlock()
+		return fmt.Errorf("write to WAL: %w", err)
+	}
+	s.mtGuard.Unlock()
+
+	// Update statistics
+	s.stats.RecordInsert()
+
+	// Check if flush is needed
+	if s.shouldFlush() && !s.opts.DisableAutoFlush {
+		go s.triggerFlush()
+	}
+
+	return nil
 }
 
 // InsertWithTTL adds a string to the store with expiration time.
@@ -566,7 +643,28 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	// Seed seen with memtable tombstones only (do not preload segment tombstones globally)
 	// Use bounded map with LRU-style eviction to prevent unbounded growth
 	const maxSeenSize = 100000 // Limit to 100k entries
-	seen := make(map[string]struct{}, 1024)
+
+	// Pre-size seen map based on expected tombstone count for better performance
+	initialSeenSize := 1024
+	if memSnap != nil {
+		// Estimate tombstone count: deleted / total
+		mt := s.memtablePtr.Load()
+		if mt != nil {
+			totalCount := mt.Count()
+			deletedCount := mt.DeletedCount()
+			if totalCount > 0 && deletedCount > 0 {
+				// Estimate with some buffer
+				estimatedTombstones := int(float64(deletedCount) * 1.2)
+				if estimatedTombstones > initialSeenSize && estimatedTombstones < maxSeenSize {
+					initialSeenSize = estimatedTombstones
+				} else if estimatedTombstones >= maxSeenSize {
+					initialSeenSize = maxSeenSize / 2
+				}
+			}
+		}
+	}
+
+	seen := make(map[string]struct{}, initialSeenSize)
 	seenMu := &sync.Mutex{}
 	if memSnap != nil {
 		keys, tombs := memSnap.GetAllWithTombstones()
@@ -598,7 +696,8 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	if re != nil {
 		pat := re.String()
 		if len(pat) >= 3 && pat[0] == '^' && pat[len(pat)-1] == '$' {
-			if lit, _ := re.LiteralPrefix(); lit != "" {
+			// Only use exact path if literal prefix is complete (no regex metacharacters)
+			if lit, complete := re.LiteralPrefix(); lit != "" && complete {
 				exactLiteral = []byte(lit)
 			}
 		}
@@ -621,6 +720,8 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				}
 				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
 			}
+			// COW: Release snapshot immediately - we've copied all data we need
+			memSnap.Release()
 		}
 		for _, fs := range frozenSnapList {
 			if fs == nil {
@@ -651,12 +752,24 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	}
 	// If no segments, return simple iterator but include frozen snapshots
 	if len(readersSnap) == 0 {
+		// For broad scans with no segments and memIter==nil, pre-load memtable keys
+		var preloadedKeys [][]byte
+		if broad && memSnap != nil {
+			keys, tombs, _ := memSnap.GetAllWithExpiry()
+			for i, k := range keys {
+				if !tombs[i] { // Skip tombstones
+					preloadedKeys = append(preloadedKeys, k)
+				}
+			}
+		}
 		return &simpleIterator{
-			memIter:     memIter,
-			frozenIters: frozenIters,
-			mode:        q.Mode,
-			limit:       q.Limit,
-			count:       0,
+			memIter:       memIter,
+			memSnap:       memSnap, // COW: Store snapshot for Release() on Close()
+			frozenIters:   frozenIters,
+			preloadedKeys: preloadedKeys,
+			mode:          q.Mode,
+			limit:         q.Limit,
+			count:         0,
 		}, nil
 	}
 
@@ -673,6 +786,8 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				}
 				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
 			}
+			// COW: Release snapshot immediately - we've copied all data we need
+			memSnap.Release()
 		}
 		// from frozen snapshots
 		for _, fs := range frozenSnapList {
@@ -756,7 +871,7 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		return selected[i].GetSegmentID() > selected[j].GetSegmentID()
 	})
 
-	out := make(chan segItem, 1024)
+	out := make(chan segBatch, 64) // Fewer, larger messages
 	// Create a cancellable context for the background producer
 	pctx, cancel := context.WithCancel(ctx)
 	go func(readers []*segment.Reader) {
@@ -767,28 +882,55 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				s.logger.Error("panic in regex search producer goroutine", "panic", r)
 			}
 		}()
+
+		const batchSize = 512 // Batch items for efficient channel communication
+		batch := make([]segItem, 0, batchSize)
+
+		// Helper to send current batch
+		sendBatch := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			select {
+			case out <- segBatch{items: batch}:
+				batch = make([]segItem, 0, batchSize)
+				return true
+			case <-pctx.Done():
+				return false
+			}
+		}
+
 		// For broad scans, emit all memtable keys first via channel
 		if broad && memSnap != nil {
-			all := memSnap.GetAll()
+			keys, tombs, _ := memSnap.GetAllWithExpiry()
 			emitted := 0
-			for _, k := range all {
+			for i, k := range keys {
 				select {
 				case <-pctx.Done():
 					return
 				default:
 				}
+				// Skip tombstones (they're tracked in seen map)
+				if tombs[i] {
+					continue
+				}
 				if re != nil && !re.Match(k) {
 					continue
 				}
-				select {
-				case out <- segItem{id: 0, key: append([]byte(nil), k...), op: common.OpInsert}:
-				case <-pctx.Done():
-					return
-				}
+
+				batch = append(batch, segItem{id: 0, key: append([]byte(nil), k...), op: common.OpInsert})
 				emitted++
+
+				if len(batch) >= batchSize {
+					if !sendBatch() {
+						return
+					}
+				}
 			}
+			sendBatch() // Flush remaining
 			s.logger.Info("broad scan emitted memtable keys", "count", emitted)
 		}
+
 		for _, r := range readers {
 			if !unsafeBroadScan {
 				if re != nil && !r.MayContain(re) {
@@ -809,18 +951,14 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				})
 			}
 			emitted := 0
-			adv, closeFn := r.StreamKeys()
-			for {
+			// Use AllKeys() instead of StreamKeys() to avoid batching bugs
+			allKeys := r.AllKeys()
+			for _, k := range allKeys {
 				select {
 				case <-pctx.Done():
-					closeFn()
 					r.Release()
 					return
 				default:
-				}
-				k, ok := adv()
-				if !ok {
-					break
 				}
 				if re != nil && !re.Match(k) {
 					continue
@@ -831,24 +969,28 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 						continue
 					}
 				}
-				select {
-				case out <- segItem{id: r.GetSegmentID(), key: append([]byte(nil), k...), op: common.OpInsert}:
-				case <-pctx.Done():
-					closeFn()
-					r.Release()
-					return
-				}
+
+				batch = append(batch, segItem{id: r.GetSegmentID(), key: append([]byte(nil), k...), op: common.OpInsert})
 				emitted++
+
+				if len(batch) >= batchSize {
+					if !sendBatch() {
+						r.Release()
+						return
+					}
+				}
 			}
-			closeFn()
+			sendBatch() // Flush remaining items for this segment
 			r.Release()
 			s.logger.Info("broad scan emitted segment keys", "segment", r.GetSegmentID(), "count", emitted)
 		}
+		sendBatch() // Final flush
 	}(selected)
 
 	// Drain into merged iterator (memtable first)
 	return &parallelMergedIterator{
 		memIter:     memIter,
+		memSnap:     memSnap, // COW: Store snapshot for Release() on Close()
 		frozenIters: frozenIters,
 		in:          out,
 		seen:        seen,
@@ -1008,8 +1150,11 @@ func fnv32(b []byte) uint32 {
 // parallelMergedIterator merges memtable and channel of segment results.
 type parallelMergedIterator struct {
 	memIter     *memtable.Iterator
+	memSnap     *memtable.Snapshot // COW: Need to Release() when done
 	frozenIters []*memtable.Iterator
-	in          chan segItem
+	in          chan segBatch // Batched channel
+	batchBuf    []segItem     // Buffer for current batch
+	batchIdx    int           // Current index in batch
 	seen        map[string]struct{}
 	seenMu      *sync.Mutex
 	mode        QueryMode
@@ -1098,14 +1243,13 @@ func (it *parallelMergedIterator) Next(ctx context.Context) bool {
 		_ = cur.Close()
 		it.frozenIters = it.frozenIters[1:]
 	}
-	// then read from segments channel
+	// then read from segments channel (batched)
 	for it.in != nil {
-		select {
-		case x, ok := <-it.in:
-			if !ok {
-				it.in = nil
-				return false
-			}
+		// Process items from current batch buffer
+		for it.batchIdx < len(it.batchBuf) {
+			x := it.batchBuf[it.batchIdx]
+			it.batchIdx++
+
 			if x.err != nil {
 				it.err = x.err
 				continue
@@ -1123,6 +1267,17 @@ func (it *parallelMergedIterator) Next(ctx context.Context) bool {
 			it.cur.op = x.op
 			it.count++
 			return true
+		}
+
+		// Batch exhausted, fetch next batch
+		select {
+		case batch, ok := <-it.in:
+			if !ok {
+				it.in = nil
+				return false
+			}
+			it.batchBuf = batch.items
+			it.batchIdx = 0
 		case <-ctx.Done():
 			it.err = ctx.Err()
 			if it.cancel != nil {
@@ -1146,6 +1301,10 @@ func (it *parallelMergedIterator) Op() uint8 { return it.cur.op }
 func (it *parallelMergedIterator) Close() error {
 	if it.cancel != nil {
 		it.cancel()
+	}
+	// COW: Release snapshot to decrement refcounts
+	if it.memSnap != nil {
+		it.memSnap.Release()
 	}
 	return nil
 }
@@ -1364,7 +1523,8 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	return nil
 }
 
-// After flush, optionally build filters asynchronously (placeholder)
+// maybeScheduleAsyncFilters schedules background filter building for segments without filters.
+// This is called after flush/compact when AsyncFilterBuild is enabled.
 func (s *storeImpl) maybeScheduleAsyncFilters() {
 	if !s.opts.AsyncFilterBuild {
 		return
@@ -1717,11 +1877,44 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		// Range-partition snapshot by first byte (0..255). If it collapses to <=1 non-empty bucket,
 		// fallback to hash-based partitioning to ensure parallel build even for heavy shared prefixes.
 		partPrepStart := time.Now()
-		keys, tombs := snapshot.GetAllWithTombstones()
 
-		// Critical check: if snapshot is empty after filtering expired keys, this is unusual
-		// because oldCount indicated we had entries but now we have nothing to flush
-		if len(keys) == 0 {
+		// Use iterator-based approach to avoid materializing all keys at once
+		it := snapshot.IterateWithTombstones()
+		buckets := make([][][]byte, parts)
+		btombs := make([][]bool, parts)
+		for i := range buckets {
+			buckets[i] = make([][]byte, 0, int(oldCount)/parts+1)
+			btombs[i] = make([]bool, 0, int(oldCount)/parts+1)
+		}
+
+		totalKeys := 0
+		// First pass: collect keys and partition by first byte
+		allKeys := make([][]byte, 0, oldCount)
+		allTombs := make([]bool, 0, oldCount)
+
+		for it.Next() {
+			key := it.Key()
+			// Make a copy since iterator may reuse the slice
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+
+			allKeys = append(allKeys, keyCopy)
+			allTombs = append(allTombs, it.IsTombstone())
+			totalKeys++
+
+			idx := 0
+			if len(keyCopy) > 0 {
+				idx = int(keyCopy[0]) * parts / 256
+				if idx >= parts {
+					idx = parts - 1
+				}
+			}
+			buckets[idx] = append(buckets[idx], keyCopy)
+			btombs[idx] = append(btombs[idx], it.IsTombstone())
+		}
+
+		// Critical check: if snapshot is empty after filtering expired keys
+		if totalKeys == 0 {
 			s.logger.Warn("flush completed with no keys after expiry filtering",
 				"original_count", oldCount,
 				"original_deleted", oldDeleted,
@@ -1738,23 +1931,6 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			return nil // Not an error - data naturally expired
 		}
 
-		buckets := make([][][]byte, parts)
-		btombs := make([][]bool, parts)
-		for i := range buckets {
-			buckets[i] = make([][]byte, 0, len(keys)/parts+1)
-			btombs[i] = make([]bool, 0, len(keys)/parts+1)
-		}
-		for i, k := range keys {
-			idx := 0
-			if len(k) > 0 {
-				idx = int(k[0]) * parts / 256
-				if idx >= parts {
-					idx = parts - 1
-				}
-			}
-			buckets[idx] = append(buckets[idx], k)
-			btombs[idx] = append(btombs[idx], tombs[i])
-		}
 		// count non-empty
 		nonEmpty := 0
 		for p := 0; p < parts; p++ {
@@ -1768,15 +1944,15 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 				buckets[i] = buckets[i][:0]
 				btombs[i] = btombs[i][:0]
 			}
-			for i, k := range keys {
+			for i, k := range allKeys {
 				h := fnv32(k)
 				idx := int(h % uint32(parts))
 				buckets[idx] = append(buckets[idx], k)
-				btombs[idx] = append(btombs[idx], tombs[i])
+				btombs[idx] = append(btombs[idx], allTombs[i])
 			}
 			s.logger.Info("flush using hash-based partitioning", "parts", parts)
 		}
-		s.logger.Info("flush stage: partitioning done", "parts", parts, "non_empty", nonEmpty, "duration", time.Since(partPrepStart), "total_keys", len(keys))
+		s.logger.Info("flush stage: partitioning done", "parts", parts, "non_empty", nonEmpty, "duration", time.Since(partPrepStart), "total_keys", totalKeys)
 		var wg sync.WaitGroup
 		for p := 0; p < parts; p++ {
 			if len(buckets[p]) == 0 {
@@ -1970,6 +2146,10 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			last := len(s.frozenSnaps) - 1
 			s.frozenSnaps[idx] = s.frozenSnaps[last]
 			s.frozenSnaps = s.frozenSnaps[:last]
+
+			// COW: Release snapshot now that it's no longer needed
+			// This allows memtable to reclaim memory from nodes no longer referenced
+			snapshot.Release()
 		}
 	}
 	s.mu.Unlock()
@@ -2130,30 +2310,27 @@ func (s *storeImpl) SetAutotunerEnabled(enabled bool) {
 func (s *storeImpl) replayWAL() error {
 	count := 0
 	err := s.wal.Replay(func(op uint8, key []byte, expiresAt time.Time) error {
+		mt := s.memtablePtr.Load()
+		if mt == nil {
+			return fmt.Errorf("memtable not initialized")
+		}
+
 		switch op {
 		case common.OpInsert:
 			if expiresAt.IsZero() || time.Now().Before(expiresAt) {
-				if mt := s.memtablePtr.Load(); mt != nil {
-					if expiresAt.IsZero() {
-						if err := mt.InsertWithTTL(key, 0); err != nil {
-							return err
-						}
-					} else {
-						if err := mt.InsertWithExpiry(key, expiresAt); err != nil {
-							return err
-						}
-					}
-				} else {
-					return fmt.Errorf("memtable not initialized")
+				// OPTIMIZATION: WAL already allocates a fresh key for each record,
+				// so we can use the zero-copy variant to avoid redundant copying.
+				if expiresAt.IsZero() {
+					expiresAt = time.Time{} // Ensure zero value
+				}
+				if err := mt.InsertWithExpiryNoCopy(key, expiresAt); err != nil {
+					return err
 				}
 			}
 		case common.OpDelete:
-			if mt := s.memtablePtr.Load(); mt != nil {
-				if err := mt.Delete(key); err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("memtable not initialized")
+			// OPTIMIZATION: Same reasoning - WAL provides fresh key, use zero-copy
+			if err := mt.DeleteNoCopy(key); err != nil {
+				return err
 			}
 		default:
 			s.logger.Warn("unknown operation in WAL", "op", op)
