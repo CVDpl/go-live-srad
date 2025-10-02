@@ -178,9 +178,12 @@ func NewLOUDSFromSortedKeys(keys [][]byte) *LOUDS {
 	louds.bits.Clear(1)
 	bitPos := uint64(2)
 
+	// Add root's label (node 1) - typically byte 0 or epsilon
+	louds.labels = append(louds.labels, 0)
+
 	// nodeIdx tracks CHILD nodes as we emit their labels
-	// Node 1 is root's first child, node 2 is second child, etc.
-	nodeIdx := uint64(1)
+	// Root is node 1, its children start at node 2
+	nodeIdx := uint64(2)
 
 	// Process level by level using BFS-style groups
 	cur = []group{{0, len(keys), 0}}
@@ -271,11 +274,20 @@ func (l *LOUDS) buildFromTrie(root *TrieNode) {
 	l.bits.Set(0)
 	l.bits.Clear(1)
 
+	// Add root's label (node 1)
+	l.labels = append(l.labels, root.Label)
+	if root.IsLeaf {
+		l.values = append(l.values, root.Value)
+	} else {
+		l.values = append(l.values, nil)
+	}
+
 	// BFS traversal
 	queue := []*TrieNode{root}
 	bitPos := uint64(2)
 	// LOUDS node indices are 1-based and follow children discovery order
-	nodeIdx := uint64(1)
+	// Root is node 1, its children start at node 2
+	nodeIdx := uint64(2)
 
 	for len(queue) > 0 {
 		node := queue[0]
@@ -314,18 +326,32 @@ func (l *LOUDS) FirstChild(i uint64) uint64 {
 		return 0
 	}
 
-	// First child position = rank0(select1(i+1)) + 1
-	nodeStart := l.rs.Select1(i + 1)
-	if nodeStart >= l.bits.Length() {
+	// Special case for super-root (node 0)
+	if i == 0 {
+		// Super-root's first child is always at bit position 0
+		if l.bits.Length() > 0 && l.bits.Get(0) {
+			// First child is node 1 (always)
+			return 1
+		}
+		return 0
+	}
+
+	// For other nodes: node i's children start after its separator (Select0(i))
+	// The first child (if any) is at position Select0(i) + 1
+	zeroPos := l.rs.Select0(i)
+	if zeroPos >= l.bits.Length() {
+		return 0 // No such node
+	}
+
+	// Check if there's at least one child (bit after the separator)
+	childBitPos := zeroPos + 1
+	if childBitPos >= l.bits.Length() || !l.bits.Get(childBitPos) {
 		return 0 // No children
 	}
 
-	// Check if there's at least one child
-	if !l.bits.Get(nodeStart + 1) {
-		return 0 // No children
-	}
-
-	return l.rs.Rank0(nodeStart + 1)
+	// The child node number is Rank1(childBitPos+1) (count of 1-bits up to and including this child)
+	// Rank1 counts 1-bits up to position (exclusive), so we need +1 to include the child bit
+	return l.rs.Rank1(childBitPos + 1)
 }
 
 // NextSibling returns the next sibling of node i.
@@ -334,10 +360,19 @@ func (l *LOUDS) NextSibling(i uint64) uint64 {
 		return 0
 	}
 
-	// Next sibling position = i + 1 if bit at select1(i+1)+1 is 1
-	nodePos := l.rs.Select1(i + 1)
-	if nodePos+1 >= l.bits.Length() || !l.bits.Get(nodePos+1) {
-		return 0 // No next sibling
+	// In LOUDS, node i is represented by the i-th 1-bit at position Select1(i)
+	// The next sibling (if any) is immediately after, at position Select1(i) + 1
+	// If the bit at Select1(i) + 1 is a 1, then there's a sibling (node i+1)
+	// If it's a 0, then this is the separator (no more siblings)
+	onePos := l.rs.Select1(i)
+	if onePos >= l.bits.Length() {
+		return 0
+	}
+
+	// Check if the next bit is a 1 (indicating a sibling)
+	nextBitPos := onePos + 1
+	if nextBitPos >= l.bits.Length() || !l.bits.Get(nextBitPos) {
+		return 0 // No next sibling (separator)
 	}
 
 	return i + 1
@@ -349,13 +384,16 @@ func (l *LOUDS) Parent(i uint64) uint64 {
 		return 0 // Root has no parent
 	}
 
-	// Parent position = rank1(select0(i))
-	zeroPos := l.rs.Select0(i)
-	if zeroPos >= l.bits.Length() {
+	// In LOUDS, node i is represented by the i-th 1-bit at position Select1(i)
+	// The parent of node i is the node whose children list contains this 1-bit
+	// We find the parent by counting the number of 0-bits (separators) before this node
+	// Parent position = Rank0(Select1(i))
+	onePos := l.rs.Select1(i)
+	if onePos >= l.bits.Length() {
 		return 0
 	}
 
-	return l.rs.Rank1(zeroPos)
+	return l.rs.Rank0(onePos)
 }
 
 // GetLabel returns the label of the edge to node i.
