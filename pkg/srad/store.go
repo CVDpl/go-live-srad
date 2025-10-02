@@ -167,7 +167,12 @@ type Options struct {
 
 	// Range-partitioned build (1 = disabled)
 	BuildRangePartitions int
-	// Build filters asynchronously after flush (may increase memory)
+	// AsyncFilterBuild enables background filter building after flush/compact.
+	// When true, filters (Bloom/Trigram) are built asynchronously in background,
+	// shortening the flush critical path. Queries remain correct but may scan more
+	// segments until filters are ready (typically < 1 second for most workloads).
+	// When false, filters are built inline during flush/compact (deterministic, but slower).
+	// Default: true (recommended for high-write workloads and bulk imports)
 	AsyncFilterBuild bool
 
 	// ForceTrieBuild forces building a trie even when input is sorted and
@@ -374,7 +379,7 @@ func DefaultOptions() *Options {
 		BuildShardMinKeys:           200000,
 		BloomAdaptiveMinKeys:        10000000,
 		BuildRangePartitions:        1,
-		AsyncFilterBuild:            false,
+		AsyncFilterBuild:            true, // Enable by default: faster flush, filters built in background
 		ForceTrieBuild:              false,
 		DisableLOUDSBuild:           false,
 		AutoDisableLOUDSMinKeys:     0,
