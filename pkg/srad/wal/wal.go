@@ -40,6 +40,10 @@ type WAL struct {
 	flushOnEveryWrite   bool
 	flushEveryBytes     int
 	bytesSinceLastFlush int
+
+	// Memory pooling for batch operations
+	batchBufferPool sync.Pool // Pool of []byte buffers for encoding
+	batchSlicePool  sync.Pool // Pool of [][]byte slices for batch data
 }
 
 // Config controls WAL sizing and buffering.
@@ -114,6 +118,22 @@ func NewWithConfig(dir string, logger common.Logger, cfg Config) (*WAL, error) {
 		syncOnEveryWrite:  cfg.SyncOnEveryWrite,
 		flushOnEveryWrite: cfg.FlushOnEveryWrite,
 		flushEveryBytes:   cfg.FlushEveryBytes,
+	}
+
+	// Initialize memory pools for batch operations
+	w.batchBufferPool = sync.Pool{
+		New: func() interface{} {
+			// Pre-allocate buffer for typical record size (~key + overhead)
+			buf := make([]byte, 0, 256)
+			return &buf
+		},
+	}
+	w.batchSlicePool = sync.Pool{
+		New: func() interface{} {
+			// Pre-allocate slice for typical batch size
+			s := make([][]byte, 0, 64)
+			return &s
+		},
 	}
 
 	// Find the latest WAL file or create a new one
@@ -280,11 +300,24 @@ func (w *WAL) WriteBatch(entries []*WALEntry) error {
 		return common.ErrClosed
 	}
 
-	var dataToWrite [][]byte
+	// Get pooled slice for batch data
+	dataToWritePtr := w.batchSlicePool.Get().(*[][]byte)
+	dataToWrite := (*dataToWritePtr)[:0] // Reset but keep capacity
+	defer func() {
+		// Return slice to pool
+		*dataToWritePtr = dataToWrite
+		w.batchSlicePool.Put(dataToWritePtr)
+	}()
+
 	var totalSize int64
+	var encodedBuffers []*[]byte // Track buffers to return to pool
 
 	for _, entry := range entries {
 		if len(entry.Key) > common.MaxKeySize {
+			// Return all buffers before erroring
+			for _, bufPtr := range encodedBuffers {
+				w.batchBufferPool.Put(bufPtr)
+			}
 			return common.ErrKeyTooLarge // Fail the whole batch on invalid entry
 		}
 
@@ -294,12 +327,30 @@ func (w *WAL) WriteBatch(entries []*WALEntry) error {
 			TTL: entry.TTL,
 		}
 
-		data, err := w.encodeRecord(record)
+		// Get pooled buffer
+		bufPtr := w.batchBufferPool.Get().(*[]byte)
+		encodedBuffers = append(encodedBuffers, bufPtr)
+
+		data, err := w.encodeRecordTo(record, *bufPtr)
 		if err != nil {
+			// Return all buffers before erroring
+			for _, bp := range encodedBuffers {
+				w.batchBufferPool.Put(bp)
+			}
 			return fmt.Errorf("encode WAL record: %w", err)
 		}
-		dataToWrite = append(dataToWrite, data)
-		totalSize += int64(len(data))
+
+		// Make a copy since we'll return the buffer to pool
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+
+		dataToWrite = append(dataToWrite, dataCopy)
+		totalSize += int64(len(dataCopy))
+	}
+
+	// Return all encoding buffers to pool now that we're done with them
+	for _, bufPtr := range encodedBuffers {
+		w.batchBufferPool.Put(bufPtr)
 	}
 
 	if w.currentSize+totalSize > w.rotateSize {
@@ -571,6 +622,45 @@ func (w *WAL) encodeRecord(record WALRecord) ([]byte, error) {
 	buf.Write(crcBuf)
 
 	return buf.Bytes(), nil
+}
+
+// encodeRecordTo encodes a WAL record into the provided byte buffer.
+// Returns the encoded data as a slice of the buffer.
+// This is a zero-allocation version for use with pooled buffers.
+func (w *WAL) encodeRecordTo(record WALRecord, buf []byte) ([]byte, error) {
+	// Reset buffer but keep capacity
+	buf = buf[:0]
+
+	// Write op as varint
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(record.Op))
+	buf = append(buf, tmp[:n]...)
+
+	// Write key length as varint
+	n = binary.PutUvarint(tmp[:], uint64(len(record.Key)))
+	buf = append(buf, tmp[:n]...)
+
+	// Write key
+	buf = append(buf, record.Key...)
+
+	// Write absolute expiry as int64 unix nanos (0 means none)
+	var abs int64
+	if record.TTL > 0 {
+		abs = time.Now().Add(record.TTL).UnixNano()
+	} else {
+		abs = 0
+	}
+	binary.LittleEndian.PutUint64(tmp[:8], uint64(abs))
+	buf = append(buf, tmp[:8]...)
+
+	// Compute CRC32C over the data so far
+	crc := utils.ComputeCRC32C(buf)
+
+	// Append CRC32C
+	binary.LittleEndian.PutUint32(tmp[:4], crc)
+	buf = append(buf, tmp[:4]...)
+
+	return buf, nil
 }
 
 // Replay replays all WAL files and calls the callback for each record.
