@@ -1673,35 +1673,71 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 
 	results := make(chan partResult, parts)
 
-	flushPlanStart := time.Now()
-
 	if parts == 1 {
 		// Single builder path (existing)
 		segID := atomic.AddUint64(&s.nextSegmentID, 1)
 		builder := segment.NewBuilder(segID, common.LevelL0, segmentsDir, s.logger)
 		cfgBuilder(builder)
 		s.logger.Info("flush plan: single-partition prepared", "segment_id", segID, "entries", oldCount)
+
+		addStart := time.Now()
 		if err := builder.AddFromMemtable(snapshot); err != nil {
+			s.logger.Error("failed to add memtable to builder", "segment_id", segID, "error", err)
 			// Rollback: reinsert snapshot into current memtable to avoid data loss
 			s.rollbackSnapshotIntoMemtable(snapshot)
 			return fmt.Errorf("add memtable to builder: %w", err)
 		}
 		addDone := time.Now()
-		s.logger.Info("flush stage: builder input added", "segment_id", segID, "duration", addDone.Sub(flushPlanStart))
-		buildStart := time.Now()
-		md, err := builder.BuildWithContext(ctx)
-		if err != nil {
-			s.rollbackSnapshotIntoMemtable(snapshot)
-			return fmt.Errorf("build segment: %w", err)
+		s.logger.Info("flush stage: builder input added", "segment_id", segID, "duration", addDone.Sub(addStart))
+
+		// Check if builder has any keys after adding from memtable
+		// This can happen if all entries were tombstones or expired
+		if len(snapshot.GetAll()) == 0 {
+			s.logger.Warn("flush completed with no keys to write (all expired or deleted)",
+				"segment_id", segID,
+				"original_count", oldCount,
+				"original_deleted", oldDeleted)
+			close(results)
+			// Don't return error - this is a valid case, just unusual
+			// Continue to let flush complete normally (no segments created, but that's OK)
+		} else {
+			buildStart := time.Now()
+			s.logger.Info("flush stage: starting build", "segment_id", segID)
+			md, err := builder.BuildWithContext(ctx)
+			if err != nil {
+				s.logger.Error("failed to build segment", "segment_id", segID, "error", err)
+				s.rollbackSnapshotIntoMemtable(snapshot)
+				return fmt.Errorf("build segment: %w", err)
+			}
+			s.logger.Info("flush stage: builder.Build completed", "segment_id", segID, "duration", time.Since(buildStart))
+			results <- partResult{id: segID, md: md, err: nil}
+			close(results)
 		}
-		s.logger.Info("flush stage: builder.Build completed", "segment_id", segID, "duration", time.Since(buildStart))
-		results <- partResult{id: segID, md: md, err: nil}
-		close(results)
 	} else {
 		// Range-partition snapshot by first byte (0..255). If it collapses to <=1 non-empty bucket,
 		// fallback to hash-based partitioning to ensure parallel build even for heavy shared prefixes.
 		partPrepStart := time.Now()
 		keys, tombs := snapshot.GetAllWithTombstones()
+
+		// Critical check: if snapshot is empty after filtering expired keys, this is unusual
+		// because oldCount indicated we had entries but now we have nothing to flush
+		if len(keys) == 0 {
+			s.logger.Warn("flush completed with no keys after expiry filtering",
+				"original_count", oldCount,
+				"original_deleted", oldDeleted,
+				"note", "All entries expired between flush start and snapshot creation")
+			// Don't rollback - data already expired naturally
+			// Still sync WAL to ensure any non-expired data in WAL is preserved
+			if s.wal != nil {
+				if err := s.wal.Sync(); err != nil {
+					s.logger.Error("failed to sync WAL after empty snapshot", "error", err)
+				}
+			}
+			// Don't prune WAL since no segments were written
+			s.lastFlushTime = time.Now()
+			return nil // Not an error - data naturally expired
+		}
+
 		buckets := make([][][]byte, parts)
 		btombs := make([][]bool, parts)
 		for i := range buckets {
@@ -1834,6 +1870,27 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			"note", "This indicates partition building is taking too long or goroutines are stuck")
 		s.rollbackSnapshotIntoMemtable(snapshot)
 		return fmt.Errorf("flush timeout: %w", ctx.Err())
+	}
+
+	// Critical check: if no segments were built, log this clearly
+	// This can happen if all entries were expired or deleted
+	if len(mds) == 0 {
+		s.logger.Warn("flush completed with no segments created",
+			"original_count", oldCount,
+			"original_deleted", oldDeleted,
+			"note", "This may indicate all entries expired or were tombstones. Data in WAL will be preserved.")
+
+		// Sync WAL to ensure data is preserved for potential recovery
+		if s.wal != nil {
+			if err := s.wal.Sync(); err != nil {
+				return fmt.Errorf("sync WAL after empty flush: %w", err)
+			}
+		}
+
+		// Don't prune WAL since no segments were written
+		s.lastFlushTime = time.Now()
+		s.logger.Info("empty flush completed - WAL preserved", "duration", time.Since(start))
+		return nil
 	}
 
 	// Prepare manifest entries for all segments first
