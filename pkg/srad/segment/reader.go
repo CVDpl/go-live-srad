@@ -378,8 +378,9 @@ func (r *Reader) loadKeys() error {
 					ok = false
 					break
 				}
-				k := make([]byte, kl)
-				copy(k, data[off:off+kl])
+				// Zero-copy: Return slice directly pointing to mmapped data
+				// This is safe as long as the mmap remains valid (reader lifecycle)
+				k := data[off : off+kl]
 				off += kl
 				keys = append(keys, k)
 			}
@@ -624,26 +625,35 @@ func (r *Reader) isExpiredKeyIndex(idx int) bool {
 }
 
 // Get retrieves a value by key.
+// Note: Currently uses binary search on keys array instead of LOUDS for reliability.
 func (r *Reader) Get(key []byte) ([]byte, bool) {
-	if r.louds == nil {
-		if err := r.loadLOUDS(); err != nil {
-			r.logger.Warn("failed to load LOUDS", "id", r.segmentID, "error", err)
+	if len(r.keys) == 0 {
+		if err := r.loadKeys(); err != nil {
+			r.logger.Warn("failed to load keys for Get", "id", r.segmentID, "error", err)
 			return nil, false
 		}
 	}
-	val, ok := r.louds.Search(key)
-	if !ok {
+
+	// Load expiries if not yet loaded
+	if len(r.expiries) == 0 && r.expFile != nil {
+		if err := r.loadExpiries(); err != nil {
+			r.logger.Warn("failed to load expiries for Get", "id", r.segmentID, "error", err)
+		}
+	}
+
+	// Binary search to find key
+	i := sort.Search(len(r.keys), func(i int) bool { return bytes.Compare(r.keys[i], key) >= 0 })
+	if i >= len(r.keys) || !bytes.Equal(r.keys[i], key) {
 		return nil, false
 	}
-	// If we have keys loaded, check expiry via index lookup
-	if len(r.keys) > 0 && len(r.expiries) == len(r.keys) {
-		// binary search to find index
-		i := sort.Search(len(r.keys), func(i int) bool { return bytes.Compare(r.keys[i], key) >= 0 })
-		if i < len(r.keys) && bytes.Equal(r.keys[i], key) && r.isExpiredKeyIndex(i) {
-			return nil, false
-		}
+
+	// Check expiry
+	if len(r.expiries) == len(r.keys) && r.isExpiredKeyIndex(i) {
+		return nil, false
 	}
-	return val, ok
+
+	// Return the key itself as value (self-referential storage)
+	return r.keys[i], true
 }
 
 // Contains checks if a key exists in the segment.
@@ -662,6 +672,10 @@ func (r *Reader) Iterator() *SegmentIterator {
 
 // RegexIterator returns an iterator for regex matching.
 func (r *Reader) RegexIterator(pattern *regexp.Regexp) *SegmentIterator {
+	// Load LOUDS for efficient iteration
+	if r.louds == nil {
+		_ = r.loadLOUDS()
+	}
 	// Ensure tombstones are loaded before iteration to suppress deleted keys
 	if r.tombstoneSet == nil && r.tombFile != nil {
 		_ = r.loadTombstones()
@@ -717,8 +731,23 @@ func (r *Reader) MayContain(pattern *regexp.Regexp) bool {
 	if r == nil || pattern == nil {
 		return true
 	}
-	lit, _ := pattern.LiteralPrefix()
-	if lit != "" && r.bloom != nil {
+
+	// Extract literal prefix for filter checks
+	lit, complete := pattern.LiteralPrefix()
+	if lit == "" {
+		// No literal prefix - can't use filters
+		return true
+	}
+
+	// For regex patterns (not complete literals), be more conservative with filters
+	// Only use filters if we have a substantial literal prefix
+	if !complete && len(lit) < 3 {
+		// Too short prefix for reliable filtering
+		return true
+	}
+
+	// Use Bloom filter if available
+	if r.bloom != nil {
 		b := []byte(lit)
 		if len(b) <= 16 {
 			if !r.bloom.Contains(b) {
@@ -731,16 +760,12 @@ func (r *Reader) MayContain(pattern *regexp.Regexp) bool {
 			}
 		}
 	}
-	if r.trigram == nil {
-		return true
+
+	// Use trigram filter if available
+	if r.trigram != nil && len(lit) >= 3 {
+		return r.trigram.MayContainLiteral([]byte(lit))
 	}
-	if lit != "" {
-		// For pruning we only need 3+ bytes literal for trigram
-		b := []byte(lit)
-		if len(b) >= 3 {
-			return r.trigram.MayContainLiteral(b)
-		}
-	}
+
 	return true
 }
 
@@ -777,24 +802,90 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 	if len(r.expiries) == 0 && r.expFile != nil {
 		_ = r.loadExpiries()
 	}
+
+	// Batch decode: read large chunks and parse in userspace
+	const chunkSize = 256 * 1024 // 256KB chunks for batching
+	chunk := make([]byte, chunkSize)
+	chunkPos := 0
+	chunkLen := 0
 	var i uint32
+
 	adv := func() ([]byte, bool) {
 		for i < count {
-			var kl uint32
-			if err := binary.Read(br, binary.LittleEndian, &kl); err != nil {
-				closeFunc()
-				return nil, false
-			}
-			var k []byte
-			if kl > 0 {
-				k = make([]byte, kl)
-				if _, err := io.ReadFull(br, k); err != nil {
+			// Refill chunk if we don't have enough bytes for even a length prefix
+			if chunkPos+4 > chunkLen {
+				// Copy remaining bytes to start of buffer
+				remaining := chunkLen - chunkPos
+				if remaining > 0 {
+					copy(chunk[0:remaining], chunk[chunkPos:chunkLen])
+				}
+				chunkPos = 0
+				chunkLen = remaining
+
+				// Read more data
+				n, err := br.Read(chunk[chunkLen:])
+				if err != nil && err != io.EOF {
+					closeFunc()
+					return nil, false
+				}
+				chunkLen += n
+
+				if chunkLen < 4 {
+					// Not enough data even for length prefix
 					closeFunc()
 					return nil, false
 				}
 			}
+
+			// Read key length from chunk
+			kl := binary.LittleEndian.Uint32(chunk[chunkPos : chunkPos+4])
+			chunkPos += 4
+
+			// Check if we have the full key in the chunk
+			if chunkPos+int(kl) > chunkLen {
+				// Need to refill - rewind to start of this key
+				chunkPos -= 4
+
+				// Copy remaining bytes to start
+				remaining := chunkLen - chunkPos
+				copy(chunk[0:remaining], chunk[chunkPos:chunkLen])
+				chunkPos = 0
+				chunkLen = remaining
+
+				// Read more data
+				n, err := br.Read(chunk[chunkLen:])
+				if err != nil && err != io.EOF {
+					closeFunc()
+					return nil, false
+				}
+				chunkLen += n
+
+				// Re-read length
+				if chunkLen < 4 {
+					closeFunc()
+					return nil, false
+				}
+				kl = binary.LittleEndian.Uint32(chunk[chunkPos : chunkPos+4])
+				chunkPos += 4
+
+				if chunkPos+int(kl) > chunkLen {
+					// Key is too large for our chunk or incomplete
+					closeFunc()
+					return nil, false
+				}
+			}
+
+			// Extract key from chunk
+			var k []byte
+			if kl > 0 {
+				k = make([]byte, kl)
+				copy(k, chunk[chunkPos:chunkPos+int(kl)])
+			}
+			chunkPos += int(kl)
+
 			idx := int(i)
 			i++
+
 			// Filter expired using aligned expiry index when available
 			if idx < len(r.expiries) && r.isExpiredKeyIndex(idx) {
 				continue
@@ -880,14 +971,15 @@ type SegmentIterator struct {
 	keysIndex int
 
 	// Streaming fallback over keys.dat (preferred): mmap or buffered file
-	streamInit   bool
-	usingMmap    bool
-	mmapData     []byte
-	mmapOff      int
-	keysCount    uint32
-	keysRead     uint32
-	streamFile   *os.File
-	streamReader *bufio.Reader
+	loudsFinished bool // Set to true when LOUDS iteration completes
+	streamInit    bool
+	usingMmap     bool
+	mmapData      []byte
+	mmapOff       int
+	keysCount     uint32
+	keysRead      uint32
+	streamFile    *os.File
+	streamReader  *bufio.Reader
 }
 
 type iteratorState struct {
@@ -918,7 +1010,7 @@ func (it *SegmentIterator) Next() bool {
 	}
 
 	// LOUDS-based DFS
-	if it.reader.louds != nil && it.reader.louds.NumNodes() > 0 {
+	if it.reader.louds != nil && it.reader.louds.NumNodes() > 0 && !it.loudsFinished {
 		if it.pattern != nil && it.eng == nil {
 			if lit, complete := it.pattern.LiteralPrefix(); lit != "" {
 				it.literal = []byte(lit)
@@ -1005,6 +1097,10 @@ func (it *SegmentIterator) Next() bool {
 				it.stack = append(it.stack, children[i])
 			}
 		}
+		// If we exhausted LOUDS tree, don't fall through to streaming
+		// (LOUDS is the primary iteration method when available)
+		it.loudsFinished = true
+		return false
 	}
 
 	// Fallback to keys: prefer streaming over keys.dat to avoid loading all keys into memory
@@ -1084,6 +1180,8 @@ func (it *SegmentIterator) Next() bool {
 				return true
 			}
 		}
+		// After mmap streaming finishes, don't fall through to legacy fallback
+		return false
 	}
 
 	// Streaming via buffered file
@@ -1116,6 +1214,8 @@ func (it *SegmentIterator) Next() bool {
 				return true
 			}
 		}
+		// After buffered streaming finishes, don't fall through to legacy fallback
+		return false
 	}
 
 	// Legacy in-memory fallback if keys were loaded elsewhere

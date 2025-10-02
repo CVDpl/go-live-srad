@@ -115,30 +115,21 @@ func (b *Builder) DropAllTombstones() { b.dropTombstones = true }
 
 // AddFromMemtable adds all entries from a memtable snapshot.
 func (b *Builder) AddFromMemtable(snapshot *memtable.Snapshot) error {
-	// Get all keys with tombstone flags and expiries
-	allKeys, tombs, exps := snapshot.GetAllWithMeta()
-	// Keep pairs aligned while sorting
-	pairs := make([]pair, len(allKeys))
-	for i := range allKeys {
-		pairs[i] = pair{k: allKeys[i], t: tombs[i], e: exps[i]}
-	}
-	sort.Slice(pairs, func(i, j int) bool { return bytes.Compare(pairs[i].k, pairs[j].k) < 0 })
+	// Use GetAllWithExpiry() to get keys with tombstone flags and expiry timestamps
+	keys, tombs, expiries := snapshot.GetAllWithExpiry()
 
-	// Input is now sorted; allow Build() to skip resort/dedup
-	b.alreadySorted = true
-
-	// Add entries: drop tombstones from values, but record keys for future policies
-	for _, p := range pairs {
-		if p.t {
-			kc := make([]byte, len(p.k))
-			copy(kc, p.k)
-			b.tombstoneKeys = append(b.tombstoneKeys, kc)
+	for i, k := range keys {
+		if tombs[i] {
+			b.tombstoneKeys = append(b.tombstoneKeys, k)
 			continue
 		}
-		if err := b.AddWithExpiry(p.k, p.k, p.e, false); err != nil {
+		if err := b.AddWithExpiry(k, k, expiries[i], false); err != nil {
 			return err
 		}
 	}
+
+	// Input is already sorted by GetAllWithExpiry (Patricia trie traversal is in-order)
+	b.alreadySorted = true
 
 	return nil
 }
@@ -385,7 +376,8 @@ func (b *Builder) BuildWithContext(ctx context.Context) (*Metadata, error) {
 	stepStart := time.Now()
 
 	var trie *trieNode
-	if b.alreadySorted && !b.forceTrie {
+	// Force trie build to avoid streaming LOUDS issues
+	if false && b.alreadySorted && !b.forceTrie {
 		b.logger.Info("trie build skipped (streaming LOUDS)", "id", b.segmentID, "keys", len(b.keys))
 	} else {
 		// Build trie structure (simplified for now)
@@ -853,6 +845,7 @@ func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
 
 	// Build LOUDS without Rank/Select to speed up flush; readers will rebuild RS
 	var louds *encoding.LOUDS
+	// Use streaming LOUDS builder when possible (faster for sorted keys)
 	if b.alreadySorted {
 		// Prefer streaming LOUDS builder from sorted keys (fast path)
 		louds = encoding.NewLOUDSFromSortedKeys(b.keys)
