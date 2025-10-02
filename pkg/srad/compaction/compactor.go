@@ -419,12 +419,36 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		return []*segment.Reader{}, nil
 	}
 
+	// CRITICAL: Create readers BEFORE manifest update to ensure files exist and prevent RCU race condition
+	// This holds file handles open, preventing RCU cleanup from removing segments while we're adding them to manifest
+	newReaders := make([]*segment.Reader, 0, len(outputs))
+	for _, outID := range outputs {
+		reader, err := segment.NewReader(outID, segmentsDir, c.logger, true) // Verify checksums on new segments
+		if err != nil {
+			// Clean up already created readers
+			for _, r := range newReaders {
+				r.Close()
+			}
+			// Also clean up segment files since we can't use them
+			for _, segID := range outputs {
+				segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID))
+				_ = os.RemoveAll(segmentPath)
+			}
+			return nil, fmt.Errorf("failed to open new segment reader %d: %w", outID, err)
+		}
+		newReaders = append(newReaders, reader)
+	}
+
 	// ATOMIC COMPACTION UPDATE: Add all new segments and remove old ones atomically
 	c.logger.Info("performing atomic compaction manifest update", "new_segments", len(pendingSegmentInfos), "removing_segments", len(inputIDs))
 
 	// Add new segments first
 	if err := c.manifest.AddSegments(pendingSegmentInfos); err != nil {
-		c.logger.Error("failed to add new segments to manifest - cleaning up segment files", "error", err)
+		c.logger.Error("failed to add new segments to manifest - cleaning up readers and segment files", "error", err)
+		// Close readers first
+		for _, r := range newReaders {
+			r.Close()
+		}
 		// Clean up segment files since manifest update failed
 		cleanupFailed := 0
 		for _, segID := range outputs {
@@ -447,6 +471,7 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		c.logger.Error("failed to remove old segments from manifest after adding new ones", "error", err, "new_segments", outputs, "old_segments", inputIDs)
 		// This is a problematic state, new segments exist and old ones are not marked for deletion.
 		// Log extensively for recovery purposes but continue - the system is still functional
+		// Don't close readers - they're still needed
 		return nil, fmt.Errorf("remove old segments from manifest: %w", err)
 	}
 
@@ -466,20 +491,6 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 	c.logger.Info("atomic compaction manifest update completed", "new_segments", len(outputs), "removed_segments", len(inputIDs))
 
 	c.logger.Info("compaction completed", "reason", plan.Reason, "duration", time.Since(startTime), "outputs", len(outputs))
-
-	// Create readers for the new segments
-	newReaders := make([]*segment.Reader, 0, len(outputs))
-	for _, outID := range outputs {
-		reader, err := segment.NewReader(outID, segmentsDir, c.logger, true) // Verify checksums on new segments
-		if err != nil {
-			// Clean up already created readers
-			for _, r := range newReaders {
-				r.Close()
-			}
-			return nil, fmt.Errorf("failed to open new segment reader %d: %w", outID, err)
-		}
-		newReaders = append(newReaders, reader)
-	}
 
 	return newReaders, nil
 }
