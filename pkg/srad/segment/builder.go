@@ -537,11 +537,10 @@ func (b *Builder) BuildWithContext(ctx context.Context) (*Metadata, error) {
 		return nil, fmt.Errorf("save metadata: %w", err)
 	}
 
-	// Build completed successfully – remove BUILDING sentinel
-	if err := os.Remove(buildingPath); err != nil {
-		b.logger.Warn("failed to remove .building sentinel", "id", b.segmentID, "path", buildingPath, "error", err)
-		// Non-fatal: segment is complete, sentinel just prevents RCU cleanup for a bit longer
-	}
+	// NOTE: Do NOT remove .building sentinel here!
+	// It protects against RCU cleanup until the segment is added to manifest.
+	// The caller (compaction/flush) is responsible for removing .building after manifest update.
+	// This prevents race condition where RCU deletes segment between Build() and manifest add.
 
 	b.logger.Info("segment built successfully", "id", b.segmentID)
 

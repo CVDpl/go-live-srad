@@ -497,6 +497,15 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 
 	c.logger.Info("atomic compaction manifest update completed", "new_segments", len(outputs), "removed_segments", len(inputIDs))
 
+	// Remove .building sentinels now that segments are safely in manifest
+	for _, segID := range outputs {
+		buildingPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID), ".building")
+		if err := os.Remove(buildingPath); err != nil && !os.IsNotExist(err) {
+			c.logger.Warn("failed to remove .building sentinel after manifest update", "id", segID, "error", err)
+			// Non-fatal: sentinel will eventually be cleaned up by RCU after grace period
+		}
+	}
+
 	c.logger.Info("compaction completed", "reason", plan.Reason, "duration", time.Since(startTime), "outputs", len(outputs))
 
 	return newReaders, nil

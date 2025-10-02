@@ -2120,6 +2120,15 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 			return fmt.Errorf("atomic manifest update failed: %w", err)
 		}
 		s.logger.Info("atomic manifest update succeeded", "segments", len(manifestInfos))
+
+		// Remove .building sentinels now that segments are safely in manifest
+		for _, md := range mds {
+			buildingPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", md.SegmentID), ".building")
+			if err := os.Remove(buildingPath); err != nil && !os.IsNotExist(err) {
+				s.logger.Warn("failed to remove .building sentinel after manifest update", "id", md.SegmentID, "error", err)
+				// Non-fatal: sentinel will eventually be cleaned up by RCU after grace period
+			}
+		}
 	}
 
 	// Update in-memory state after successful manifest update
