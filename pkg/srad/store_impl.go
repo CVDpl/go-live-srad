@@ -90,6 +90,7 @@ type storeImpl struct {
 	nextSegmentID uint64
 	segments      []*segment.Metadata
 	readers       []*segment.Reader
+	readersMap    map[uint64]*segment.Reader // Track readers by segmentID for RCU refcount checks
 	manifest      *manifest.Manifest
 	compactor     *compaction.Compactor
 
@@ -182,6 +183,7 @@ func Open(dir string, opts *Options) (Store, error) {
 		rcuEnabled:       opts.EnableRCU,
 		stats:            NewStatsCollector(),
 		memPool:          NewMemoryPool(),
+		readersMap:       make(map[uint64]*segment.Reader),
 	}
 
 	// Initialize WAL if not read-only
@@ -1740,8 +1742,14 @@ func (s *storeImpl) PurgeObsoleteSegments() error {
 		if _, err := os.Stat(filepath.Join(segmentsDir, name, "segment.json")); err != nil {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(segmentsDir, name))
-		s.logger.Info("purged obsolete segment dir", "name", name)
+		segPath := filepath.Join(segmentsDir, name)
+		if err := os.RemoveAll(segPath); err != nil {
+			s.logger.Warn("failed to purge obsolete segment dir", "name", name, "error", err)
+			atomic.AddUint64(&s.stats.CleanupFailures, 1)
+		} else {
+			s.logger.Info("purged obsolete segment dir", "name", name)
+			atomic.AddUint64(&s.stats.SegmentsDeleted, 1)
+		}
 	}
 	return nil
 }
@@ -2122,6 +2130,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 		reader, rerr := segment.NewReader(md.SegmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
 		if rerr == nil {
 			s.readers = append(s.readers, reader)
+			s.readersMap[md.SegmentID] = reader // Track for RCU refcount checks
 		} else {
 			s.logger.Warn("failed to open reader for new segment", "id", md.SegmentID, "error", rerr)
 		}
@@ -2262,10 +2271,33 @@ func (s *storeImpl) rcuCleanupOnce() {
 		if _, ok := activeIDs[segID]; ok {
 			continue
 		}
+
+		// CRITICAL: Check refcount before deletion to prevent race conditions
+		s.mu.RLock()
+		reader, hasReader := s.readersMap[segID]
+		s.mu.RUnlock()
+
+		if hasReader && reader != nil {
+			refcount := reader.GetRefcount()
+			if refcount > 0 {
+				s.logger.Debug("rcu skipping segment with active refcount", "id", segID, "refcount", refcount)
+				continue
+			}
+			// Refcount is 0, safe to delete - remove from map
+			s.mu.Lock()
+			delete(s.readersMap, segID)
+			s.mu.Unlock()
+		}
+
 		if info, err := os.Stat(segPath); err == nil {
 			if info.ModTime().Unix() < cutoff {
-				_ = os.RemoveAll(segPath)
-				s.logger.Info("rcu removed obsolete segment dir", "id", segID)
+				if err := os.RemoveAll(segPath); err != nil {
+					s.logger.Warn("rcu failed to remove segment dir", "id", segID, "error", err)
+					atomic.AddUint64(&s.stats.CleanupFailures, 1)
+				} else {
+					s.logger.Info("rcu removed obsolete segment dir", "id", segID)
+					atomic.AddUint64(&s.stats.SegmentsDeleted, 1)
+				}
 			}
 		}
 	}
@@ -2541,10 +2573,18 @@ func (s *storeImpl) stopBackgroundTasks() {
 
 	// Close open segment readers
 	s.mu.Lock()
+	closeFailed := 0
 	for _, r := range s.readers {
-		_ = r.Close()
+		if err := r.Close(); err != nil {
+			s.logger.Warn("failed to close segment reader during shutdown", "id", r.GetSegmentID(), "error", err)
+			closeFailed++
+		}
+	}
+	if closeFailed > 0 {
+		s.logger.Warn("some segment readers failed to close", "failed", closeFailed)
 	}
 	s.readers = nil
+	s.readersMap = make(map[uint64]*segment.Reader) // Clear readersMap
 	s.mu.Unlock()
 }
 
@@ -2951,11 +2991,38 @@ func (s *storeImpl) rcuCleanupTask() {
 				if _, ok := activeIDs[segID]; ok {
 					continue
 				}
+
+				// CRITICAL: Check refcount before deletion to prevent race conditions
+				// If a reader exists with refcount > 0, segment is still in use (e.g., during compaction)
+				s.mu.RLock()
+				reader, hasReader := s.readersMap[segID]
+				s.mu.RUnlock()
+
+				if hasReader && reader != nil {
+					// Check refcount atomically
+					refcount := reader.GetRefcount()
+					if refcount > 0 {
+						// Segment is still in use by active queries or operations
+						s.logger.Debug("rcu skipping segment with active refcount", "id", segID, "refcount", refcount)
+						continue
+					}
+					// Refcount is 0, safe to proceed with deletion
+					// Remove from readersMap first
+					s.mu.Lock()
+					delete(s.readersMap, segID)
+					s.mu.Unlock()
+				}
+
 				// Check dir mtime as proxy for age
 				if info, err := os.Stat(segPath); err == nil {
 					if info.ModTime().Unix() < cutoff {
-						_ = os.RemoveAll(segPath)
-						s.logger.Info("rcu removed obsolete segment dir", "id", segID)
+						if err := os.RemoveAll(segPath); err != nil {
+							s.logger.Warn("rcu failed to remove segment dir", "id", segID, "error", err)
+							atomic.AddUint64(&s.stats.CleanupFailures, 1)
+						} else {
+							s.logger.Info("rcu removed obsolete segment dir", "id", segID)
+							atomic.AddUint64(&s.stats.SegmentsDeleted, 1)
+						}
 					}
 				}
 			}
@@ -2986,6 +3053,7 @@ func (s *storeImpl) loadSegments() error {
 			}
 			s.segments = append(s.segments, metadata)
 			s.readers = append(s.readers, reader)
+			s.readersMap[segmentID] = reader // Track for RCU refcount checks
 			if segmentID >= s.nextSegmentID {
 				s.nextSegmentID = segmentID + 1
 			}
@@ -3034,6 +3102,7 @@ func (s *storeImpl) loadSegments() error {
 
 		s.segments = append(s.segments, metadata)
 		s.readers = append(s.readers, reader)
+		s.readersMap[segmentID] = reader // Track for RCU refcount checks
 
 		// Update next segment ID
 		if segmentID >= s.nextSegmentID {

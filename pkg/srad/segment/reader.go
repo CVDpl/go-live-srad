@@ -88,6 +88,11 @@ func (r *Reader) DecRef() {
 	r.Release()
 }
 
+// GetRefcount returns the current reference count (for RCU debugging/monitoring).
+func (r *Reader) GetRefcount() int32 {
+	return atomic.LoadInt32(&r.refcnt)
+}
+
 // Release decrements refcount and closes resources when it reaches zero.
 // Uses atomic compare-and-swap to prevent race conditions.
 func (r *Reader) Release() {
@@ -134,11 +139,15 @@ func (r *Reader) internalClose() {
 	}
 	// Unmap both mmap regions to prevent memory leak
 	if r.mmap != nil {
-		_ = unix.Munmap(r.mmap)
+		if err := unix.Munmap(r.mmap); err != nil {
+			r.logger.Warn("failed to munmap segment data", "id", r.segmentID, "error", err)
+		}
 		r.mmap = nil
 	}
 	if r.keysMap != nil {
-		_ = unix.Munmap(r.keysMap)
+		if err := unix.Munmap(r.keysMap); err != nil {
+			r.logger.Warn("failed to munmap keys data", "id", r.segmentID, "error", err)
+		}
 		r.keysMap = nil
 	}
 }
@@ -654,12 +663,6 @@ func (r *Reader) Get(key []byte) ([]byte, bool) {
 
 	// Return the key itself as value (self-referential storage)
 	return r.keys[i], true
-}
-
-// Contains checks if a key exists in the segment.
-func (r *Reader) Contains(key []byte) bool {
-	_, found := r.Get(key)
-	return found
 }
 
 // Iterator returns an iterator for the segment.

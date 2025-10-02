@@ -331,6 +331,15 @@ type Stats struct {
 
 	// ManifestGeneration is the current manifest generation.
 	ManifestGeneration uint64
+
+	// CleanupFailures is the number of failed cleanup operations.
+	CleanupFailures uint64
+
+	// SegmentsDeleted is the number of successfully deleted segments.
+	SegmentsDeleted uint64
+
+	// WALDeleteFailed is the number of failed WAL file deletions.
+	WALDeleteFailed uint64
 }
 
 // TuningParams contains tunable parameters.

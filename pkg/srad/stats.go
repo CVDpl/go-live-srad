@@ -42,6 +42,11 @@ type StatsCollector struct {
 	trigramChecks     uint64
 	trigramSkips      uint64
 
+	// Cleanup statistics
+	CleanupFailures uint64 // Failed os.RemoveAll operations
+	SegmentsDeleted uint64 // Successfully deleted segments
+	WALDeleteFailed uint64 // Failed WAL file deletions
+
 	// Level statistics
 	levelSizes    map[int]int64
 	segmentCounts map[int]int
@@ -213,6 +218,9 @@ func (sc *StatsCollector) GetStats() Stats {
 		PrefixBloomFPR:          bloomFPR,
 		TrigramSkipRatio:        trigramSkipRatio,
 		ManifestGeneration:      atomic.LoadUint64(&sc.manifestGen),
+		CleanupFailures:         atomic.LoadUint64(&sc.CleanupFailures),
+		SegmentsDeleted:         atomic.LoadUint64(&sc.SegmentsDeleted),
+		WALDeleteFailed:         atomic.LoadUint64(&sc.WALDeleteFailed),
 	}
 }
 

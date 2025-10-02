@@ -430,9 +430,16 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 				r.Close()
 			}
 			// Also clean up segment files since we can't use them
+			cleanupFailed := 0
 			for _, segID := range outputs {
 				segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID))
-				_ = os.RemoveAll(segmentPath)
+				if err := os.RemoveAll(segmentPath); err != nil {
+					c.logger.Warn("failed to cleanup segment after reader open failure", "id", segID, "error", err)
+					cleanupFailed++
+				}
+			}
+			if cleanupFailed > 0 {
+				c.logger.Warn("some segments failed to cleanup", "failed", cleanupFailed)
 			}
 			return nil, fmt.Errorf("failed to open new segment reader %d: %w", outID, err)
 		}
