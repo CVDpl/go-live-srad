@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -2673,12 +2674,23 @@ func (s *storeImpl) compactionTask() {
 
 			if s.manifest != nil {
 				active := s.manifest.GetActiveSegments()
+				var missingSegmentIDs []uint64
 				for _, seg := range active {
 					segmentID := seg.ID
 					// Load segment metadata
 					metadataPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segmentID), "segment.json")
 					metadata, err := segment.LoadFromFile(metadataPath)
 					if err != nil {
+						// Self-healing: if segment is missing, remove from manifest
+						if errors.Is(err, os.ErrNotExist) {
+							s.logger.Warn("segment missing during reload, will remove from manifest",
+								"segment_id", segmentID,
+								"path", metadataPath,
+								"error", err,
+							)
+							missingSegmentIDs = append(missingSegmentIDs, segmentID)
+							continue
+						}
 						s.logger.Warn("failed to load segment metadata during reload", "id", segmentID, "error", err)
 						// Cleanup already loaded readers before continuing
 						for _, r := range newReaders {
@@ -2691,6 +2703,15 @@ func (s *storeImpl) compactionTask() {
 					}
 					reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
 					if err != nil {
+						// Self-healing: if segment is missing, remove from manifest
+						if errors.Is(err, os.ErrNotExist) {
+							s.logger.Warn("segment missing during reload, will remove from manifest",
+								"segment_id", segmentID,
+								"error", err,
+							)
+							missingSegmentIDs = append(missingSegmentIDs, segmentID)
+							continue
+						}
 						s.logger.Warn("failed to create segment reader during reload", "id", segmentID, "error", err)
 						// Cleanup already loaded readers before continuing
 						for _, r := range newReaders {
@@ -2703,6 +2724,23 @@ func (s *storeImpl) compactionTask() {
 					}
 					newSegments = append(newSegments, metadata)
 					newReaders = append(newReaders, reader)
+				}
+
+				// Remove missing segments from manifest
+				if len(missingSegmentIDs) > 0 {
+					s.logger.Info("removing missing segments from manifest during reload",
+						"count", len(missingSegmentIDs),
+						"segment_ids", missingSegmentIDs,
+					)
+					if err := s.manifest.RemoveSegments(missingSegmentIDs); err != nil {
+						s.logger.Error("failed to remove missing segments from manifest during reload",
+							"error", err,
+							"segment_ids", missingSegmentIDs,
+						)
+						// Don't fail the reload - we can continue with loaded segments
+					} else {
+						s.logger.Info("successfully removed missing segments from manifest", "count", len(missingSegmentIDs))
+					}
 				}
 			}
 
@@ -3055,17 +3093,37 @@ func (s *storeImpl) loadSegments() error {
 	// Prefer manifest listing when available
 	if s.manifest != nil {
 		active := s.manifest.GetActiveSegments()
+		var missingSegmentIDs []uint64
 		for _, seg := range active {
 			segmentID := seg.ID
 			// Load segment metadata
 			metadataPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segmentID), "segment.json")
 			metadata, err := segment.LoadFromFile(metadataPath)
 			if err != nil {
+				// Self-healing: if segment is missing, remove from manifest
+				if errors.Is(err, os.ErrNotExist) {
+					s.logger.Warn("segment missing during initial load, will remove from manifest",
+						"segment_id", segmentID,
+						"path", metadataPath,
+						"error", err,
+					)
+					missingSegmentIDs = append(missingSegmentIDs, segmentID)
+					continue
+				}
 				s.logger.Warn("failed to load segment metadata", "id", segmentID, "error", err)
 				continue
 			}
 			reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
 			if err != nil {
+				// Self-healing: if segment is missing, remove from manifest
+				if errors.Is(err, os.ErrNotExist) {
+					s.logger.Warn("segment missing during initial load, will remove from manifest",
+						"segment_id", segmentID,
+						"error", err,
+					)
+					missingSegmentIDs = append(missingSegmentIDs, segmentID)
+					continue
+				}
 				s.logger.Warn("failed to create segment reader", "id", segmentID, "error", err)
 				continue
 			}
@@ -3076,6 +3134,24 @@ func (s *storeImpl) loadSegments() error {
 				s.nextSegmentID = segmentID + 1
 			}
 		}
+
+		// Remove missing segments from manifest
+		if len(missingSegmentIDs) > 0 {
+			s.logger.Info("removing missing segments from manifest during initial load",
+				"count", len(missingSegmentIDs),
+				"segment_ids", missingSegmentIDs,
+			)
+			if err := s.manifest.RemoveSegments(missingSegmentIDs); err != nil {
+				s.logger.Error("failed to remove missing segments from manifest during initial load",
+					"error", err,
+					"segment_ids", missingSegmentIDs,
+				)
+				// Don't fail the load - we can continue with loaded segments
+			} else {
+				s.logger.Info("successfully removed missing segments from manifest during initial load", "count", len(missingSegmentIDs))
+			}
+		}
+
 		s.logger.Info("loaded segments", "count", len(s.segments))
 		return nil
 	}
