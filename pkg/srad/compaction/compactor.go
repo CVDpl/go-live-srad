@@ -175,10 +175,21 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 
 	segmentsDir := filepath.Join(c.dir, common.DirSegments)
 	var readers []*segment.Reader
+	var missingSegments []uint64
 	for _, segID := range inputIDs {
 		// false for checksum verification, assuming it's already been checked on load
 		reader, err := segment.NewReader(segID, segmentsDir, c.logger, false)
 		if err != nil {
+			// Check if segment file is missing (self-healing)
+			if os.IsNotExist(err) {
+				c.logger.Warn("segment missing from disk, will remove from manifest",
+					"segment_id", segID,
+					"path", filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID)),
+					"error", err,
+				)
+				missingSegments = append(missingSegments, segID)
+				continue
+			}
 			// Clean up already opened readers
 			for _, r := range readers {
 				r.Close()
@@ -186,6 +197,34 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 			return nil, fmt.Errorf("failed to open segment reader for %d: %w", segID, err)
 		}
 		readers = append(readers, reader)
+	}
+
+	// Self-healing: remove missing segments from manifest
+	if len(missingSegments) > 0 {
+		c.logger.Info("removing missing segments from manifest",
+			"count", len(missingSegments),
+			"segment_ids", missingSegments,
+		)
+		if err := c.manifest.RemoveSegments(missingSegments); err != nil {
+			c.logger.Error("failed to remove missing segments from manifest",
+				"error", err,
+				"segment_ids", missingSegments,
+			)
+			// Clean up opened readers before returning
+			for _, r := range readers {
+				r.Close()
+			}
+			return nil, fmt.Errorf("failed to remove missing segments from manifest: %w", err)
+		}
+		c.logger.Info("successfully removed missing segments from manifest", "count", len(missingSegments))
+
+		// If all segments were missing, return early (no compaction possible)
+		if len(readers) == 0 {
+			c.logger.Info("all input segments were missing, no compaction performed")
+			return []*segment.Reader{}, nil
+		}
+		// Otherwise continue with available segments
+		c.logger.Info("continuing compaction with remaining segments", "available", len(readers), "missing", len(missingSegments))
 	}
 	defer func() {
 		for _, r := range readers {
