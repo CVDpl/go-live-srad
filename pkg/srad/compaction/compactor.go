@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -181,7 +182,8 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 		reader, err := segment.NewReader(segID, segmentsDir, c.logger, false)
 		if err != nil {
 			// Check if segment file is missing (self-healing)
-			if os.IsNotExist(err) {
+			// Use errors.Is to handle wrapped errors properly
+			if errors.Is(err, os.ErrNotExist) {
 				c.logger.Warn("segment missing from disk, will remove from manifest",
 					"segment_id", segID,
 					"path", filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID)),
