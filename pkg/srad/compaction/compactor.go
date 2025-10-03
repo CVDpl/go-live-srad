@@ -261,7 +261,8 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		}
 		md, err := cur.builder.BuildWithContext(ctx)
 		if err != nil {
-			return fmt.Errorf("build segment: %w", err)
+			return fmt.Errorf("build segment %d (keys=%d, bytes=%d): %w",
+				cur.id, cur.acceptedCount, cur.approxBytes, err)
 		}
 		info := manifest.SegmentInfo{ID: cur.id, Level: targetLevel, NumKeys: md.Counts.Accepted}
 		if minb, err := md.GetMinKey(); err == nil {
@@ -422,7 +423,7 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 	// CRITICAL: Create readers BEFORE manifest update to ensure files exist and prevent RCU race condition
 	// This holds file handles open, preventing RCU cleanup from removing segments while we're adding them to manifest
 	newReaders := make([]*segment.Reader, 0, len(outputs))
-	for _, outID := range outputs {
+	for i, outID := range outputs {
 		reader, err := segment.NewReader(outID, segmentsDir, c.logger, true) // Verify checksums on new segments
 		if err != nil {
 			// Clean up already created readers
@@ -438,10 +439,16 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 					cleanupFailed++
 				}
 			}
-			if cleanupFailed > 0 {
-				c.logger.Warn("some segments failed to cleanup", "failed", cleanupFailed)
-			}
-			return nil, fmt.Errorf("failed to open new segment reader %d: %w", outID, err)
+			c.logger.Error("failed to open compaction output segment reader",
+				"segment_id", outID,
+				"segment_index", i,
+				"total_outputs", len(outputs),
+				"all_output_ids", outputs,
+				"cleanup_failures", cleanupFailed,
+				"error", err,
+			)
+			return nil, fmt.Errorf("failed to open new segment reader %d (index %d/%d): %w",
+				outID, i, len(outputs), err)
 		}
 		newReaders = append(newReaders, reader)
 	}
@@ -451,7 +458,13 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 
 	// Add new segments first
 	if err := c.manifest.AddSegments(pendingSegmentInfos); err != nil {
-		c.logger.Error("failed to add new segments to manifest - cleaning up readers and segment files", "error", err)
+		c.logger.Error("failed to add new segments to manifest - cleaning up readers and segment files",
+			"error", err,
+			"new_segments", len(pendingSegmentInfos),
+			"new_segment_ids", outputs,
+			"input_segments", len(inputIDs),
+			"input_ids", inputIDs,
+		)
 		// Close readers first
 		for _, r := range newReaders {
 			r.Close()
@@ -470,16 +483,25 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		if cleanupFailed > 0 {
 			c.logger.Error("cleanup incomplete - some orphaned segment files may remain", "failed_cleanups", cleanupFailed)
 		}
-		return nil, fmt.Errorf("atomic compaction manifest update failed: %w", err)
+		return nil, fmt.Errorf("atomic compaction manifest update failed (new=%d, inputs=%d): %w",
+			len(outputs), len(inputIDs), err)
 	}
 
 	// Remove old segments after successful addition of new ones
 	if err := c.manifest.RemoveSegments(inputIDs); err != nil {
-		c.logger.Error("failed to remove old segments from manifest after adding new ones", "error", err, "new_segments", outputs, "old_segments", inputIDs)
+		c.logger.Error("failed to remove old segments from manifest after adding new ones",
+			"error", err,
+			"new_segments", len(outputs),
+			"new_segment_ids", outputs,
+			"old_segments", len(inputIDs),
+			"old_segment_ids", inputIDs,
+			"note", "New segments are active but old ones not removed - manual cleanup may be needed",
+		)
 		// This is a problematic state, new segments exist and old ones are not marked for deletion.
 		// Log extensively for recovery purposes but continue - the system is still functional
 		// Don't close readers - they're still needed
-		return nil, fmt.Errorf("remove old segments from manifest: %w", err)
+		return nil, fmt.Errorf("remove old segments from manifest (new=%d, old=%d): %w",
+			len(outputs), len(inputIDs), err)
 	}
 
 	compactionInfo := manifest.CompactionInfo{
@@ -519,7 +541,14 @@ func (c *Compactor) TriggerCompaction() {
 		return
 	}
 	if _, err := c.Execute(plan); err != nil {
-		c.logger.Warn("manual compaction failed", "error", err)
+		c.logger.Error("manual compaction failed",
+			"error", err,
+			"reason", plan.Reason,
+			"level", plan.Level,
+			"target_level", plan.TargetLevel,
+			"input_segments", len(plan.Inputs),
+			"input_ids", plan.Inputs,
+		)
 	}
 }
 

@@ -2648,7 +2648,16 @@ func (s *storeImpl) compactionTask() {
 					// Suppress errors while shutting down or paused
 					continue
 				}
-				s.logger.Error("background compaction failed", "error", err)
+				// Log comprehensive diagnostic information for troubleshooting
+				s.logger.Error("background compaction failed",
+					"error", err,
+					"reason", plan.Reason,
+					"level", plan.Level,
+					"target_level", plan.TargetLevel,
+					"input_segments", len(plan.Inputs),
+					"input_ids", plan.Inputs,
+					"overlapping_segments", len(plan.Overlaps),
+				)
 				continue
 			}
 
