@@ -823,9 +823,6 @@ func (b *Builder) buildTrieFromSortedRange(start, end, depth int) *trieNode {
 
 // buildLOUDS builds the LOUDS representation.
 func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
-	// Convert our trie to encoding.TrieNode format
-	encodingTrie := b.convertToEncodingTrie(trie)
-
 	// Create LOUDS encoding unless disabled by options/thresholds
 	if b.disableLOUDS || (b.autoDisableMinKeys > 0 && len(b.keys) >= b.autoDisableMinKeys) {
 		b.logger.Info("skipping LOUDS build due to config/threshold", "keys", len(b.keys))
@@ -851,6 +848,8 @@ func (b *Builder) buildLOUDS(trie *trieNode, path string) error {
 		// Prefer streaming LOUDS builder from sorted keys (fast path)
 		louds = encoding.NewLOUDSFromSortedKeys(b.keys)
 	} else {
+		// Convert our trie to encoding.TrieNode format (only when needed)
+		encodingTrie := b.convertToEncodingTrie(trie)
 		louds = encoding.NewLOUDSNoRS(encodingTrie)
 	}
 

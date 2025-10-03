@@ -185,6 +185,7 @@ type Options struct {
 
 	// AutoDisableLOUDSMinKeys: when >0 and number of keys >= this threshold, the
 	// builder will skip LOUDS regardless of DisableLOUDSBuild.
+	// Recommended: 1M keys (LOUDS memory usage becomes prohibitive above this).
 	AutoDisableLOUDSMinKeys int
 
 	// GCPercentDuringTrie sets temporary runtime GC percent during trie build (0 = unchanged).
@@ -391,7 +392,7 @@ func DefaultOptions() *Options {
 		AsyncFilterBuild:            true, // Enable by default: faster flush, filters built in background
 		ForceTrieBuild:              false,
 		DisableLOUDSBuild:           false,
-		AutoDisableLOUDSMinKeys:     0,
+		AutoDisableLOUDSMinKeys:     1_000_000, // Auto-disable LOUDS for segments with 1M+ keys (prevents memory explosion)
 	}
 }
 
