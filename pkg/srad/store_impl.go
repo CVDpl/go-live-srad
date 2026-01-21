@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2282,6 +2283,12 @@ func (s *storeImpl) rcuCleanupOnce() {
 			continue
 		}
 
+		// CRITICAL FIX: Check if segment is locked for compaction
+		if s.manifest.IsSegmentLockedForCompaction(segID) {
+			s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
+			continue
+		}
+
 		// CRITICAL: Check refcount before deletion to prevent race conditions
 		s.mu.RLock()
 		reader, hasReader := s.readersMap[segID]
@@ -2297,6 +2304,12 @@ func (s *storeImpl) rcuCleanupOnce() {
 			s.mu.Lock()
 			delete(s.readersMap, segID)
 			s.mu.Unlock()
+		}
+
+		// Double-check compaction lock after refcount check (prevents TOCTOU race)
+		if s.manifest.IsSegmentLockedForCompaction(segID) {
+			s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
+			continue
 		}
 
 		if info, err := os.Stat(segPath); err == nil {
@@ -2641,6 +2654,57 @@ func (s *storeImpl) compactionTask() {
 				continue
 			}
 
+			// SELF-HEALING: Pre-validate that all planned segments exist on disk
+			// This catches cases where segments were deleted between Plan() and Execute()
+			segmentsDir := filepath.Join(s.dir, common.DirSegments)
+			var missingSelfHeal []uint64
+			for _, seg := range plan.Inputs {
+				segPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", seg.ID), "segment.json")
+				if _, err := os.Stat(segPath); os.IsNotExist(err) {
+					s.logger.Warn("pre-compaction check: segment missing from disk",
+						"segment_id", seg.ID,
+						"path", segPath,
+						"note", "Will remove from manifest during self-healing",
+					)
+					missingSelfHeal = append(missingSelfHeal, seg.ID)
+				}
+			}
+			for _, seg := range plan.Overlaps {
+				segPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", seg.ID), "segment.json")
+				if _, err := os.Stat(segPath); os.IsNotExist(err) {
+					s.logger.Warn("pre-compaction check: overlapping segment missing from disk",
+						"segment_id", seg.ID,
+						"path", segPath,
+						"note", "Will remove from manifest during self-healing",
+					)
+					missingSelfHeal = append(missingSelfHeal, seg.ID)
+				}
+			}
+
+			// Self-heal missing segments before attempting compaction
+			if len(missingSelfHeal) > 0 {
+				s.logger.Info("self-healing: removing missing segments from manifest before compaction",
+					"count", len(missingSelfHeal),
+					"segment_ids", missingSelfHeal,
+				)
+				if err := s.manifest.RemoveSegments(missingSelfHeal); err != nil {
+					s.logger.Error("self-healing: failed to remove missing segments",
+						"error", err,
+						"segment_ids", missingSelfHeal,
+					)
+				} else {
+					s.logger.Info("self-healing: successfully removed missing segments from manifest",
+						"count", len(missingSelfHeal),
+					)
+				}
+				// Re-plan after self-healing
+				plan = s.compactor.Plan()
+				if plan == nil {
+					s.logger.Info("after self-healing: no compaction work needed")
+					continue
+				}
+			}
+
 			// The execution is the long-running part, also without a store-level lock.
 			// It will atomically update the manifest upon completion.
 			_, err := s.compactor.Execute(plan)
@@ -2649,6 +2713,20 @@ func (s *storeImpl) compactionTask() {
 					// Suppress errors while shutting down or paused
 					continue
 				}
+
+				// Check if this is a "segment not found" error and attempt self-healing
+				if errors.Is(err, os.ErrNotExist) || (err != nil && (strings.Contains(err.Error(), "no such file") || strings.Contains(err.Error(), "not found"))) {
+					s.logger.Warn("compaction failed due to missing segment - triggering self-healing scan",
+						"error", err,
+						"reason", plan.Reason,
+					)
+					// Trigger a full self-healing scan
+					if healErr := s.selfHealMissingSegments(); healErr != nil {
+						s.logger.Error("self-healing scan failed", "error", healErr)
+					}
+					continue
+				}
+
 				// Log comprehensive diagnostic information for troubleshooting
 				s.logger.Error("background compaction failed",
 					"error", err,
@@ -2667,7 +2745,7 @@ func (s *storeImpl) compactionTask() {
 			s.logger.Info("compaction finished, reloading segment readers to reflect changes")
 
 			// Load new segments first (outside of critical section)
-			segmentsDir := filepath.Join(s.dir, common.DirSegments)
+			// Note: segmentsDir is already defined earlier in this function
 			var newSegments []*segment.Metadata
 			var newReaders []*segment.Reader
 			var loadErr error
@@ -3048,6 +3126,13 @@ func (s *storeImpl) rcuCleanupTask() {
 					continue
 				}
 
+				// CRITICAL FIX: Check if segment is locked for compaction
+				// If locked, another goroutine is actively using this segment
+				if s.manifest.IsSegmentLockedForCompaction(segID) {
+					s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
+					continue
+				}
+
 				// CRITICAL: Check refcount before deletion to prevent race conditions
 				// If a reader exists with refcount > 0, segment is still in use (e.g., during compaction)
 				s.mu.RLock()
@@ -3067,6 +3152,12 @@ func (s *storeImpl) rcuCleanupTask() {
 					s.mu.Lock()
 					delete(s.readersMap, segID)
 					s.mu.Unlock()
+				}
+
+				// Double-check compaction lock after refcount check (prevents TOCTOU race)
+				if s.manifest.IsSegmentLockedForCompaction(segID) {
+					s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
+					continue
 				}
 
 				// Check dir mtime as proxy for age
@@ -3398,6 +3489,81 @@ func (s *storeImpl) recoverOrphanedSegments(orphanIDs []uint64, segmentsDir stri
 		}())
 
 	return recovered, failed
+}
+
+// selfHealMissingSegments scans manifest for segments that don't exist on disk
+// and removes them from the manifest. This is a recovery mechanism for
+// handling race conditions or unexpected segment deletions.
+func (s *storeImpl) selfHealMissingSegments() error {
+	if s.manifest == nil {
+		return fmt.Errorf("manifest not initialized")
+	}
+
+	active := s.manifest.GetActiveSegments()
+	segmentsDir := filepath.Join(s.dir, common.DirSegments)
+
+	var missingIDs []uint64
+	for _, seg := range active {
+		segPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", seg.ID), "segment.json")
+		if _, err := os.Stat(segPath); os.IsNotExist(err) {
+			s.logger.Warn("self-healing: found segment in manifest but missing on disk",
+				"segment_id", seg.ID,
+				"level", seg.Level,
+				"path", segPath,
+			)
+			missingIDs = append(missingIDs, seg.ID)
+		}
+	}
+
+	if len(missingIDs) == 0 {
+		s.logger.Info("self-healing: no missing segments found")
+		return nil
+	}
+
+	s.logger.Info("self-healing: removing missing segments from manifest",
+		"count", len(missingIDs),
+		"segment_ids", missingIDs,
+	)
+
+	if err := s.manifest.RemoveSegments(missingIDs); err != nil {
+		return fmt.Errorf("self-healing: failed to remove segments from manifest: %w", err)
+	}
+
+	s.logger.Info("self-healing: successfully removed missing segments",
+		"count", len(missingIDs),
+	)
+
+	// Reload segments to update in-memory state
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Remove readers for missing segments
+	newReaders := make([]*segment.Reader, 0, len(s.readers))
+	newSegments := make([]*segment.Metadata, 0, len(s.segments))
+
+	missingMap := make(map[uint64]bool, len(missingIDs))
+	for _, id := range missingIDs {
+		missingMap[id] = true
+	}
+
+	for i, r := range s.readers {
+		if !missingMap[r.GetSegmentID()] {
+			newReaders = append(newReaders, r)
+			if i < len(s.segments) {
+				newSegments = append(newSegments, s.segments[i])
+			}
+		} else {
+			// Close and remove reader for missing segment
+			r.Close()
+			delete(s.readersMap, r.GetSegmentID())
+		}
+	}
+
+	s.readers = newReaders
+	s.segments = newSegments
+	s.updateStatsFromManifest()
+
+	return nil
 }
 
 // saveTuning saves tuning parameters to disk.

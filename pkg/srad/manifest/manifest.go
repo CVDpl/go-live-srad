@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,10 @@ type Manifest struct {
 	// RCU support
 	epoch   uint64
 	readers sync.Map // epoch -> reader count
+
+	// Compaction locks: segments currently being used by compaction
+	// These segments MUST NOT be deleted by RCU cleanup until unlocked
+	compactionLocks sync.Map // segmentID (uint64) -> struct{}
 
 	logger common.Logger
 }
@@ -131,17 +136,37 @@ func (m *Manifest) load() error {
 		}
 	}
 	if latestFile == "" {
-		// Fallback to glob
-		pattern := filepath.Join(m.dir, "manifest-*.json")
+		// Fallback to glob - try new format first (%016d.json), then legacy (manifest-*.json)
+		// New format: files like 0000000000000001.json
+		pattern := filepath.Join(m.dir, "*.json")
 		files, err := filepath.Glob(pattern)
 		if err != nil {
 			return err
 		}
-		if len(files) == 0 {
+		// Filter to only numeric JSON files (new format) or manifest-* files (legacy)
+		var validFiles []string
+		for _, f := range files {
+			base := filepath.Base(f)
+			// Skip CURRENT-related files
+			if strings.HasPrefix(base, "CURRENT") {
+				continue
+			}
+			// Check if it's a numeric filename (new format: 0000000000000001.json)
+			nameWithoutExt := strings.TrimSuffix(base, ".json")
+			if _, err := strconv.ParseUint(nameWithoutExt, 10, 64); err == nil {
+				validFiles = append(validFiles, f)
+				continue
+			}
+			// Check for legacy format (manifest-*.json)
+			if strings.HasPrefix(base, "manifest-") {
+				validFiles = append(validFiles, f)
+			}
+		}
+		if len(validFiles) == 0 {
 			return fmt.Errorf("no manifest files found")
 		}
-		sort.Strings(files)
-		latestFile = files[len(files)-1]
+		sort.Strings(validFiles)
+		latestFile = validFiles[len(validFiles)-1]
 	}
 
 	// Read the file
@@ -258,6 +283,11 @@ func (m *Manifest) AddSegments(infos []SegmentInfo) error {
 
 	m.versions = append(m.versions, newVersion)
 
+	// Limit versions slice to prevent unbounded growth (keep last 100 versions)
+	if len(m.versions) > 100 {
+		m.versions = m.versions[len(m.versions)-100:]
+	}
+
 	// Start RCU grace period for old version
 	m.startGracePeriod(oldVersion)
 
@@ -302,6 +332,11 @@ func (m *Manifest) RemoveSegments(segmentIDs []uint64) error {
 	}
 
 	m.versions = append(m.versions, newVersion)
+
+	// Limit versions slice to prevent unbounded growth (keep last 100 versions)
+	if len(m.versions) > 100 {
+		m.versions = m.versions[len(m.versions)-100:]
+	}
 
 	// Start RCU grace period for old version
 	m.startGracePeriod(oldVersion)
@@ -374,6 +409,11 @@ func (m *Manifest) RecordCompaction(info CompactionInfo) error {
 
 	m.versions = append(m.versions, newVersion)
 
+	// Limit versions slice to prevent unbounded growth (keep last 100 versions)
+	if len(m.versions) > 100 {
+		m.versions = m.versions[len(m.versions)-100:]
+	}
+
 	// Start RCU grace period for old version
 	m.startGracePeriod(oldVersion)
 
@@ -434,11 +474,14 @@ func (m *Manifest) cleanupOldVersion(version *Version, epoch uint64) {
 
 	// Remove old manifest file if it's not the current one
 	if version.VersionID < m.current.VersionID-10 {
-		filename := fmt.Sprintf("manifest-%06d.json", version.VersionID)
+		// FIX: Use correct filename format matching save() - %016d.json
+		filename := fmt.Sprintf("%016d.json", version.VersionID)
 		path := filepath.Join(m.dir, filename)
-		os.Remove(path)
-
-		m.logger.Debug("cleaned up old manifest", "version", version.VersionID)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			m.logger.Warn("failed to remove old manifest file", "version", version.VersionID, "error", err)
+		} else if err == nil {
+			m.logger.Debug("cleaned up old manifest", "version", version.VersionID)
+		}
 	}
 }
 
@@ -448,6 +491,108 @@ func (m *Manifest) GetCurrentVersion() uint64 {
 	defer m.mu.RUnlock()
 
 	return m.current.VersionID
+}
+
+// LockSegmentsForCompaction marks segments as being used by compaction.
+// These segments will NOT be deleted by RCU cleanup until unlocked.
+// Returns the list of segment IDs that were successfully locked.
+func (m *Manifest) LockSegmentsForCompaction(segmentIDs []uint64) []uint64 {
+	locked := make([]uint64, 0, len(segmentIDs))
+	for _, id := range segmentIDs {
+		m.compactionLocks.Store(id, struct{}{})
+		locked = append(locked, id)
+	}
+	m.logger.Debug("locked segments for compaction", "count", len(locked), "ids", locked)
+	return locked
+}
+
+// UnlockSegmentsForCompaction removes compaction locks from segments.
+func (m *Manifest) UnlockSegmentsForCompaction(segmentIDs []uint64) {
+	for _, id := range segmentIDs {
+		m.compactionLocks.Delete(id)
+	}
+	m.logger.Debug("unlocked segments after compaction", "count", len(segmentIDs), "ids", segmentIDs)
+}
+
+// IsSegmentLockedForCompaction checks if a segment is currently locked for compaction.
+func (m *Manifest) IsSegmentLockedForCompaction(segmentID uint64) bool {
+	_, ok := m.compactionLocks.Load(segmentID)
+	return ok
+}
+
+// AtomicCompactionUpdate performs an atomic compaction update:
+// adds new segments and removes old segments in a single manifest version.
+// This prevents race conditions between AddSegments and RemoveSegments.
+func (m *Manifest) AtomicCompactionUpdate(addInfos []SegmentInfo, removeIDs []uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Create new version
+	newVersion := &Version{
+		VersionID:   m.current.VersionID + 1,
+		CreatedAt:   time.Now().Unix(),
+		Segments:    make([]SegmentInfo, 0, len(m.current.Segments)+len(addInfos)),
+		Compactions: m.current.Compactions,
+	}
+
+	// Build map of segments to remove for O(1) lookup
+	removeMap := make(map[uint64]bool, len(removeIDs))
+	for _, id := range removeIDs {
+		removeMap[id] = true
+	}
+
+	now := time.Now().Unix()
+
+	// Copy existing segments, marking deleted ones
+	for _, seg := range m.current.Segments {
+		if removeMap[seg.ID] {
+			seg.Deleted = now
+		}
+		newVersion.Segments = append(newVersion.Segments, seg)
+	}
+
+	// Add new segments
+	for _, info := range addInfos {
+		info.Created = now
+		newVersion.Segments = append(newVersion.Segments, info)
+	}
+
+	// Save new version
+	oldVersion := m.current
+	m.current = newVersion
+
+	if err := m.save(); err != nil {
+		// Rollback on error
+		m.current = oldVersion
+		return fmt.Errorf("atomic compaction update failed: %w", err)
+	}
+
+	m.versions = append(m.versions, newVersion)
+
+	// Limit versions slice to prevent unbounded growth (keep last 100 versions)
+	if len(m.versions) > 100 {
+		m.versions = m.versions[len(m.versions)-100:]
+	}
+
+	// Start RCU grace period for old version
+	m.startGracePeriod(oldVersion)
+
+	m.logger.Info("atomic compaction update completed",
+		"added", len(addInfos),
+		"removed", len(removeIDs),
+		"new_version", newVersion.VersionID)
+
+	return nil
+}
+
+// GetLockedSegmentIDs returns all segment IDs currently locked for compaction.
+func (m *Manifest) GetLockedSegmentIDs() []uint64 {
+	var ids []uint64
+	m.compactionLocks.Range(func(key, value interface{}) bool {
+		ids = append(ids, key.(uint64))
+		return true
+	})
+	return ids
 }
 
 // GetStats returns manifest statistics.

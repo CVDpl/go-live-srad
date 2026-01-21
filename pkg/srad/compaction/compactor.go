@@ -174,10 +174,30 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 		inputIDs = append(inputIDs, s.ID)
 	}
 
+	// CRITICAL FIX: Lock segments BEFORE opening readers to prevent RCU cleanup race
+	// This ensures segments cannot be deleted while we're trying to open them
+	lockedIDs := c.manifest.LockSegmentsForCompaction(inputIDs)
+	defer func() {
+		// Always unlock segments when compaction finishes (success or failure)
+		c.manifest.UnlockSegmentsForCompaction(lockedIDs)
+	}()
+
 	segmentsDir := filepath.Join(c.dir, common.DirSegments)
 	var readers []*segment.Reader
 	var missingSegments []uint64
 	for _, segID := range inputIDs {
+		// Verify segment still exists before opening (race condition check)
+		segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID), "segment.json")
+		if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
+			c.logger.Warn("segment missing from disk during compaction (detected early)",
+				"segment_id", segID,
+				"path", segmentPath,
+				"note", "Segment may have been deleted by RCU before lock was acquired",
+			)
+			missingSegments = append(missingSegments, segID)
+			continue
+		}
+
 		// false for checksum verification, assuming it's already been checked on load
 		reader, err := segment.NewReader(segID, segmentsDir, c.logger, false)
 		if err != nil {
@@ -219,6 +239,19 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 			return nil, fmt.Errorf("failed to remove missing segments from manifest: %w", err)
 		}
 		c.logger.Info("successfully removed missing segments from manifest", "count", len(missingSegments))
+
+		// Update inputIDs to exclude missing segments for later manifest update
+		validInputIDs := make([]uint64, 0, len(inputIDs)-len(missingSegments))
+		missingMap := make(map[uint64]bool, len(missingSegments))
+		for _, id := range missingSegments {
+			missingMap[id] = true
+		}
+		for _, id := range inputIDs {
+			if !missingMap[id] {
+				validInputIDs = append(validInputIDs, id)
+			}
+		}
+		inputIDs = validInputIDs
 
 		// If all segments were missing, return early (no compaction possible)
 		if len(readers) == 0 {
@@ -494,12 +527,12 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		newReaders = append(newReaders, reader)
 	}
 
-	// ATOMIC COMPACTION UPDATE: Add all new segments and remove old ones atomically
+	// ATOMIC COMPACTION UPDATE: Add all new segments and remove old ones in a SINGLE manifest version
+	// This prevents race conditions between adding and removing segments
 	c.logger.Info("performing atomic compaction manifest update", "new_segments", len(pendingSegmentInfos), "removing_segments", len(inputIDs))
 
-	// Add new segments first
-	if err := c.manifest.AddSegments(pendingSegmentInfos); err != nil {
-		c.logger.Error("failed to add new segments to manifest - cleaning up readers and segment files",
+	if err := c.manifest.AtomicCompactionUpdate(pendingSegmentInfos, inputIDs); err != nil {
+		c.logger.Error("failed atomic compaction manifest update - cleaning up readers and segment files",
 			"error", err,
 			"new_segments", len(pendingSegmentInfos),
 			"new_segment_ids", outputs,
@@ -525,23 +558,6 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 			c.logger.Error("cleanup incomplete - some orphaned segment files may remain", "failed_cleanups", cleanupFailed)
 		}
 		return nil, fmt.Errorf("atomic compaction manifest update failed (new=%d, inputs=%d): %w",
-			len(outputs), len(inputIDs), err)
-	}
-
-	// Remove old segments after successful addition of new ones
-	if err := c.manifest.RemoveSegments(inputIDs); err != nil {
-		c.logger.Error("failed to remove old segments from manifest after adding new ones",
-			"error", err,
-			"new_segments", len(outputs),
-			"new_segment_ids", outputs,
-			"old_segments", len(inputIDs),
-			"old_segment_ids", inputIDs,
-			"note", "New segments are active but old ones not removed - manual cleanup may be needed",
-		)
-		// This is a problematic state, new segments exist and old ones are not marked for deletion.
-		// Log extensively for recovery purposes but continue - the system is still functional
-		// Don't close readers - they're still needed
-		return nil, fmt.Errorf("remove old segments from manifest (new=%d, old=%d): %w",
 			len(outputs), len(inputIDs), err)
 	}
 
