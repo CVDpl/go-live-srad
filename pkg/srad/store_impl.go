@@ -95,6 +95,7 @@ type storeImpl struct {
 	readersMap    map[uint64]*segment.Reader // Track readers by segmentID for RCU refcount checks
 	manifest      *manifest.Manifest
 	compactor     *compaction.Compactor
+	mmapCache     *segment.MmapCache // LRU cache for keys.dat mmap to limit VIRT
 
 	// Frozen memtable snapshots visible to readers during flush
 	frozenSnaps []*memtable.Snapshot
@@ -272,6 +273,20 @@ func Open(dir string, opts *Options) (Store, error) {
 		// Continue without manifest for now
 	}
 
+	// Initialize mmap cache for keys.dat files (unless disabled with -1)
+	if opts.MaxMmapCacheSize >= 0 {
+		cacheSize := opts.MaxMmapCacheSize
+		if cacheSize == 0 {
+			cacheSize = segment.DefaultMaxMmapCacheSize
+		}
+		idleTimeout := opts.MmapCacheIdleTimeout
+		if idleTimeout == 0 {
+			idleTimeout = segment.DefaultMmapCacheIdleTimeout
+		}
+		s.mmapCache = segment.NewMmapCacheWithTimeout(cacheSize, idleTimeout, s.logger)
+		s.logger.Info("mmap cache initialized", "max_size", cacheSize, "idle_timeout", idleTimeout)
+	}
+
 	// Load existing segments
 	if err := s.loadSegments(); err != nil {
 		s.logger.Warn("failed to load segments", "error", err)
@@ -289,6 +304,10 @@ func Open(dir string, opts *Options) (Store, error) {
 	if s.manifest != nil && !s.readonly {
 		alloc := func() uint64 { return atomic.AddUint64(&s.nextSegmentID, 1) }
 		s.compactor = compaction.NewCompactor(dir, s.manifest, s.logger, alloc)
+		// Share mmap cache with compactor
+		if s.mmapCache != nil {
+			s.compactor.SetMmapCache(s.mmapCache)
+		}
 		// Ensure compaction builders are configured consistently with flush
 		cfg := func(b *segment.Builder) {
 			bloomFPR := s.opts.PrefixBloomFPR
@@ -392,6 +411,13 @@ func (s *storeImpl) Close() error {
 	if s.wal != nil {
 		if err := s.wal.Close(); err != nil {
 			s.logger.Error("failed to close WAL", "error", err)
+		}
+	}
+
+	// Close mmap cache (unmaps all remaining cached keys.dat files)
+	if s.mmapCache != nil {
+		if err := s.mmapCache.Close(); err != nil {
+			s.logger.Error("failed to close mmap cache", "error", err)
 		}
 	}
 
@@ -1555,7 +1581,7 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 				return
 			}
 			// Open reader and check filters
-			reader, err := segment.NewReader(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad)
+			reader, err := segment.NewReaderWithCache(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 			if err != nil {
 				continue
 			}
@@ -1645,7 +1671,7 @@ func (s *storeImpl) RebuildMissingFilters(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
-		reader, err := segment.NewReader(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad)
+		reader, err := segment.NewReaderWithCache(seg.ID, dir, logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 		if err != nil {
 			continue
 		}
@@ -2138,7 +2164,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 	s.mu.Lock()
 	for _, md := range mds {
 		s.segments = append(s.segments, md)
-		reader, rerr := segment.NewReader(md.SegmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+		reader, rerr := segment.NewReaderWithCache(md.SegmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 		if rerr == nil {
 			s.readers = append(s.readers, reader)
 			s.readersMap[md.SegmentID] = reader // Track for RCU refcount checks
@@ -2779,7 +2805,7 @@ func (s *storeImpl) compactionTask() {
 						loadErr = fmt.Errorf("load metadata for segment %d: %w", segmentID, err)
 						break
 					}
-					reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+					reader, err := segment.NewReaderWithCache(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 					if err != nil {
 						// Self-healing: if segment is missing, remove from manifest
 						if errors.Is(err, os.ErrNotExist) {
@@ -3204,7 +3230,7 @@ func (s *storeImpl) loadSegments() error {
 				s.logger.Warn("failed to load segment metadata", "id", segmentID, "error", err)
 				continue
 			}
-			reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+			reader, err := segment.NewReaderWithCache(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 			if err != nil {
 				// Self-healing: if segment is missing, remove from manifest
 				if errors.Is(err, os.ErrNotExist) {
@@ -3279,7 +3305,7 @@ func (s *storeImpl) loadSegments() error {
 		}
 
 		// Create segment reader
-		reader, err := segment.NewReader(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad)
+		reader, err := segment.NewReaderWithCache(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 		if err != nil {
 			s.logger.Warn("failed to create segment reader", "id", segmentID, "error", err)
 			continue

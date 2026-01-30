@@ -191,6 +191,18 @@ type Options struct {
 	// GCPercentDuringTrie sets temporary runtime GC percent during trie build (0 = unchanged).
 	// Example: set to a large number (e.g., 500-1000) to reduce GC frequency while building huge tries.
 	GCPercentDuringTrie int
+
+	// MaxMmapCacheSize sets the maximum number of concurrently mmapped keys.dat files.
+	// This limits virtual memory (VIRT) usage when working with many segments.
+	// Set to 0 to use default (128). Set to -1 to disable cache (legacy behavior with direct mmap).
+	// Recommended: 128 for most workloads, higher for many concurrent indexes.
+	MaxMmapCacheSize int
+
+	// MmapCacheIdleTimeout sets how long an unused mmap entry stays in cache before eviction.
+	// Even if the cache is not full, entries not accessed within this duration will be unmapped.
+	// Set to 0 to disable time-based eviction (only evict when cache is full).
+	// Default: 5 minutes.
+	MmapCacheIdleTimeout time.Duration
 }
 
 // QueryOptions configures query execution.
@@ -389,10 +401,12 @@ func DefaultOptions() *Options {
 		BuildShardMinKeys:           200000,
 		BloomAdaptiveMinKeys:        10000000,
 		BuildRangePartitions:        1,
-		AsyncFilterBuild:            true, // Enable by default: faster flush, filters built in background
+		AsyncFilterBuild:            true,  // Enable by default: faster flush, filters built in background
 		ForceTrieBuild:              false,
 		DisableLOUDSBuild:           false,
-		AutoDisableLOUDSMinKeys:     1_000_000, // Auto-disable LOUDS for segments with 1M+ keys (prevents memory explosion)
+		AutoDisableLOUDSMinKeys:     1_000_000,    // Auto-disable LOUDS for segments with 1M+ keys (prevents memory explosion)
+		MaxMmapCacheSize:            128,          // Limit concurrent keys.dat mmaps to control VIRT
+		MmapCacheIdleTimeout:        5 * time.Minute, // Evict unused mmaps after 5 minutes
 	}
 }
 

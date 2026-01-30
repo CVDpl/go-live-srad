@@ -38,6 +38,9 @@ type Compactor struct {
 
 	// Optional: configure each segment.Builder before use (filters, LOUDS, trie, GC, etc.)
 	configureBuilder func(*segment.Builder)
+
+	// Optional: shared mmap cache for segment readers
+	mmapCache *segment.MmapCache
 }
 
 // CompactionPlan describes a compaction task.
@@ -69,6 +72,14 @@ func NewCompactor(dir string, m *manifest.Manifest, logger common.Logger, alloc 
 		logger:         logger,
 		alloc:          alloc,
 	}
+}
+
+// SetMmapCache sets the shared mmap cache for segment readers.
+// This should be called before starting compaction to share the cache with the store.
+func (c *Compactor) SetMmapCache(cache *segment.MmapCache) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mmapCache = cache
 }
 
 // Start starts the compaction background process.
@@ -199,7 +210,7 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 		}
 
 		// false for checksum verification, assuming it's already been checked on load
-		reader, err := segment.NewReader(segID, segmentsDir, c.logger, false)
+		reader, err := segment.NewReaderWithCache(segID, segmentsDir, c.logger, false, c.mmapCache)
 		if err != nil {
 			// Check if segment file is missing (self-healing)
 			// Use errors.Is to handle wrapped errors properly
@@ -498,7 +509,7 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 	// This holds file handles open, preventing RCU cleanup from removing segments while we're adding them to manifest
 	newReaders := make([]*segment.Reader, 0, len(outputs))
 	for i, outID := range outputs {
-		reader, err := segment.NewReader(outID, segmentsDir, c.logger, true) // Verify checksums on new segments
+		reader, err := segment.NewReaderWithCache(outID, segmentsDir, c.logger, true, c.mmapCache) // Verify checksums on new segments
 		if err != nil {
 			// Clean up already created readers
 			for _, r := range newReaders {

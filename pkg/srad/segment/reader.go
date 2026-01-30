@@ -31,7 +31,7 @@ type Reader struct {
 	// Cached structures
 	louds   *encoding.LOUDS
 	keys    [][]byte // fallback list for iteration
-	keysMap []byte   // mmapped keys.dat (optional)
+	keysMap []byte   // mmapped keys.dat (optional, managed by mmapCache if set)
 	// Expiry data per key (parallel to keys order); unix nanos, 0 if none
 	expiries []int64
 
@@ -65,6 +65,13 @@ type Reader struct {
 
 	// Closed flag to make Close idempotent
 	closed int32
+
+	// LRU mmap cache for keys.dat (shared across readers, may be nil for legacy mode)
+	mmapCache *MmapCache
+	// Whether keysMap was acquired from cache (vs direct mmap)
+	keysMapFromCache bool
+	// File size for lazy mmap via cache
+	keysFileSize int64
 }
 
 // IncRef increments the reader's reference count.
@@ -137,23 +144,76 @@ func (r *Reader) internalClose() {
 	if r.tombFile != nil {
 		r.tombFile.Close()
 	}
-	// Unmap both mmap regions to prevent memory leak
+	// Unmap LOUDS mmap region
 	if r.mmap != nil {
 		if err := unix.Munmap(r.mmap); err != nil {
 			r.logger.Warn("failed to munmap segment data", "id", r.segmentID, "error", err)
 		}
 		r.mmap = nil
 	}
+	// Handle keys.dat mmap cleanup
 	if r.keysMap != nil {
-		if err := unix.Munmap(r.keysMap); err != nil {
-			r.logger.Warn("failed to munmap keys data", "id", r.segmentID, "error", err)
+		if r.keysMapFromCache && r.mmapCache != nil {
+			// Release reference to cache - cache will handle munmap
+			r.mmapCache.Release(r.segmentID)
+		} else {
+			// Direct mmap - munmap ourselves
+			if err := unix.Munmap(r.keysMap); err != nil {
+				r.logger.Warn("failed to munmap keys data", "id", r.segmentID, "error", err)
+			}
 		}
 		r.keysMap = nil
 	}
 }
 
+// acquireKeysMap lazily acquires the keys.dat mmap through cache or returns existing.
+// Returns nil if mmap is not available.
+func (r *Reader) acquireKeysMap() []byte {
+	// Already have mmap
+	if r.keysMap != nil {
+		return r.keysMap
+	}
+
+	// No keys file
+	if r.keysFile == nil || r.keysFileSize <= 0 {
+		return nil
+	}
+
+	// No cache - can't lazy mmap (would have been done in openFiles)
+	if r.mmapCache == nil {
+		return nil
+	}
+
+	// Acquire through cache
+	keysPath := filepath.Join(r.dir, "keys.dat")
+	data := r.mmapCache.Acquire(r.segmentID, keysPath, r.keysFileSize)
+	if data != nil {
+		r.keysMap = data
+		r.keysMapFromCache = true
+	}
+	return r.keysMap
+}
+
+// releaseKeysMap releases the keys.dat mmap back to cache if acquired from cache.
+// Call this when done with a batch of operations to allow cache eviction.
+func (r *Reader) releaseKeysMap() {
+	if r.keysMapFromCache && r.mmapCache != nil && r.keysMap != nil {
+		r.mmapCache.Release(r.segmentID)
+		r.keysMap = nil
+		r.keysMapFromCache = false
+	}
+}
+
 // NewReader creates a new segment reader.
+// For better memory management with many segments, use NewReaderWithCache instead.
 func NewReader(segmentID uint64, dir string, logger common.Logger, verifyChecksums bool) (*Reader, error) {
+	return NewReaderWithCache(segmentID, dir, logger, verifyChecksums, nil)
+}
+
+// NewReaderWithCache creates a new segment reader with optional mmap cache.
+// When mmapCache is provided, keys.dat mmap is managed lazily through the cache,
+// significantly reducing virtual memory usage with many segments.
+func NewReaderWithCache(segmentID uint64, dir string, logger common.Logger, verifyChecksums bool, mmapCache *MmapCache) (*Reader, error) {
 	if logger == nil {
 		logger = common.NewNullLogger()
 	}
@@ -173,6 +233,7 @@ func NewReader(segmentID uint64, dir string, logger common.Logger, verifyChecksu
 		metadata:        metadata,
 		logger:          logger,
 		verifyChecksums: verifyChecksums,
+		mmapCache:       mmapCache,
 		// Hold one reference for store ownership; queries will IncRef/Release.
 		refcnt: 1,
 	}
@@ -222,12 +283,21 @@ func (r *Reader) openFiles() error {
 	keysPath := filepath.Join(r.dir, "keys.dat")
 	if f, err := os.Open(keysPath); err == nil {
 		r.keysFile = f
-		// Try mmap keys file to avoid heap copies
+		// Get file size for potential lazy mmap
 		if stat, err := f.Stat(); err == nil && stat.Size() > 0 {
-			if mapped, mErr := unix.Mmap(int(f.Fd()), 0, int(stat.Size()), unix.PROT_READ, unix.MAP_SHARED); mErr == nil {
-				r.keysMap = mapped
-				_ = unix.Madvise(mapped, unix.MADV_SEQUENTIAL)
+			r.keysFileSize = stat.Size()
+
+			// If mmapCache is set, defer mmap to first access (lazy loading)
+			// Otherwise, mmap immediately for backward compatibility
+			if r.mmapCache == nil {
+				// Legacy mode: direct mmap
+				if mapped, mErr := unix.Mmap(int(f.Fd()), 0, int(stat.Size()), unix.PROT_READ, unix.MAP_SHARED); mErr == nil {
+					r.keysMap = mapped
+					r.keysMapFromCache = false
+					_ = unix.Madvise(mapped, unix.MADV_SEQUENTIAL)
+				}
 			}
+			// With mmapCache: keysMap stays nil until acquireKeysMap() is called
 		}
 	}
 
@@ -363,11 +433,15 @@ func (r *Reader) loadKeys() error {
 	if r.keysFile == nil {
 		return nil
 	}
+
+	// Try to acquire mmap (lazy via cache if available)
+	data := r.acquireKeysMap()
+
 	// If mmap is available, parse with mandatory 6B header
-	if len(r.keysMap) >= 6 {
-		data := r.keysMap
+	if len(data) >= 6 {
 		// Mandatory 6B common header (magic+version)
 		if binary.LittleEndian.Uint32(data[0:4]) != common.MagicKeys {
+			r.releaseKeysMap()
 			return fmt.Errorf("keys file invalid magic")
 		}
 		off := 6
@@ -376,6 +450,11 @@ func (r *Reader) loadKeys() error {
 			off += 4
 			keys := make([][]byte, 0, count)
 			ok := true
+
+			// When using cache, we must copy keys since mmap may be evicted later.
+			// When not using cache (direct mmap), we can use zero-copy slices.
+			useZeroCopy := !r.keysMapFromCache
+
 			for i := uint32(0); i < count; i++ {
 				if off+4 > len(data) {
 					ok = false
@@ -387,18 +466,33 @@ func (r *Reader) loadKeys() error {
 					ok = false
 					break
 				}
-				// Zero-copy: Return slice directly pointing to mmapped data
-				// This is safe as long as the mmap remains valid (reader lifecycle)
-				k := data[off : off+kl]
+
+				var k []byte
+				if useZeroCopy {
+					// Zero-copy: Return slice directly pointing to mmapped data
+					// This is safe as long as the mmap remains valid (reader lifecycle)
+					k = data[off : off+kl]
+				} else {
+					// Copy data since mmap may be evicted from cache
+					k = make([]byte, kl)
+					copy(k, data[off:off+kl])
+				}
 				off += kl
 				keys = append(keys, k)
 			}
 			if ok {
 				r.keys = keys
+				// If using cache and we copied data, release mmap to allow eviction
+				if r.keysMapFromCache {
+					r.releaseKeysMap()
+				}
 				return nil
 			}
 		}
 	}
+
+	// Release mmap if we acquired it but couldn't use it
+	r.releaseKeysMap()
 
 	r.logger.Warn("keys.dat is not mmapable, falling back to file read", "id", r.segmentID)
 
@@ -983,6 +1077,9 @@ type SegmentIterator struct {
 	keysRead      uint32
 	streamFile    *os.File
 	streamReader  *bufio.Reader
+
+	// Track if mmap was acquired from cache (needs release on Close)
+	mmapFromCache bool
 }
 
 type iteratorState struct {
@@ -1110,17 +1207,17 @@ func (it *SegmentIterator) Next() bool {
 	if !it.streamInit {
 		it.streamInit = true
 		// Try mmap first (zero-copy) with mandatory 6B header
-		if len(it.reader.keysMap) > 0 {
-			data := it.reader.keysMap
-			if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == common.MagicKeys {
-				off := 6
-				// Read count
-				if off+4 <= len(data) {
-					it.keysCount = binary.LittleEndian.Uint32(data[off : off+4])
-					it.mmapOff = off + 4
-					it.usingMmap = true
-					it.mmapData = data
-				}
+		// Use acquireKeysMap for lazy mmap via cache
+		data := it.reader.acquireKeysMap()
+		if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == common.MagicKeys {
+			off := 6
+			// Read count
+			if off+4 <= len(data) {
+				it.keysCount = binary.LittleEndian.Uint32(data[off : off+4])
+				it.mmapOff = off + 4
+				it.usingMmap = true
+				it.mmapData = data
+				it.mmapFromCache = it.reader.keysMapFromCache
 			}
 		}
 		// If no mmap, create a dedicated buffered reader over keys.dat (mandatory header)
@@ -1256,7 +1353,6 @@ func (it *SegmentIterator) Value() []byte {
 // Error returns any error encountered during iteration.
 func (it *SegmentIterator) Error() error { return it.err }
 
-// Close closes the iterator.
 // Close closes the iterator and any streaming resources.
 func (it *SegmentIterator) Close() error {
 	it.stack = nil
@@ -1265,5 +1361,11 @@ func (it *SegmentIterator) Close() error {
 		it.streamFile = nil
 		it.streamReader = nil
 	}
+	// Release mmap back to cache if acquired from cache
+	if it.mmapFromCache && it.reader != nil && it.reader.mmapCache != nil {
+		it.reader.mmapCache.Release(it.reader.segmentID)
+		it.mmapFromCache = false
+	}
+	it.mmapData = nil
 	return nil
 }

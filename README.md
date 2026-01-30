@@ -259,6 +259,18 @@ type Options struct {
     // GCPercentDuringTrie sets temporary runtime GC percent during trie build (0 = unchanged).
     // Default: 0
     GCPercentDuringTrie int
+
+    // MaxMmapCacheSize sets the maximum number of concurrently mmapped keys.dat files.
+    // This limits virtual memory (VIRT) usage when working with many segments.
+    // Set to 0 to use default (128). Set to -1 to disable cache (legacy direct mmap).
+    // Default: 128
+    MaxMmapCacheSize int
+
+    // MmapCacheIdleTimeout sets how long unused mmap entries stay in cache before eviction.
+    // Even if cache is not full, entries not accessed within this duration will be unmapped.
+    // Set to 0 to disable time-based eviction (only evict when cache is full).
+    // Default: 5 minutes
+    MmapCacheIdleTimeout time.Duration
 }
 ```
 
@@ -537,6 +549,8 @@ store_directory/
 - WAL Rotation Size: 128MB
 - WAL Max File Size: 1GB
 - WAL Buffer Size: 256KB
+- Mmap Cache Size: 128 entries
+- Mmap Cache Idle Timeout: 5 minutes
 
 Note on WAL lifecycle:
 - WAL pruning is manual via `PruneWAL()` and does not run automatically after flush/compaction.
@@ -755,6 +769,47 @@ If a WAL file is corrupted during replay:
 ### Search concurrency and correctness
 
 Regex search scans memtable first, then segments from newest to oldest, seeding a `seen` set with memtable tombstones and per-segment tombstones to enforce "newest wins". The engine holds internal references to segment readers during scans to avoid use-after-close during compaction. Use contexts to cancel long-running searches.
+
+### Mmap Cache for keys.dat (Memory Management)
+
+SRAD uses memory-mapped files (mmap) for efficient access to `keys.dat` files. With many segments, this can consume significant virtual memory (VIRT). The **mmap cache** limits concurrent mmaps using LRU eviction and optional time-based cleanup.
+
+**Default behavior:**
+- Maximum 128 concurrent mmapped keys.dat files
+- Unused entries evicted after 5 minutes of inactivity
+- Entries are lazily mapped on first access
+
+**Configuration:**
+
+```go
+opts := srad.DefaultOptions()
+
+// Increase cache for workloads with many concurrent indexes
+opts.MaxMmapCacheSize = 256
+
+// Reduce idle timeout for memory-constrained environments
+opts.MmapCacheIdleTimeout = 2 * time.Minute
+
+// Disable time-based eviction (only evict when cache full)
+opts.MmapCacheIdleTimeout = 0
+
+// Disable mmap cache entirely (legacy direct mmap behavior)
+opts.MaxMmapCacheSize = -1
+```
+
+**How it works:**
+
+1. **Lazy loading**: Segments are not mmapped at startup; mmap happens on first access
+2. **LRU eviction**: When cache is full, least recently used entries with `refcount=0` are evicted
+3. **Idle eviction**: Background goroutine periodically evicts entries not accessed within `MmapCacheIdleTimeout`
+4. **Re-acquisition**: If an evicted segment is needed again, it's simply remapped and added back to cache
+
+**Memory impact example:**
+
+| Scenario | Without cache | With cache (128, 5min) |
+|----------|---------------|------------------------|
+| 500 segments × 10MB | ~5GB VIRT | ~1.3GB VIRT (max 128 mapped) |
+| Idle for 10 minutes | ~5GB VIRT | Near 0 (all evicted) |
 
 ### Trie and LOUDS build behavior
 
