@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -197,14 +198,31 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 	var readers []*segment.Reader
 	var missingSegments []uint64
 	for _, segID := range inputIDs {
-		// Verify segment still exists before opening (race condition check)
-		segmentPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID), "segment.json")
+		segDir := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID))
+
+		// Verify ALL critical segment files exist before opening (race condition check)
+		// Check both segment.json and index.louds to prevent partial segment issues
+		segmentPath := filepath.Join(segDir, "segment.json")
+		loudsPath := filepath.Join(segDir, "index.louds")
+
+		segmentMissing := false
 		if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
-			c.logger.Warn("segment missing from disk during compaction (detected early)",
+			c.logger.Warn("segment.json missing from disk during compaction (detected early)",
 				"segment_id", segID,
 				"path", segmentPath,
 				"note", "Segment may have been deleted by RCU before lock was acquired",
 			)
+			segmentMissing = true
+		}
+		if _, err := os.Stat(loudsPath); os.IsNotExist(err) {
+			c.logger.Warn("index.louds missing from disk during compaction (detected early)",
+				"segment_id", segID,
+				"path", loudsPath,
+				"note", "Segment may be corrupted or partially deleted",
+			)
+			segmentMissing = true
+		}
+		if segmentMissing {
 			missingSegments = append(missingSegments, segID)
 			continue
 		}
@@ -214,10 +232,13 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 		if err != nil {
 			// Check if segment file is missing (self-healing)
 			// Use errors.Is to handle wrapped errors properly
-			if errors.Is(err, os.ErrNotExist) {
+			// Also check error message as fallback for edge cases with wrapped errors
+			isMissingError := errors.Is(err, os.ErrNotExist) ||
+				strings.Contains(err.Error(), "no such file or directory")
+			if isMissingError {
 				c.logger.Warn("segment missing from disk, will remove from manifest",
 					"segment_id", segID,
-					"path", filepath.Join(segmentsDir, fmt.Sprintf("%016d", segID)),
+					"path", segDir,
 					"error", err,
 				)
 				missingSegments = append(missingSegments, segID)

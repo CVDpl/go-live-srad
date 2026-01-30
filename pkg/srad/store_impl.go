@@ -3214,11 +3214,15 @@ func (s *storeImpl) loadSegments() error {
 		for _, seg := range active {
 			segmentID := seg.ID
 			// Load segment metadata
-			metadataPath := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segmentID), "segment.json")
+			segDir := filepath.Join(segmentsDir, fmt.Sprintf("%016d", segmentID))
+			metadataPath := filepath.Join(segDir, "segment.json")
 			metadata, err := segment.LoadFromFile(metadataPath)
 			if err != nil {
 				// Self-healing: if segment is missing, remove from manifest
-				if errors.Is(err, os.ErrNotExist) {
+				// Use errors.Is and fallback string check for wrapped errors
+				isMissingError := errors.Is(err, os.ErrNotExist) ||
+					strings.Contains(err.Error(), "no such file or directory")
+				if isMissingError {
 					s.logger.Warn("segment missing during initial load, will remove from manifest",
 						"segment_id", segmentID,
 						"path", metadataPath,
@@ -3230,10 +3234,24 @@ func (s *storeImpl) loadSegments() error {
 				s.logger.Warn("failed to load segment metadata", "id", segmentID, "error", err)
 				continue
 			}
+
+			// Also verify index.louds exists to detect partially deleted segments
+			loudsPath := filepath.Join(segDir, "index.louds")
+			if _, err := os.Stat(loudsPath); os.IsNotExist(err) {
+				s.logger.Warn("index.louds missing during initial load (partial segment), will remove from manifest",
+					"segment_id", segmentID,
+					"path", loudsPath,
+				)
+				missingSegmentIDs = append(missingSegmentIDs, segmentID)
+				continue
+			}
 			reader, err := segment.NewReaderWithCache(segmentID, segmentsDir, s.logger, s.opts.VerifyChecksumsOnLoad, s.mmapCache)
 			if err != nil {
 				// Self-healing: if segment is missing, remove from manifest
-				if errors.Is(err, os.ErrNotExist) {
+				// Use errors.Is and fallback string check for wrapped errors
+				isMissingError := errors.Is(err, os.ErrNotExist) ||
+					strings.Contains(err.Error(), "no such file or directory")
+				if isMissingError {
 					s.logger.Warn("segment missing during initial load, will remove from manifest",
 						"segment_id", segmentID,
 						"error", err,
