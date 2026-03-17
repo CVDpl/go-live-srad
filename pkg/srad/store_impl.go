@@ -374,8 +374,22 @@ func (s *storeImpl) Close() error {
 			entryCount := mt.Count() + mt.DeletedCount()
 			s.logger.Info("flushing memtable during close", "entries", entryCount)
 
-			// Use timeout to prevent hanging on close
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			var ctx context.Context
+			var cancel context.CancelFunc
+			switch {
+			case s.opts.CloseFlushTimeout < 0:
+				ctx, cancel = context.Background(), func() {}
+			case s.opts.CloseFlushTimeout > 0:
+				ctx, cancel = context.WithTimeout(context.Background(), s.opts.CloseFlushTimeout)
+			default:
+				// Adaptive: base 2 min + 1 min per million entries, minimum 3 min
+				adaptive := 2*time.Minute + time.Duration(entryCount/1_000_000)*time.Minute
+				if adaptive < 3*time.Minute {
+					adaptive = 3 * time.Minute
+				}
+				s.logger.Info("close flush: using adaptive timeout", "timeout", adaptive, "entries", entryCount)
+				ctx, cancel = context.WithTimeout(context.Background(), adaptive)
+			}
 			defer cancel()
 
 			if err := s.Flush(ctx); err != nil {

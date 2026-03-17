@@ -203,6 +203,13 @@ type Options struct {
 	// Set to 0 to disable time-based eviction (only evict when cache is full).
 	// Default: 5 minutes.
 	MmapCacheIdleTimeout time.Duration
+
+	// CloseFlushTimeout sets the maximum time allowed for flushing the memtable during Close().
+	// If 0 (default), an adaptive timeout is calculated based on entry count:
+	//   base 2 minutes + 1 minute per million entries (minimum 3 minutes).
+	// Set to a positive duration to override with a fixed timeout.
+	// Set to -1 for no timeout (flush will block until complete or context is cancelled).
+	CloseFlushTimeout time.Duration
 }
 
 // QueryOptions configures query execution.
