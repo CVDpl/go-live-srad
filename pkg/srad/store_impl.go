@@ -2347,7 +2347,10 @@ func (s *storeImpl) AdvanceRCU(ctx context.Context) error {
 	s.logger.Info("RCU epoch advanced", "epoch", newEpoch)
 
 	// Opportunistically trigger one cleanup pass to remove obsolete dirs.
-	// Track via bgWg so Close() waits for it.
+	// Re-check closed right before Add to prevent bgWg.Add after bgWg.Wait in Close().
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return common.ErrClosed
+	}
 	s.bgWg.Add(1)
 	go func() {
 		defer s.bgWg.Done()
@@ -2813,7 +2816,7 @@ func (s *storeImpl) compactionTask() {
 				}
 
 				// Stale plan is benign — another compaction completed between Plan and Execute.
-				if strings.Contains(err.Error(), "stale compaction plan") {
+				if errors.Is(err, compaction.ErrStalePlan) {
 					s.logger.Info("compaction plan was stale, will re-plan on next tick", "error", err)
 					continue
 				}
@@ -3768,6 +3771,8 @@ func (s *storeImpl) PauseBackgroundCompaction(ctx context.Context) error {
 		s.logger.Info("background compaction paused")
 		return nil
 	case <-ctx.Done():
+		// Roll back the counter so the caller doesn't have to call Resume.
+		atomic.AddInt32(&s.compactionPauseCount, -1)
 		return ctx.Err()
 	}
 }

@@ -231,11 +231,22 @@ func (m *Manifest) save() error {
 	tmp := currentPath + ".tmp"
 	content := []byte(filename + "\n")
 	if f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
-		if _, wErr := f.Write(content); wErr == nil {
-			_ = f.Sync()
+		_, wErr := f.Write(content)
+		if wErr != nil {
+			f.Close()
+			os.Remove(tmp)
+			return fmt.Errorf("write CURRENT tmp: %w", wErr)
 		}
-		_ = f.Close()
-		_ = os.Rename(tmp, currentPath)
+		if sErr := f.Sync(); sErr != nil {
+			f.Close()
+			os.Remove(tmp)
+			return fmt.Errorf("sync CURRENT tmp: %w", sErr)
+		}
+		f.Close()
+		if rErr := os.Rename(tmp, currentPath); rErr != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("rename CURRENT: %w", rErr)
+		}
 		_ = utils.SyncDir(m.dir)
 	}
 

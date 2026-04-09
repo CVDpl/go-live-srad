@@ -18,6 +18,10 @@ import (
 	"github.com/CVDpl/go-live-srad/pkg/srad/segment"
 )
 
+// ErrStalePlan indicates the compaction plan references segments that are
+// no longer active in the manifest (e.g. compacted away by another goroutine).
+var ErrStalePlan = errors.New("stale compaction plan")
+
 // Compactor manages LSM compaction.
 type Compactor struct {
 	mu       sync.Mutex
@@ -197,7 +201,7 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 	}
 	for _, inp := range plan.Inputs {
 		if _, ok := activeSet[inp.ID]; !ok {
-			return nil, fmt.Errorf("stale compaction plan: input segment %d no longer active in manifest", inp.ID)
+			return nil, fmt.Errorf("%w: input segment %d no longer active in manifest", ErrStalePlan, inp.ID)
 		}
 	}
 
@@ -336,12 +340,18 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 
 // mergeSegments performs the k-way merge of multiple segment readers.
 func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, plan *CompactionPlan, startTime time.Time, mmapCache *segment.MmapCache, configureFn func(*segment.Builder)) ([]*segment.Reader, error) {
-	// newest first, so newest wins
+	// newest first, so newest wins; nil metadata sorts to the end
 	sort.Slice(readers, func(i, j int) bool {
 		mi := readers[i].GetMetadata()
 		mj := readers[j].GetMetadata()
-		if mi == nil || mj == nil {
+		if mi == nil && mj == nil {
 			return false
+		}
+		if mi == nil {
+			return false // nil sorts after non-nil
+		}
+		if mj == nil {
+			return true // non-nil sorts before nil
 		}
 		return mi.CreatedAtUnix > mj.CreatedAtUnix
 	})
@@ -714,13 +724,9 @@ func findOverlaps(inputs []manifest.SegmentInfo, candidates []manifest.SegmentIn
 
 	// Get min/max key range for the input set
 	var minKey, maxKey []byte
-	inputsWithRange := 0
 	for _, s := range inputs {
 		minB, _ := hex.DecodeString(s.MinKeyHex)
 		maxB, _ := hex.DecodeString(s.MaxKeyHex)
-		if len(minB) > 0 && len(maxB) > 0 {
-			inputsWithRange++
-		}
 		if len(minB) > 0 && (minKey == nil || bytes.Compare(minB, minKey) < 0) {
 			minKey = minB
 		}
@@ -730,17 +736,9 @@ func findOverlaps(inputs []manifest.SegmentInfo, candidates []manifest.SegmentIn
 	}
 
 	if minKey == nil || maxKey == nil {
-		// Cannot determine key range: conservatively include only candidates
-		// that also lack range info instead of pulling in ALL candidates.
-		var noRange []manifest.SegmentInfo
-		for _, cand := range candidates {
-			candMin, _ := hex.DecodeString(cand.MinKeyHex)
-			candMax, _ := hex.DecodeString(cand.MaxKeyHex)
-			if len(candMin) == 0 || len(candMax) == 0 {
-				noRange = append(noRange, cand)
-			}
-		}
-		return noRange
+		// Cannot determine key range for inputs — conservatively include all
+		// candidates to prevent duplicate keys across levels.
+		return candidates
 	}
 
 	var overlaps []manifest.SegmentInfo
