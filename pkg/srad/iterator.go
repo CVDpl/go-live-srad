@@ -128,9 +128,9 @@ func (it *simpleIterator) Op() uint8 {
 
 // Close releases resources associated with the iterator.
 func (it *simpleIterator) Close() error {
-	// COW: Release snapshot to decrement refcounts
 	if it.memSnap != nil {
 		it.memSnap.Release()
+		it.memSnap = nil
 	}
 	for _, fs := range it.frozenSnapRefs {
 		fs.Release()

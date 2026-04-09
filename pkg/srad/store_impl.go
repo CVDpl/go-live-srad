@@ -662,10 +662,19 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	// Update statistics
 	s.stats.RecordSearch()
 
-	// Snapshot readers and frozenSnaps under short RLock, then release
+	// Snapshot readers and frozenSnaps under RLock.
+	// IncRef frozen snapshots while still under RLock to prevent Flush from
+	// releasing them before we bump the refcount.
 	s.mu.RLock()
 	readersSnap := append([]*segment.Reader(nil), s.readers...)
-	frozenSnapList := append([]*memtable.Snapshot(nil), s.frozenSnaps...)
+	frozenSnapRefs := make([]*memtable.Snapshot, 0, len(s.frozenSnaps))
+	for _, fs := range s.frozenSnaps {
+		if fs == nil {
+			continue
+		}
+		fs.IncRef()
+		frozenSnapRefs = append(frozenSnapRefs, fs)
+	}
 	s.mu.RUnlock()
 
 	// Use a snapshot to avoid racing with concurrent writers
@@ -676,16 +685,9 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		memIter = memSnap.RegexSearch(re)
 	}
 
-	// Build iterators for frozen snapshots.
-	// IncRef each snapshot so Flush's Release doesn't free the tree while we iterate.
-	frozenIters := make([]*memtable.Iterator, 0, len(frozenSnapList))
-	frozenSnapRefs := make([]*memtable.Snapshot, 0, len(frozenSnapList))
-	for _, fs := range frozenSnapList {
-		if fs == nil {
-			continue
-		}
-		fs.IncRef()
-		frozenSnapRefs = append(frozenSnapRefs, fs)
+	// Build iterators for frozen snapshots (IncRef already done above)
+	frozenIters := make([]*memtable.Iterator, 0, len(frozenSnapRefs))
+	for _, fs := range frozenSnapRefs {
 		frozenIters = append(frozenIters, fs.RegexSearch(re))
 	}
 	// Seed seen with memtable tombstones only (do not preload segment tombstones globally)
@@ -768,13 +770,10 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				}
 				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
 			}
-			// COW: Release snapshot immediately - we've copied all data we need
 			memSnap.Release()
+			memSnap = nil
 		}
-		for _, fs := range frozenSnapList {
-			if fs == nil {
-				continue
-			}
+		for _, fs := range frozenSnapRefs {
 			if v := fs.GetValue(exactLiteral); v != nil && !v.IsExpired() {
 				op := common.OpInsert
 				if v.Tombstone() {
@@ -782,6 +781,9 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				}
 				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
 			}
+		}
+		for _, fs := range frozenSnapRefs {
+			fs.Release()
 		}
 		return &listIterator{items: items, idx: 0, mode: q.Mode, limit: q.Limit}, nil
 	}
@@ -835,14 +837,11 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 				}
 				items = append(items, segItem{id: 0, key: append([]byte(nil), exactLiteral...), op: op})
 			}
-			// COW: Release snapshot immediately - we've copied all data we need
 			memSnap.Release()
+			memSnap = nil
 		}
 		// from frozen snapshots
-		for _, fs := range frozenSnapList {
-			if fs == nil {
-				continue
-			}
+		for _, fs := range frozenSnapRefs {
 			v := fs.GetValue(exactLiteral)
 			if v != nil && !v.IsExpired() {
 				op := common.OpInsert
@@ -889,6 +888,9 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			if q.Limit > 0 && len(items) >= q.Limit {
 				break
 			}
+		}
+		for _, fs := range frozenSnapRefs {
+			fs.Release()
 		}
 		return &listIterator{items: items, idx: 0, mode: q.Mode, limit: q.Limit}, nil
 	}
@@ -1352,9 +1354,9 @@ func (it *parallelMergedIterator) Close() error {
 	if it.cancel != nil {
 		it.cancel()
 	}
-	// COW: Release snapshot to decrement refcounts
 	if it.memSnap != nil {
 		it.memSnap.Release()
+		it.memSnap = nil
 	}
 	for _, fs := range it.frozenSnapRefs {
 		fs.Release()

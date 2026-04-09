@@ -754,33 +754,33 @@ func (r *Reader) isExpiredKeyIndex(idx int) bool {
 // Get retrieves a value by key.
 // Note: Currently uses binary search on keys array instead of LOUDS for reliability.
 func (r *Reader) Get(key []byte) ([]byte, bool) {
+	r.keysMu.Lock()
 	if len(r.keys) == 0 {
 		if err := r.loadKeys(); err != nil {
+			r.keysMu.Unlock()
 			r.logger.Warn("failed to load keys for Get", "id", r.segmentID, "error", err)
 			return nil, false
 		}
 	}
-
-	// Load expiries if not yet loaded
 	if len(r.expiries) == 0 && r.expFile != nil {
 		if err := r.loadExpiries(); err != nil {
 			r.logger.Warn("failed to load expiries for Get", "id", r.segmentID, "error", err)
 		}
 	}
+	keys := r.keys
+	expiries := r.expiries
+	r.keysMu.Unlock()
 
-	// Binary search to find key
-	i := sort.Search(len(r.keys), func(i int) bool { return bytes.Compare(r.keys[i], key) >= 0 })
-	if i >= len(r.keys) || !bytes.Equal(r.keys[i], key) {
+	i := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], key) >= 0 })
+	if i >= len(keys) || !bytes.Equal(keys[i], key) {
 		return nil, false
 	}
 
-	// Check expiry
-	if len(r.expiries) == len(r.keys) && r.isExpiredKeyIndex(i) {
+	if len(expiries) == len(keys) && r.isExpiredKeyIndex(i) {
 		return nil, false
 	}
 
-	// Return the key itself as value (self-referential storage)
-	return r.keys[i], true
+	return keys[i], true
 }
 
 // Iterator returns an iterator for the segment.
@@ -1167,9 +1167,9 @@ func (it *SegmentIterator) Next() bool {
 							return true
 						}
 					} else {
-						// Try to lazily load keys to enable expiry checks
-						_ = it.reader.loadKeys()
-						if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
+					// Try to lazily load keys to enable expiry checks
+					it.reader.AllKeys()
+					if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
 							idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], state.key) >= 0 })
 							if idx < len(it.reader.keys) && bytes.Equal(it.reader.keys[idx], state.key) && it.reader.isExpiredKeyIndex(idx) {
 								// skip expired
