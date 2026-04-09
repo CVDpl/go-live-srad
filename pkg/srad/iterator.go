@@ -9,10 +9,11 @@ import (
 
 // simpleIterator is a simple implementation of Iterator for memtable-only queries.
 type simpleIterator struct {
-	memIter       *memtable.Iterator
-	memSnap       *memtable.Snapshot // COW: Need to Release() when done
-	frozenIters   []*memtable.Iterator
-	preloadedKeys [][]byte // For broad scans when memIter is nil
+	memIter        *memtable.Iterator
+	memSnap        *memtable.Snapshot // COW: Need to Release() when done
+	frozenIters    []*memtable.Iterator
+	frozenSnapRefs []*memtable.Snapshot // IncRef'd frozen snapshots; Released on Close
+	preloadedKeys  [][]byte             // For broad scans when memIter is nil
 	preloadedIdx  int
 	mode          QueryMode
 	limit         int
@@ -131,5 +132,9 @@ func (it *simpleIterator) Close() error {
 	if it.memSnap != nil {
 		it.memSnap.Release()
 	}
+	for _, fs := range it.frozenSnapRefs {
+		fs.Release()
+	}
+	it.frozenSnapRefs = nil
 	return nil
 }

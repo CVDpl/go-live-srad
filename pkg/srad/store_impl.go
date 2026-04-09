@@ -495,8 +495,9 @@ func (s *storeImpl) Insert(key []byte) error {
 	s.writeCh <- req
 	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
-		// Rollback
-		mt.Delete(key)
+		// Don't rollback with mt.Delete — that would create a tombstone which
+		// shadows existing data in segments. The un-WAL-backed entry in the
+		// memtable will be lost on restart (correct since user received an error).
 		s.mtGuard.Unlock()
 		return fmt.Errorf("write to WAL: %w", err)
 	}
@@ -566,8 +567,7 @@ func (s *storeImpl) InsertWithTTL(key []byte, ttl time.Duration) error {
 	s.writeCh <- req
 	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
-		// Rollback
-		mt.Delete(key)
+		// Don't rollback with mt.Delete — see Insert() comment.
 		s.mtGuard.Unlock()
 		return fmt.Errorf("write to WAL: %w", err)
 	}
@@ -676,12 +676,16 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		memIter = memSnap.RegexSearch(re)
 	}
 
-	// Build iterators for frozen snapshots
+	// Build iterators for frozen snapshots.
+	// IncRef each snapshot so Flush's Release doesn't free the tree while we iterate.
 	frozenIters := make([]*memtable.Iterator, 0, len(frozenSnapList))
+	frozenSnapRefs := make([]*memtable.Snapshot, 0, len(frozenSnapList))
 	for _, fs := range frozenSnapList {
 		if fs == nil {
 			continue
 		}
+		fs.IncRef()
+		frozenSnapRefs = append(frozenSnapRefs, fs)
 		frozenIters = append(frozenIters, fs.RegexSearch(re))
 	}
 	// Seed seen with memtable tombstones only (do not preload segment tombstones globally)
@@ -807,13 +811,14 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			}
 		}
 		return &simpleIterator{
-			memIter:       memIter,
-			memSnap:       memSnap, // COW: Store snapshot for Release() on Close()
-			frozenIters:   frozenIters,
-			preloadedKeys: preloadedKeys,
-			mode:          q.Mode,
-			limit:         q.Limit,
-			count:         0,
+			memIter:        memIter,
+			memSnap:        memSnap, // COW: Store snapshot for Release() on Close()
+			frozenIters:    frozenIters,
+			frozenSnapRefs: frozenSnapRefs,
+			preloadedKeys:  preloadedKeys,
+			mode:           q.Mode,
+			limit:          q.Limit,
+			count:          0,
 		}, nil
 	}
 
@@ -1033,15 +1038,16 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 
 	// Drain into merged iterator (memtable first)
 	return &parallelMergedIterator{
-		memIter:     memIter,
-		memSnap:     memSnap, // COW: Store snapshot for Release() on Close()
-		frozenIters: frozenIters,
-		in:          out,
-		seen:        seen,
-		seenMu:      seenMu,
-		mode:        q.Mode,
-		limit:       q.Limit,
-		cancel:      cancel,
+		memIter:        memIter,
+		memSnap:        memSnap, // COW: Store snapshot for Release() on Close()
+		frozenIters:    frozenIters,
+		frozenSnapRefs: frozenSnapRefs,
+		in:             out,
+		seen:           seen,
+		seenMu:         seenMu,
+		mode:           q.Mode,
+		limit:          q.Limit,
+		cancel:         cancel,
 	}, nil
 }
 
@@ -1193,9 +1199,10 @@ func fnv32(b []byte) uint32 {
 
 // parallelMergedIterator merges memtable and channel of segment results.
 type parallelMergedIterator struct {
-	memIter     *memtable.Iterator
-	memSnap     *memtable.Snapshot // COW: Need to Release() when done
-	frozenIters []*memtable.Iterator
+	memIter        *memtable.Iterator
+	memSnap        *memtable.Snapshot // COW: Need to Release() when done
+	frozenIters    []*memtable.Iterator
+	frozenSnapRefs []*memtable.Snapshot // IncRef'd frozen snapshots; Released on Close
 	in          chan segBatch // Batched channel
 	batchBuf    []segItem     // Buffer for current batch
 	batchIdx    int           // Current index in batch
@@ -1229,20 +1236,19 @@ func (it *parallelMergedIterator) Next(ctx context.Context) bool {
 			it.seenMu.Unlock()
 			continue
 		}
-		// Prevent unbounded growth of seen map
+		// Prevent unbounded growth of seen map.
+		// Delete entries in-place instead of replacing the map so the producer
+		// goroutine (which captured the same map pointer) stays in sync.
 		const maxSeenSize = 100000
 		if len(it.seen) >= maxSeenSize {
-			// Clear oldest half when limit reached
-			newSeen := make(map[string]struct{}, maxSeenSize/2)
 			count := 0
 			for k := range it.seen {
 				if count >= maxSeenSize/2 {
 					break
 				}
-				newSeen[k] = struct{}{}
+				delete(it.seen, k)
 				count++
 			}
-			it.seen = newSeen
 		}
 		it.seen[ks] = struct{}{}
 		it.seenMu.Unlock()
@@ -1350,6 +1356,10 @@ func (it *parallelMergedIterator) Close() error {
 	if it.memSnap != nil {
 		it.memSnap.Release()
 	}
+	for _, fs := range it.frozenSnapRefs {
+		fs.Release()
+	}
+	it.frozenSnapRefs = nil
 	return nil
 }
 
@@ -1558,6 +1568,12 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 	updatedReaders = append(updatedReaders, newReaders...)
 	s.readers = updatedReaders
 
+	// Rebuild readersMap to match new readers list
+	s.readersMap = make(map[uint64]*segment.Reader, len(updatedReaders))
+	for _, r := range updatedReaders {
+		s.readersMap[r.GetSegmentID()] = r
+	}
+
 	// Refresh stats
 	s.updateStatsFromManifest()
 
@@ -1576,9 +1592,10 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 	if s.manifest == nil {
 		return
 	}
-	// Best-effort background job
+	// Track goroutine so Close() waits for it to finish.
+	s.bgWg.Add(1)
 	go func() {
-		// Check if store is closed before starting work
+		defer s.bgWg.Done()
 		if atomic.LoadInt32(&s.closed) == 1 {
 			return
 		}
@@ -2251,6 +2268,7 @@ func (s *storeImpl) Flush(ctx context.Context) error {
 }
 
 // rollbackSnapshotIntoMemtable reinserts snapshot data back into the active memtable on flush failure.
+// It also removes the snapshot from frozenSnaps and releases it to prevent leaks and duplicate visibility.
 func (s *storeImpl) rollbackSnapshotIntoMemtable(snapshot *memtable.Snapshot) {
 	if snapshot == nil {
 		return
@@ -2266,6 +2284,20 @@ func (s *storeImpl) rollbackSnapshotIntoMemtable(snapshot *memtable.Snapshot) {
 			}
 		}
 	}
+
+	// Remove snapshot from frozenSnaps and release it so queries don't see
+	// stale/duplicate data and the COW nodes can be reclaimed.
+	s.mu.Lock()
+	for i, sn := range s.frozenSnaps {
+		if sn == snapshot {
+			last := len(s.frozenSnaps) - 1
+			s.frozenSnaps[i] = s.frozenSnaps[last]
+			s.frozenSnaps = s.frozenSnaps[:last]
+			break
+		}
+	}
+	s.mu.Unlock()
+	snapshot.Release()
 }
 
 // RCUEnabled returns whether RCU is enabled.
@@ -2279,8 +2311,8 @@ func (s *storeImpl) AdvanceRCU(ctx context.Context) error {
 		return fmt.Errorf("RCU is not enabled")
 	}
 
-	atomic.AddUint64(&s.rcuEpoch, 1)
-	s.logger.Info("RCU epoch advanced", "epoch", s.rcuEpoch)
+	newEpoch := atomic.AddUint64(&s.rcuEpoch, 1)
+	s.logger.Info("RCU epoch advanced", "epoch", newEpoch)
 
 	// Opportunistically trigger one cleanup pass to remove obsolete dirs
 	go s.rcuCleanupOnce()
@@ -2747,7 +2779,12 @@ func (s *storeImpl) compactionTask() {
 
 			// The execution is the long-running part, also without a store-level lock.
 			// It will atomically update the manifest upon completion.
-			_, err := s.compactor.Execute(plan)
+			execReaders, err := s.compactor.Execute(plan)
+			// Close readers returned by Execute — compactionTask reloads all
+			// readers from disk below, so these would otherwise leak.
+			for _, r := range execReaders {
+				r.Close()
+			}
 			if err != nil {
 				if atomic.LoadInt32(&s.closed) == 1 || atomic.LoadInt32(&s.compactionPauseCount) > 0 {
 					// Suppress errors while shutting down or paused
@@ -2875,6 +2912,14 @@ func (s *storeImpl) compactionTask() {
 			// Install new readers and segments atomically
 			s.readers = newReaders
 			s.segments = newSegments
+
+			// Rebuild readersMap to match new readers list so RCU cleanup
+			// sees correct refcounts and doesn't delete active segments.
+			s.readersMap = make(map[uint64]*segment.Reader, len(newReaders))
+			for _, r := range newReaders {
+				s.readersMap[r.GetSegmentID()] = r
+			}
+
 			s.updateStatsFromManifest()
 
 			s.mu.Unlock()

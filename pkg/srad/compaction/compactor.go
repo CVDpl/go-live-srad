@@ -629,7 +629,11 @@ func (c *Compactor) TriggerCompaction() {
 		c.logger.Info("manual compaction: no work to do")
 		return
 	}
-	if _, err := c.Execute(plan); err != nil {
+	readers, err := c.Execute(plan)
+	for _, r := range readers {
+		r.Close()
+	}
+	if err != nil {
 		c.logger.Error("manual compaction failed",
 			"error", err,
 			"reason", plan.Reason,

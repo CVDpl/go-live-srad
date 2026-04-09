@@ -569,6 +569,7 @@ func (m *Memtable) Snapshot() *Snapshot {
 		size:    m.size,
 		count:   m.count,
 		deleted: m.deleted,
+		refcnt:  1,
 	}
 }
 
@@ -646,6 +647,7 @@ type Snapshot struct {
 	count    int64
 	deleted  int64
 	released int32 // atomic flag to prevent double-release
+	refcnt   int32 // number of active users; tree refcounts are decremented when this reaches 0
 }
 
 // RegexSearch performs a regex search on the snapshot.
@@ -939,27 +941,39 @@ func (s *Snapshot) GetAllWithMeta() ([][]byte, []bool, []int64) {
 	return keys, tombs, exps
 }
 
-// Release decrements refcounts for all nodes in the snapshot.
-// This allows the memtable to reclaim memory from nodes that are no longer referenced.
-// It's safe to call Release multiple times (idempotent).
-func (s *Snapshot) Release() {
-	// Use atomic CAS to ensure we only release once
-	if !atomic.CompareAndSwapInt32(&s.released, 0, 1) {
-		return // Already released
-	}
+// IncRef increments the snapshot's user reference count.
+// Callers that borrow a snapshot pointer (e.g. from frozenSnaps) must IncRef
+// before use and Release when done so that the tree node refcounts remain valid.
+func (s *Snapshot) IncRef() {
+	atomic.AddInt32(&s.refcnt, 1)
+}
 
+// Release decrements the user reference count. When it reaches zero, the tree
+// node refcounts are decremented, allowing the memtable to reclaim memory.
+// Safe to call multiple times (idempotent after final release).
+func (s *Snapshot) Release() {
+	if atomic.AddInt32(&s.refcnt, -1) > 0 {
+		return // Other users still active
+	}
+	// Last user — actually release the tree refcounts (exactly once)
+	if !atomic.CompareAndSwapInt32(&s.released, 0, 1) {
+		return
+	}
 	s.decrementRefcountRecursive(s.root)
 }
 
 // decrementRefcountRecursive decrements refcounts for a subtree.
+// Children are traversed BEFORE decrementing the parent's refcount so that
+// ensureWritable() still sees refcount > 0 and clones instead of mutating
+// in-place while we are reading the children slice.
 func (s *Snapshot) decrementRefcountRecursive(node *Node) {
 	if node == nil {
 		return
 	}
-	atomic.AddInt32(&node.refcount, -1)
 	for _, child := range node.children {
 		s.decrementRefcountRecursive(child)
 	}
+	atomic.AddInt32(&node.refcount, -1)
 }
 
 // Size returns the size of the snapshot.
