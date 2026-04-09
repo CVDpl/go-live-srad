@@ -72,6 +72,11 @@ type Reader struct {
 	keysMapFromCache bool
 	// File size for lazy mmap via cache
 	keysFileSize int64
+
+	// Protects keysMap acquire/release and keys loading against concurrent access.
+	// Multiple goroutines may IncRef() the same Reader (e.g. concurrent RegexSearch),
+	// so AllKeys()/loadKeys()/acquireKeysMap()/releaseKeysMap() must be serialized.
+	keysMu sync.Mutex
 }
 
 // IncRef increments the reader's reference count.
@@ -152,6 +157,7 @@ func (r *Reader) internalClose() {
 		r.mmap = nil
 	}
 	// Handle keys.dat mmap cleanup
+	r.keysMu.Lock()
 	if r.keysMap != nil {
 		if r.keysMapFromCache && r.mmapCache != nil {
 			// Release reference to cache - cache will handle munmap
@@ -164,27 +170,24 @@ func (r *Reader) internalClose() {
 		}
 		r.keysMap = nil
 	}
+	r.keysMu.Unlock()
 }
 
 // acquireKeysMap lazily acquires the keys.dat mmap through cache or returns existing.
 // Returns nil if mmap is not available.
+// Caller MUST hold r.keysMu. Each successful call must be balanced by releaseKeysMap.
 func (r *Reader) acquireKeysMap() []byte {
-	// Already have mmap
-	if r.keysMap != nil {
+	if r.keysFile == nil || r.keysFileSize <= 0 {
+		return r.keysMap // nil or direct-mmap (legacy, no cache)
+	}
+
+	// Direct mmap (no cache) — always valid for reader lifetime
+	if r.mmapCache == nil {
 		return r.keysMap
 	}
 
-	// No keys file
-	if r.keysFile == nil || r.keysFileSize <= 0 {
-		return nil
-	}
-
-	// No cache - can't lazy mmap (would have been done in openFiles)
-	if r.mmapCache == nil {
-		return nil
-	}
-
-	// Acquire through cache
+	// Always go through cache.Acquire to get a properly ref-counted reference.
+	// This ensures eviction cannot munmap data while we are using it.
 	keysPath := filepath.Join(r.dir, "keys.dat")
 	data := r.mmapCache.Acquire(r.segmentID, keysPath, r.keysFileSize)
 	if data != nil {
@@ -196,12 +199,33 @@ func (r *Reader) acquireKeysMap() []byte {
 
 // releaseKeysMap releases the keys.dat mmap back to cache if acquired from cache.
 // Call this when done with a batch of operations to allow cache eviction.
+// Caller MUST hold r.keysMu.
 func (r *Reader) releaseKeysMap() {
 	if r.keysMapFromCache && r.mmapCache != nil && r.keysMap != nil {
 		r.mmapCache.Release(r.segmentID)
 		r.keysMap = nil
 		r.keysMapFromCache = false
 	}
+}
+
+// acquireKeysMapIndependent obtains a ref-counted mmap reference from the cache
+// without touching the shared r.keysMap field. Used by iterators that need their
+// own long-lived reference independent of AllKeys()/loadKeys() lifecycle.
+// Returns (data, fromCache). Caller must call cache.Release(segmentID) if fromCache.
+func (r *Reader) acquireKeysMapIndependent() ([]byte, bool) {
+	if r.keysFile == nil || r.keysFileSize <= 0 {
+		return nil, false
+	}
+	if r.mmapCache == nil {
+		// Legacy direct mmap — always valid for reader lifetime, no refcount needed
+		r.keysMu.Lock()
+		d := r.keysMap
+		r.keysMu.Unlock()
+		return d, false
+	}
+	keysPath := filepath.Join(r.dir, "keys.dat")
+	data := r.mmapCache.Acquire(r.segmentID, keysPath, r.keysFileSize)
+	return data, data != nil
 }
 
 // NewReader creates a new segment reader.
@@ -801,13 +825,17 @@ func (r *Reader) GetMetadata() *Metadata { return r.metadata }
 func (r *Reader) GetSegmentID() uint64 { return r.segmentID }
 
 // AllKeys returns the list of keys stored in this segment (from keys.dat).
+// Safe for concurrent use from multiple goroutines that IncRef'd this Reader.
 func (r *Reader) AllKeys() [][]byte {
+	r.keysMu.Lock()
 	if r.keys == nil {
 		if err := r.loadKeys(); err != nil {
 			r.logger.Warn("failed to load keys", "id", r.segmentID, "error", err)
 		}
 	}
-	return r.keys
+	keys := r.keys
+	r.keysMu.Unlock()
+	return keys
 }
 
 // Tombstones returns the list of tombstoned keys recorded in this segment.
@@ -1206,9 +1234,8 @@ func (it *SegmentIterator) Next() bool {
 	// Fallback to keys: prefer streaming over keys.dat to avoid loading all keys into memory
 	if !it.streamInit {
 		it.streamInit = true
-		// Try mmap first (zero-copy) with mandatory 6B header
-		// Use acquireKeysMap for lazy mmap via cache
-		data := it.reader.acquireKeysMap()
+		// Acquire an independent ref-counted mmap reference (not shared with loadKeys)
+		data, fromCache := it.reader.acquireKeysMapIndependent()
 		if len(data) >= 6 && binary.LittleEndian.Uint32(data[0:4]) == common.MagicKeys {
 			off := 6
 			// Read count
@@ -1217,7 +1244,7 @@ func (it *SegmentIterator) Next() bool {
 				it.mmapOff = off + 4
 				it.usingMmap = true
 				it.mmapData = data
-				it.mmapFromCache = it.reader.keysMapFromCache
+				it.mmapFromCache = fromCache
 			}
 		}
 		// If no mmap, create a dedicated buffered reader over keys.dat (mandatory header)
@@ -1267,8 +1294,7 @@ func (it *SegmentIterator) Next() bool {
 			if (it.pattern == nil || it.pattern.Match(k)) && !it.reader.HasTombstone(k) {
 				// Note: k points into mmap; valid until reader is closed
 				if len(it.reader.keys) == 0 {
-					// Attempt to lazy load keys to align expiries
-					_ = it.reader.loadKeys()
+					it.reader.AllKeys()
 				}
 				if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
 					idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], k) >= 0 })
@@ -1302,7 +1328,7 @@ func (it *SegmentIterator) Next() bool {
 			it.keysRead++
 			if (it.pattern == nil || it.pattern.Match(k)) && !it.reader.HasTombstone(k) {
 				if len(it.reader.keys) == 0 {
-					_ = it.reader.loadKeys()
+					it.reader.AllKeys()
 				}
 				if len(it.reader.keys) > 0 && len(it.reader.expiries) == len(it.reader.keys) {
 					idx := sort.Search(len(it.reader.keys), func(i int) bool { return bytes.Compare(it.reader.keys[i], k) >= 0 })
