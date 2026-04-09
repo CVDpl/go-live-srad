@@ -825,33 +825,31 @@ func (it *SnapshotIterator) Next() bool {
 
 		// If this node has a value and we haven't yielded it yet
 		if state.childIndex == 0 && state.node.value != nil && !state.node.value.IsExpired() {
-			// Yield this node's value
 			it.current = snapshotIterState{
 				node:   state.node,
 				prefix: currentKey,
 			}
 
-			// Push first child if any, and mark that we've processed it
 			if len(state.node.children) > 0 {
-				// Update parent to skip first child and move to second child next time
-				it.stack[idx].childIndex = 2
-				// Push first child onto stack
+				// children[0] is pushed now; set childIndex=3 so next iteration
+				// computes childIdx = 3-2 = 1, correctly starting at children[1].
+				it.stack[idx].childIndex = 3
 				it.stack = append(it.stack, snapshotIterState{
 					node:       state.node.children[0],
 					prefix:     currentKey,
 					childIndex: 0,
 				})
 			} else {
-				// No children, mark as done
 				it.stack[idx].childIndex = 1
 			}
 			return true
 		}
 
-		// Move to next child if available
-		// childIndex: 0 = value not processed, 1 = value processed but no children, 2+ = child index (1, 2, 3...)
+		// Move to next child if available.
+		// childIndex encoding: 0 = value not processed, 1 = done (no children),
+		// N >= 2 = next child index is N-2.
 		if state.childIndex > 1 {
-			childIdx := state.childIndex - 2 // child index 0-based: childIndex=2 -> child 0, childIndex=3 -> child 1
+			childIdx := state.childIndex - 2
 			if childIdx < len(state.node.children) {
 				// Update parent to process next child
 				it.stack[idx].childIndex++
@@ -867,10 +865,9 @@ func (it *SnapshotIterator) Next() bool {
 				it.stack = it.stack[:idx]
 			}
 		} else if state.childIndex == 0 {
-			// childIndex == 0 but no value to yield: node is internal-only
-			// Move directly to first child
+			// No value to yield: node is internal-only. Push first child.
 			if len(state.node.children) > 0 {
-				it.stack[idx].childIndex = 2
+				it.stack[idx].childIndex = 3
 				it.stack = append(it.stack, snapshotIterState{
 					node:       state.node.children[0],
 					prefix:     currentKey,
@@ -942,10 +939,19 @@ func (s *Snapshot) GetAllWithMeta() ([][]byte, []bool, []int64) {
 }
 
 // IncRef increments the snapshot's user reference count.
+// Returns false if the snapshot has already been fully released (refcnt <= 0).
 // Callers that borrow a snapshot pointer (e.g. from frozenSnaps) must IncRef
 // before use and Release when done so that the tree node refcounts remain valid.
-func (s *Snapshot) IncRef() {
-	atomic.AddInt32(&s.refcnt, 1)
+func (s *Snapshot) IncRef() bool {
+	for {
+		old := atomic.LoadInt32(&s.refcnt)
+		if old <= 0 {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&s.refcnt, old, old+1) {
+			return true
+		}
+	}
 }
 
 // Release decrements the user reference count. When it reaches zero, the tree

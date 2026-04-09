@@ -43,10 +43,11 @@ type Iterator struct {
 
 // iterState represents the state of iteration at a node.
 type iterState struct {
-	node       *Node
-	prefix     []byte
-	childIndex int
-	nfaState   q.StateSet
+	node         *Node
+	prefix       []byte
+	childIndex   int
+	nfaState     q.StateSet
+	valueYielded bool
 }
 
 // Next advances to the next matching entry.
@@ -65,11 +66,11 @@ func (it *Iterator) Next(ctx context.Context) bool {
 		// Build current key only when needed
 		currentKey := append(state.prefix, state.node.label...)
 
-		// Check if this node has a value that matches
-		if state.childIndex == 0 && state.node.value != nil && !state.node.value.tombstone && !state.node.value.IsExpired() {
+		// Check if this node has a value that matches (only once per node)
+		if !state.valueYielded && state.node.value != nil && !state.node.value.tombstone && !state.node.value.IsExpired() {
+			state.valueYielded = true
 			if it.regex != nil && it.regex.Match(currentKey) {
 				it.current = &iterState{node: state.node, prefix: currentKey}
-				state.childIndex++
 				return true
 			}
 		}

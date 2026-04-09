@@ -77,6 +77,12 @@ type Reader struct {
 	// Multiple goroutines may IncRef() the same Reader (e.g. concurrent RegexSearch),
 	// so AllKeys()/loadKeys()/acquireKeysMap()/releaseKeysMap() must be serialized.
 	keysMu sync.Mutex
+
+	// sync.Once guards for lazy-loaded structures that may be triggered from
+	// concurrent goroutines (e.g. multiple RegexSearch callers on the same Reader).
+	loudsOnce sync.Once
+	tombsOnce sync.Once
+	expOnce   sync.Once
 }
 
 // IncRef increments the reader's reference count.
@@ -435,20 +441,22 @@ func (r *Reader) loadLOUDS() error {
 		}
 	}
 
-	// Load tombstones if present
-	if r.tombFile != nil {
-		if err := r.loadTombstones(); err != nil {
-			// non-fatal
-			r.logger.Warn("failed to load tombstones", "id", r.segmentID, "error", err)
+	// Tombstones and expiries are loaded via sync.Once to avoid races
+	// when multiple goroutines concurrently call RegexIterator.
+	r.tombsOnce.Do(func() {
+		if r.tombFile != nil {
+			if err := r.loadTombstones(); err != nil {
+				r.logger.Warn("failed to load tombstones", "id", r.segmentID, "error", err)
+			}
 		}
-	}
-
-	// Load expiries if present
-	if r.expFile != nil {
-		if err := r.loadExpiries(); err != nil {
-			r.logger.Warn("failed to load expiries", "id", r.segmentID, "error", err)
+	})
+	r.expOnce.Do(func() {
+		if r.expFile != nil {
+			if err := r.loadExpiries(); err != nil {
+				r.logger.Warn("failed to load expiries", "id", r.segmentID, "error", err)
+			}
 		}
-	}
+	})
 
 	return nil
 }
@@ -754,17 +762,13 @@ func (r *Reader) isExpiredKeyIndex(idx int) bool {
 // Get retrieves a value by key.
 // Note: Currently uses binary search on keys array instead of LOUDS for reliability.
 func (r *Reader) Get(key []byte) ([]byte, bool) {
+	r.ensureExpiries()
 	r.keysMu.Lock()
 	if len(r.keys) == 0 {
 		if err := r.loadKeys(); err != nil {
 			r.keysMu.Unlock()
 			r.logger.Warn("failed to load keys for Get", "id", r.segmentID, "error", err)
 			return nil, false
-		}
-	}
-	if len(r.expiries) == 0 && r.expFile != nil {
-		if err := r.loadExpiries(); err != nil {
-			r.logger.Warn("failed to load expiries for Get", "id", r.segmentID, "error", err)
 		}
 	}
 	keys := r.keys
@@ -793,23 +797,38 @@ func (r *Reader) Iterator() *SegmentIterator {
 
 // RegexIterator returns an iterator for regex matching.
 func (r *Reader) RegexIterator(pattern *regexp.Regexp) *SegmentIterator {
-	// Load LOUDS for efficient iteration
-	if r.louds == nil {
-		_ = r.loadLOUDS()
-	}
-	// Ensure tombstones are loaded before iteration to suppress deleted keys
-	if r.tombstoneSet == nil && r.tombFile != nil {
-		_ = r.loadTombstones()
-	}
-	// Ensure expiries are loaded
-	if len(r.expiries) == 0 && r.expFile != nil {
-		_ = r.loadExpiries()
-	}
+	r.ensureLOUDS()
+	r.ensureTombstones()
+	r.ensureExpiries()
 	return &SegmentIterator{
 		reader:  r,
 		pattern: pattern,
-		stack:   []iteratorState{{node: 1, key: nil}}, // Start at root
+		stack:   []iteratorState{{node: 1, key: nil}},
 	}
+}
+
+func (r *Reader) ensureLOUDS() {
+	r.loudsOnce.Do(func() {
+		if r.loudsFile != nil {
+			_ = r.loadLOUDS()
+		}
+	})
+}
+
+func (r *Reader) ensureTombstones() {
+	r.tombsOnce.Do(func() {
+		if r.tombFile != nil {
+			_ = r.loadTombstones()
+		}
+	})
+}
+
+func (r *Reader) ensureExpiries() {
+	r.expOnce.Do(func() {
+		if r.expFile != nil {
+			_ = r.loadExpiries()
+		}
+	})
 }
 
 // Close closes the segment reader.
@@ -923,10 +942,7 @@ func (r *Reader) StreamKeys() (advance func() ([]byte, bool), closeFn func()) {
 		closeFunc()
 		return func() ([]byte, bool) { return nil, false }, func() {}
 	}
-	// Best-effort load expiries so we can filter during streaming
-	if len(r.expiries) == 0 && r.expFile != nil {
-		_ = r.loadExpiries()
-	}
+	r.ensureExpiries()
 
 	// Batch decode: read large chunks and parse in userspace
 	const chunkSize = 256 * 1024 // 256KB chunks for batching

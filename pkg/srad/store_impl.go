@@ -362,11 +362,20 @@ func (s *storeImpl) Close() error {
 	s.logger.Info("closing store", "dir", s.dir)
 
 	// Block new/in-flight writes from reaching WAL while shutting it down.
-	// Ensures no goroutine can send on writeCh after it is closed by walWriter.
+	// Hold mtGuard only for WAL shutdown to prevent sends on closed channel.
 	s.mtGuard.Lock()
-	// Stop background tasks, including WAL writer (waits for WAL goroutine to exit)
-	s.stopBackgroundTasks()
+	if s.walStop != nil {
+		close(s.walStop)
+	}
+	s.walWg.Wait()
 	s.mtGuard.Unlock()
+
+	// Signal all other background tasks to stop (no lock required for signaling).
+	s.signalBackgroundStop()
+
+	// Wait for background tasks WITHOUT holding mtGuard — flushTask may be
+	// inside Flush() which needs mtGuard, so holding it here would deadlock.
+	s.bgWg.Wait()
 
 	// Flush memtable if not read-only (with timeout to prevent hanging)
 	if !s.readonly {
@@ -420,6 +429,9 @@ func (s *storeImpl) Close() error {
 		s.flushWg.Wait()
 		s.logger.Info("flush completed, proceeding with close")
 	}
+
+	// Close all segment readers after final flush is complete
+	s.closeReaders()
 
 	// Close WAL
 	if s.wal != nil {
@@ -672,7 +684,9 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		if fs == nil {
 			continue
 		}
-		fs.IncRef()
+		if !fs.IncRef() {
+			continue
+		}
 		frozenSnapRefs = append(frozenSnapRefs, fs)
 	}
 	s.mu.RUnlock()
@@ -925,6 +939,13 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	out := make(chan segBatch, 64) // Fewer, larger messages
 	// Create a cancellable context for the background producer
 	pctx, cancel := context.WithCancel(ctx)
+	// Give the producer goroutine its own ref on memSnap so that
+	// iterator.Close() → memSnap.Release() doesn't free the tree
+	// while GetAllWithExpiry is still traversing it.
+	producerOwnsSnap := false
+	if broad && memSnap != nil {
+		producerOwnsSnap = memSnap.IncRef()
+	}
 	go func(readers []*segment.Reader) {
 		defer close(out)
 		defer func() {
@@ -952,8 +973,9 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		}
 
 		// For broad scans, emit all memtable keys first via channel
-		if broad && memSnap != nil {
+		if producerOwnsSnap && memSnap != nil {
 			keys, tombs, _ := memSnap.GetAllWithExpiry()
+			memSnap.Release() // release producer's extra ref
 			emitted := 0
 			for i, k := range keys {
 				select {
@@ -961,7 +983,6 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 					return
 				default:
 				}
-				// Skip tombstones (they're tracked in seen map)
 				if tombs[i] {
 					continue
 				}
@@ -978,7 +999,7 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 					}
 				}
 			}
-			sendBatch() // Flush remaining
+			sendBatch()
 			s.logger.Info("broad scan emitted memtable keys", "count", emitted)
 		}
 
@@ -1594,7 +1615,10 @@ func (s *storeImpl) maybeScheduleAsyncFilters() {
 	if s.manifest == nil {
 		return
 	}
-	// Track goroutine so Close() waits for it to finish.
+	// Check closed BEFORE bgWg.Add to avoid Add-after-Wait race during Close.
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return
+	}
 	s.bgWg.Add(1)
 	go func() {
 		defer s.bgWg.Done()
@@ -2275,15 +2299,19 @@ func (s *storeImpl) rollbackSnapshotIntoMemtable(snapshot *memtable.Snapshot) {
 	if snapshot == nil {
 		return
 	}
-	// Best-effort reinsertion (no WAL writes; WAL already contains original ops)
-	keys, tombs := snapshot.GetAllWithTombstones()
+	// Best-effort reinsertion preserving original expiry timestamps.
+	keys, tombs, exps := snapshot.GetAllWithExpiry()
+	mt := s.memtablePtr.Load()
+	if mt == nil {
+		return
+	}
 	for i := range keys {
-		if mt := s.memtablePtr.Load(); mt != nil {
-			if tombs[i] {
-				_ = mt.Delete(keys[i])
-			} else {
-				_ = mt.InsertWithTTL(keys[i], 0)
-			}
+		if tombs[i] {
+			_ = mt.Delete(keys[i])
+		} else if exps[i] != 0 {
+			_ = mt.InsertWithExpiry(keys[i], time.Unix(0, exps[i]))
+		} else {
+			_ = mt.Insert(keys[i])
 		}
 	}
 
@@ -2309,6 +2337,9 @@ func (s *storeImpl) RCUEnabled() bool {
 
 // AdvanceRCU advances the RCU epoch.
 func (s *storeImpl) AdvanceRCU(ctx context.Context) error {
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return common.ErrClosed
+	}
 	if !s.rcuEnabled {
 		return fmt.Errorf("RCU is not enabled")
 	}
@@ -2316,8 +2347,13 @@ func (s *storeImpl) AdvanceRCU(ctx context.Context) error {
 	newEpoch := atomic.AddUint64(&s.rcuEpoch, 1)
 	s.logger.Info("RCU epoch advanced", "epoch", newEpoch)
 
-	// Opportunistically trigger one cleanup pass to remove obsolete dirs
-	go s.rcuCleanupOnce()
+	// Opportunistically trigger one cleanup pass to remove obsolete dirs.
+	// Track via bgWg so Close() waits for it.
+	s.bgWg.Add(1)
+	go func() {
+		defer s.bgWg.Done()
+		s.rcuCleanupOnce()
+	}()
 
 	return nil
 }
@@ -2485,8 +2521,10 @@ func (s *storeImpl) shouldFlush() bool {
 }
 
 // triggerFlush triggers an asynchronous flush.
-
 func (s *storeImpl) triggerFlush() {
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return
+	}
 	if err := s.Flush(context.Background()); err != nil {
 		s.logger.Error("async flush failed", "error", err)
 	}
@@ -2630,45 +2668,32 @@ func (s *storeImpl) startBackgroundTasks() {
 	}
 }
 
-// stopBackgroundTasks stops all background tasks.
-func (s *storeImpl) stopBackgroundTasks() {
-	// Stop WAL writer first to ensure all pending writes are flushed before closing WAL.
-	if s.walStop != nil {
-		close(s.walStop)
-	}
-	s.walWg.Wait()
-
-	// Stop flush task
+// signalBackgroundStop signals all background tasks (except WAL) to stop.
+// WAL shutdown is handled separately under mtGuard in Close().
+func (s *storeImpl) signalBackgroundStop() {
 	if s.flushStop != nil {
 		close(s.flushStop)
 		if s.flushTicker != nil {
 			s.flushTicker.Stop()
 		}
 	}
-
-	// Stop compaction task
 	if s.compactStop != nil {
 		close(s.compactStop)
 	}
-	// Stop compactor loop
 	if s.compactor != nil {
 		s.compactor.Stop()
 	}
-
-	// Stop autotune task
 	if s.autotuneStop != nil {
 		close(s.autotuneStop)
 	}
-
-	// Stop RCU cleanup task
 	if s.rcuStop != nil {
 		close(s.rcuStop)
 	}
+}
 
-	// Wait for all tasks to complete
-	s.bgWg.Wait()
-
-	// Close open segment readers
+// closeReaders closes all open segment readers. Must be called after all
+// background tasks have stopped and the final flush is complete.
+func (s *storeImpl) closeReaders() {
 	s.mu.Lock()
 	closeFailed := 0
 	for _, r := range s.readers {
@@ -2681,7 +2706,7 @@ func (s *storeImpl) stopBackgroundTasks() {
 		s.logger.Warn("some segment readers failed to close", "failed", closeFailed)
 	}
 	s.readers = nil
-	s.readersMap = make(map[uint64]*segment.Reader) // Clear readersMap
+	s.readersMap = make(map[uint64]*segment.Reader)
 	s.mu.Unlock()
 }
 
