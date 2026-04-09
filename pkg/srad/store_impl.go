@@ -870,8 +870,14 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		sort.Slice(selected, func(i, j int) bool {
 			mi := selected[i].GetMetadata()
 			mj := selected[j].GetMetadata()
-			if mi == nil || mj == nil {
+			if mi == nil && mj == nil {
 				return false
+			}
+			if mi == nil {
+				return false
+			}
+			if mj == nil {
+				return true
 			}
 			if mi.CreatedAtUnix != mj.CreatedAtUnix {
 				return mi.CreatedAtUnix > mj.CreatedAtUnix
@@ -927,8 +933,14 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 	sort.Slice(selected, func(i, j int) bool {
 		mi := selected[i].GetMetadata()
 		mj := selected[j].GetMetadata()
-		if mi == nil || mj == nil {
+		if mi == nil && mj == nil {
 			return false
+		}
+		if mi == nil {
+			return false
+		}
+		if mj == nil {
+			return true
 		}
 		if mi.CreatedAtUnix != mj.CreatedAtUnix {
 			return mi.CreatedAtUnix > mj.CreatedAtUnix
@@ -3237,35 +3249,34 @@ func (s *storeImpl) rcuCleanupTask() {
 				if _, err := fmt.Sscanf(e.Name(), "%d", &segID); err != nil {
 					continue
 				}
-				if _, ok := activeIDs[segID]; ok {
-					continue
-				}
-
-			if s.manifest.IsSegmentLockedForCompaction(segID) {
-				s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
+			if _, ok := activeIDs[segID]; ok {
 				continue
 			}
 
-			// Atomically check refcount and remove from map under the same lock
-			// to prevent TOCTOU race between check and delete.
-			s.mu.Lock()
-			reader, hasReader := s.readersMap[segID]
-			if hasReader && reader != nil {
-				if reader.GetRefcount() > 0 {
-					s.mu.Unlock()
-					s.logger.Debug("rcu skipping segment with active refcount", "id", segID)
+				if s.manifest.IsSegmentLockedForCompaction(segID) {
+					s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
 					continue
 				}
-				delete(s.readersMap, segID)
-			}
-			s.mu.Unlock()
 
-			if s.manifest.IsSegmentLockedForCompaction(segID) {
-				s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
-				continue
-			}
+				// Atomically check refcount and remove from map under the same lock
+				// to prevent TOCTOU race between check and delete.
+				s.mu.Lock()
+				reader, hasReader := s.readersMap[segID]
+				if hasReader && reader != nil {
+					if reader.GetRefcount() > 0 {
+						s.mu.Unlock()
+						s.logger.Debug("rcu skipping segment with active refcount", "id", segID)
+						continue
+					}
+					delete(s.readersMap, segID)
+				}
+				s.mu.Unlock()
 
-			// Check dir mtime as proxy for age
+				if s.manifest.IsSegmentLockedForCompaction(segID) {
+					s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
+					continue
+				}
+
 				if info, err := os.Stat(segPath); err == nil {
 					if info.ModTime().Unix() < cutoff {
 						if err := os.RemoveAll(segPath); err != nil {
