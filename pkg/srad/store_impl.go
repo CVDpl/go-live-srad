@@ -486,34 +486,29 @@ func (s *storeImpl) Insert(key []byte) error {
 		err:   make(chan error, 1),
 	}
 
-	// Use write lock to prevent flush during insert and WAL write
-	s.mtGuard.Lock()
+	// RLock allows concurrent inserts; Flush takes exclusive Lock for memtable swap.
+	// Memtable has its own m.mu.Lock() for thread-safe writes.
+	s.mtGuard.RLock()
 	mt := s.memtablePtr.Load()
 	if mt == nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("memtable not initialized")
 	}
 	err := mt.InsertWithTTL(key, ttl)
 	if err != nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("insert to memtable: %w", err)
 	}
-	// Send to WAL while holding lock
-	// Check if store is still open before sending to avoid panic on closed channel
 	if atomic.LoadInt32(&s.closed) == 1 {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return common.ErrClosed
 	}
 	s.writeCh <- req
-	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
-		// Don't rollback with mt.Delete — that would create a tombstone which
-		// shadows existing data in segments. The un-WAL-backed entry in the
-		// memtable will be lost on restart (correct since user received an error).
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("write to WAL: %w", err)
 	}
-	s.mtGuard.Unlock()
+	s.mtGuard.RUnlock()
 
 	// Update statistics
 	s.stats.RecordInsert()
@@ -558,32 +553,27 @@ func (s *storeImpl) InsertWithTTL(key []byte, ttl time.Duration) error {
 		err:   make(chan error, 1),
 	}
 
-	// Use write lock to prevent flush during insert and WAL write
-	s.mtGuard.Lock()
+	s.mtGuard.RLock()
 	mt := s.memtablePtr.Load()
 	if mt == nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("memtable not initialized")
 	}
 	err := mt.InsertWithTTL(key, ttl)
 	if err != nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("insert to memtable: %w", err)
 	}
-	// Send to WAL while holding lock
-	// Check if store is still open before sending to avoid panic on closed channel
 	if atomic.LoadInt32(&s.closed) == 1 {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return common.ErrClosed
 	}
 	s.writeCh <- req
-	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
-		// Don't rollback with mt.Delete — see Insert() comment.
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("write to WAL: %w", err)
 	}
-	s.mtGuard.Unlock()
+	s.mtGuard.RUnlock()
 
 	// Update statistics
 	s.stats.RecordInsert()
@@ -624,31 +614,27 @@ func (s *storeImpl) Delete(key []byte) error {
 		err:   make(chan error, 1),
 	}
 
-	// Use write lock to prevent flush during delete and WAL write
-	s.mtGuard.Lock()
+	s.mtGuard.RLock()
 	mt := s.memtablePtr.Load()
 	if mt == nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("memtable not initialized")
 	}
 	err := mt.Delete(key)
 	if err != nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("delete from memtable: %w", err)
 	}
-	// Send to WAL while holding lock
-	// Check if store is still open before sending to avoid panic on closed channel
 	if atomic.LoadInt32(&s.closed) == 1 {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return common.ErrClosed
 	}
 	s.writeCh <- req
-	// Wait for confirmation while holding lock
 	if err := <-req.err; err != nil {
-		s.mtGuard.Unlock()
+		s.mtGuard.RUnlock()
 		return fmt.Errorf("write to WAL: %w", err)
 	}
-	s.mtGuard.Unlock()
+	s.mtGuard.RUnlock()
 
 	// Update statistics
 	s.stats.RecordDelete()
@@ -734,10 +720,7 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 		keys, tombs := memSnap.GetAllWithTombstones()
 		for i := range keys {
 			if tombs[i] {
-				seenMu.Lock()
-				// Prevent unbounded growth
 				if len(seen) >= maxSeenSize {
-					// Clear oldest half when limit reached (simple eviction strategy)
 					newSeen := make(map[string]struct{}, maxSeenSize/2)
 					count := 0
 					for k := range seen {
@@ -750,7 +733,6 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 					seen = newSeen
 				}
 				seen[string(keys[i])] = struct{}{}
-				seenMu.Unlock()
 			}
 		}
 	}
@@ -1027,27 +1009,39 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 			}
 			// preload tombstones only when not an exact-match fast path
 			if exactLiteral == nil {
+				var localTombs []string
 				_, _ = r.IterateTombstones(func(tk []byte) bool {
-					seenMu.Lock()
-					seen[string(tk)] = struct{}{}
-					seenMu.Unlock()
+					localTombs = append(localTombs, string(tk))
 					return true
 				})
+				if len(localTombs) > 0 {
+					seenMu.Lock()
+					for _, tk := range localTombs {
+						seen[tk] = struct{}{}
+					}
+					seenMu.Unlock()
+				}
 			}
 			emitted := 0
-			// Use AllKeys() instead of StreamKeys() to avoid batching bugs
-			allKeys := r.AllKeys()
-			for _, k := range allKeys {
+			advK, closeK := r.StreamKeys()
+			cancelled := false
+			for {
+				k, ok := advK()
+				if !ok {
+					break
+				}
 				select {
 				case <-pctx.Done():
-					r.Release()
-					return
+					cancelled = true
+					break
 				default:
+				}
+				if cancelled {
+					break
 				}
 				if re != nil && !re.Match(k) {
 					continue
 				}
-				// Exact fast path: skip send if tombstoned in this reader
 				if exactLiteral != nil {
 					if r.HasTombstoneExact(pctx, exactLiteral) {
 						continue
@@ -1059,13 +1053,17 @@ func (s *storeImpl) RegexSearch(ctx context.Context, re *regexp.Regexp, q *Query
 
 				if len(batch) >= batchSize {
 					if !sendBatch() {
-						r.Release()
-						return
+						cancelled = true
+						break
 					}
 				}
 			}
-			sendBatch() // Flush remaining items for this segment
+			closeK()
+			sendBatch()
 			r.Release()
+			if cancelled {
+				return
+			}
 			s.logger.Info("broad scan emitted segment keys", "segment", r.GetSegmentID(), "count", emitted)
 		}
 		sendBatch() // Final flush

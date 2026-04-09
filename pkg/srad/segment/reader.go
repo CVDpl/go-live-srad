@@ -760,9 +760,24 @@ func (r *Reader) isExpiredKeyIndex(idx int) bool {
 }
 
 // Get retrieves a value by key.
-// Note: Currently uses binary search on keys array instead of LOUDS for reliability.
+// Uses LOUDS trie for O(key_length) lookup when available, falling back to
+// binary search on the keys array when expiry checks are needed.
 func (r *Reader) Get(key []byte) ([]byte, bool) {
 	r.ensureExpiries()
+	r.ensureLOUDS()
+
+	// Fast path: LOUDS trie lookup avoids loading all keys into memory.
+	if r.louds != nil && r.louds.NumNodes() > 0 {
+		_, found := r.louds.Search(key)
+		if !found {
+			return nil, false
+		}
+		if len(r.expiries) == 0 {
+			return append([]byte(nil), key...), true
+		}
+	}
+
+	// Slow path: load keys for expiry index lookup (or when LOUDS unavailable).
 	r.keysMu.Lock()
 	if len(r.keys) == 0 {
 		if err := r.loadKeys(); err != nil {

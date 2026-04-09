@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -466,36 +467,18 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		return nil
 	}
 
-	type srcIter struct {
-		key   []byte
-		ok    bool
-		next  func() ([]byte, bool)
-		order int
-		tomb  bool
-	}
-
-	// Min-heap emulation using sorted slice for small N
-	h := make([]*srcIter, 0, len(readers)*2)
-	less := func(i, j int) bool {
-		cmp := bytes.Compare(h[i].key, h[j].key)
-		if cmp != 0 {
-			return cmp < 0
-		}
-		return h[i].order > h[j].order
-	}
+	h := make(srcHeap, 0, len(readers)*2)
+	heap.Init(&h)
 	push := func(si *srcIter) {
 		if si != nil && si.ok {
-			h = append(h, si)
-			sort.Slice(h, less)
+			heap.Push(&h, si)
 		}
 	}
 	pop := func() *srcIter {
-		if len(h) == 0 {
+		if h.Len() == 0 {
 			return nil
 		}
-		x := h[0]
-		h = h[1:]
-		return x
+		return heap.Pop(&h).(*srcIter)
 	}
 
 	// Track closers to ensure cleanup
@@ -520,14 +503,14 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 		}
 	}
 
-	for len(h) > 0 {
+	for h.Len() > 0 {
 		si := pop()
 		curKey := append([]byte(nil), si.key...)
 		bestOrder := si.order
 		bestTomb := si.tomb
 		group := []*srcIter{si}
 		// Drain all entries with the same key
-		for len(h) > 0 && bytes.Equal(h[0].key, curKey) {
+		for h.Len() > 0 && bytes.Equal(h[0].key, curKey) {
 			gj := pop()
 			group = append(group, gj)
 			if gj.order > bestOrder {
@@ -774,4 +757,35 @@ func calculateTotalSize(segments []manifest.SegmentInfo) int64 {
 		total += seg.Size
 	}
 	return total
+}
+
+type srcIter struct {
+	key   []byte
+	ok    bool
+	next  func() ([]byte, bool)
+	order int
+	tomb  bool
+}
+
+// srcHeap implements container/heap.Interface for k-way merge in compaction.
+// Ordering: smallest key first; ties broken by highest order (newest segment wins).
+type srcHeap []*srcIter
+
+func (sh srcHeap) Len() int { return len(sh) }
+func (sh srcHeap) Less(i, j int) bool {
+	cmp := bytes.Compare(sh[i].key, sh[j].key)
+	if cmp != 0 {
+		return cmp < 0
+	}
+	return sh[i].order > sh[j].order
+}
+func (sh srcHeap) Swap(i, j int) { sh[i], sh[j] = sh[j], sh[i] }
+func (sh *srcHeap) Push(x any)   { *sh = append(*sh, x.(*srcIter)) }
+func (sh *srcHeap) Pop() any {
+	old := *sh
+	n := len(old)
+	x := old[n-1]
+	old[n-1] = nil
+	*sh = old[:n-1]
+	return x
 }
