@@ -226,11 +226,15 @@ func (m *Manifest) save() error {
 
 	m.logger.Debug("saved manifest", "version", m.current.VersionID, "path", path)
 
-	// Update CURRENT pointer atomically (best effort)
+	// Update CURRENT pointer atomically: write+fsync+rename to survive crash.
 	currentPath := filepath.Join(m.dir, "CURRENT")
 	tmp := currentPath + ".tmp"
 	content := []byte(filename + "\n")
-	if err := os.WriteFile(tmp, content, 0644); err == nil {
+	if f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		if _, wErr := f.Write(content); wErr == nil {
+			_ = f.Sync()
+		}
+		_ = f.Close()
 		_ = os.Rename(tmp, currentPath)
 		_ = utils.SyncDir(m.dir)
 	}

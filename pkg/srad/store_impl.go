@@ -1544,22 +1544,21 @@ func (s *storeImpl) CompactNow(ctx context.Context) error {
 		return common.ErrReadOnly
 	}
 
-	s.mu.Lock()
-	if s.compactor == nil {
-		s.mu.Unlock()
+	s.mu.RLock()
+	comp := s.compactor
+	s.mu.RUnlock()
+	if comp == nil {
 		return fmt.Errorf("compactor not initialized")
 	}
 
-	plan := s.compactor.Plan()
+	plan := comp.Plan()
 	if plan == nil {
-		s.mu.Unlock()
 		s.logger.Info("compaction triggered manually, but no work to be done")
 		return nil
 	}
-	s.mu.Unlock()
 
 	// Execute compaction plan
-	newReaders, err := s.compactor.Execute(plan)
+	newReaders, err := comp.Execute(plan)
 	if err != nil {
 		return fmt.Errorf("failed to execute compaction plan: %w", err)
 	}
@@ -2393,30 +2392,25 @@ func (s *storeImpl) rcuCleanupOnce() {
 			continue
 		}
 
-		// CRITICAL FIX: Check if segment is locked for compaction
 		if s.manifest.IsSegmentLockedForCompaction(segID) {
 			s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
 			continue
 		}
 
-		// CRITICAL: Check refcount before deletion to prevent race conditions
-		s.mu.RLock()
+		// Atomically check refcount and remove from map under the same lock
+		// to prevent TOCTOU race between check and delete.
+		s.mu.Lock()
 		reader, hasReader := s.readersMap[segID]
-		s.mu.RUnlock()
-
 		if hasReader && reader != nil {
-			refcount := reader.GetRefcount()
-			if refcount > 0 {
-				s.logger.Debug("rcu skipping segment with active refcount", "id", segID, "refcount", refcount)
+			if reader.GetRefcount() > 0 {
+				s.mu.Unlock()
+				s.logger.Debug("rcu skipping segment with active refcount", "id", segID)
 				continue
 			}
-			// Refcount is 0, safe to delete - remove from map
-			s.mu.Lock()
 			delete(s.readersMap, segID)
-			s.mu.Unlock()
 		}
+		s.mu.Unlock()
 
-		// Double-check compaction lock after refcount check (prevents TOCTOU race)
 		if s.manifest.IsSegmentLockedForCompaction(segID) {
 			s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
 			continue
@@ -2818,8 +2812,14 @@ func (s *storeImpl) compactionTask() {
 					continue
 				}
 
+				// Stale plan is benign — another compaction completed between Plan and Execute.
+				if strings.Contains(err.Error(), "stale compaction plan") {
+					s.logger.Info("compaction plan was stale, will re-plan on next tick", "error", err)
+					continue
+				}
+
 				// Check if this is a "segment not found" error and attempt self-healing
-				if errors.Is(err, os.ErrNotExist) || (err != nil && (strings.Contains(err.Error(), "no such file") || strings.Contains(err.Error(), "not found"))) {
+				if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") || strings.Contains(err.Error(), "not found") {
 					s.logger.Warn("compaction failed due to missing segment - triggering self-healing scan",
 						"error", err,
 						"reason", plan.Reason,
@@ -3238,41 +3238,31 @@ func (s *storeImpl) rcuCleanupTask() {
 					continue
 				}
 
-				// CRITICAL FIX: Check if segment is locked for compaction
-				// If locked, another goroutine is actively using this segment
-				if s.manifest.IsSegmentLockedForCompaction(segID) {
-					s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
-					continue
-				}
+			if s.manifest.IsSegmentLockedForCompaction(segID) {
+				s.logger.Debug("rcu skipping segment locked for compaction", "id", segID)
+				continue
+			}
 
-				// CRITICAL: Check refcount before deletion to prevent race conditions
-				// If a reader exists with refcount > 0, segment is still in use (e.g., during compaction)
-				s.mu.RLock()
-				reader, hasReader := s.readersMap[segID]
-				s.mu.RUnlock()
-
-				if hasReader && reader != nil {
-					// Check refcount atomically
-					refcount := reader.GetRefcount()
-					if refcount > 0 {
-						// Segment is still in use by active queries or operations
-						s.logger.Debug("rcu skipping segment with active refcount", "id", segID, "refcount", refcount)
-						continue
-					}
-					// Refcount is 0, safe to proceed with deletion
-					// Remove from readersMap first
-					s.mu.Lock()
-					delete(s.readersMap, segID)
+			// Atomically check refcount and remove from map under the same lock
+			// to prevent TOCTOU race between check and delete.
+			s.mu.Lock()
+			reader, hasReader := s.readersMap[segID]
+			if hasReader && reader != nil {
+				if reader.GetRefcount() > 0 {
 					s.mu.Unlock()
-				}
-
-				// Double-check compaction lock after refcount check (prevents TOCTOU race)
-				if s.manifest.IsSegmentLockedForCompaction(segID) {
-					s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
+					s.logger.Debug("rcu skipping segment with active refcount", "id", segID)
 					continue
 				}
+				delete(s.readersMap, segID)
+			}
+			s.mu.Unlock()
 
-				// Check dir mtime as proxy for age
+			if s.manifest.IsSegmentLockedForCompaction(segID) {
+				s.logger.Debug("rcu skipping segment locked for compaction (second check)", "id", segID)
+				continue
+			}
+
+			// Check dir mtime as proxy for age
 				if info, err := os.Stat(segPath); err == nil {
 					if info.ModTime().Unix() < cutoff {
 						if err := os.RemoveAll(segPath); err != nil {
@@ -3760,21 +3750,26 @@ func createDirIfNotExists(dir string) error {
 // Execute() call to return or until ctx is done.
 func (s *storeImpl) PauseBackgroundCompaction(ctx context.Context) error {
 	atomic.AddInt32(&s.compactionPauseCount, 1)
-	// Best-effort: wait for compaction loop to observe pause and drain in-flight Execute.
-	// We don't have a dedicated in-flight counter; poll briefly.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		// Heuristic sleep; compaction loop ticks every 10s, but Execute runs synchronously.
-		time.Sleep(50 * time.Millisecond)
-		// Nothing else to check synchronously.
+
+	if s.compactor == nil {
+		s.logger.Info("background compaction paused (no compactor)")
+		return nil
 	}
-	s.logger.Info("background compaction paused")
-	return nil
+
+	// Wait for any in-flight Execute to finish by acquiring its mutex.
+	done := make(chan struct{})
+	go func() {
+		s.compactor.IsExecuteIdle()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.logger.Info("background compaction paused")
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // ResumeBackgroundCompaction resumes background compaction if paused.

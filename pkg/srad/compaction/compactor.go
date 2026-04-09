@@ -42,6 +42,10 @@ type Compactor struct {
 
 	// Optional: shared mmap cache for segment readers
 	mmapCache *segment.MmapCache
+
+	// Held during Execute to allow PauseBackgroundCompaction to wait for
+	// an in-flight compaction to finish.
+	execMu sync.Mutex
 }
 
 // CompactionPlan describes a compaction task.
@@ -175,6 +179,28 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 	if plan == nil {
 		return nil, fmt.Errorf("compaction plan is nil")
 	}
+
+	c.execMu.Lock()
+	defer c.execMu.Unlock()
+
+	// Snapshot mutable configuration under mu to avoid races with setters.
+	c.mu.Lock()
+	mmapCache := c.mmapCache
+	configureFn := c.configureBuilder
+	c.mu.Unlock()
+
+	// Validate the plan against current manifest state to detect stale plans.
+	activeSegs := c.manifest.GetActiveSegments()
+	activeSet := make(map[uint64]struct{}, len(activeSegs))
+	for _, seg := range activeSegs {
+		activeSet[seg.ID] = struct{}{}
+	}
+	for _, inp := range plan.Inputs {
+		if _, ok := activeSet[inp.ID]; !ok {
+			return nil, fmt.Errorf("stale compaction plan: input segment %d no longer active in manifest", inp.ID)
+		}
+	}
+
 	startTime := time.Now()
 	c.logger.Info("starting compaction", "reason", plan.Reason, "level", plan.Level, "inputs", len(plan.Inputs), "overlaps", len(plan.Overlaps))
 
@@ -228,7 +254,7 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 		}
 
 		// false for checksum verification, assuming it's already been checked on load
-		reader, err := segment.NewReaderWithCache(segID, segmentsDir, c.logger, false, c.mmapCache)
+		reader, err := segment.NewReaderWithCache(segID, segmentsDir, c.logger, false, mmapCache)
 		if err != nil {
 			// Check if segment file is missing (self-healing)
 			// Use errors.Is to handle wrapped errors properly
@@ -305,11 +331,11 @@ func (c *Compactor) Execute(plan *CompactionPlan) ([]*segment.Reader, error) {
 
 	// The rest of the logic is a k-way merge, similar to the legacy function.
 	// This part can be refactored into a helper if it gets complex.
-	return c.mergeSegments(readers, inputIDs, plan, startTime)
+	return c.mergeSegments(readers, inputIDs, plan, startTime, mmapCache, configureFn)
 }
 
 // mergeSegments performs the k-way merge of multiple segment readers.
-func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, plan *CompactionPlan, startTime time.Time) ([]*segment.Reader, error) {
+func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, plan *CompactionPlan, startTime time.Time, mmapCache *segment.MmapCache, configureFn func(*segment.Builder)) ([]*segment.Reader, error) {
 	// newest first, so newest wins
 	sort.Slice(readers, func(i, j int) bool {
 		mi := readers[i].GetMetadata()
@@ -334,6 +360,23 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 	var cur chunkState
 	outputs := make([]uint64, 0, 8)
 	segmentsDir := filepath.Join(c.dir, common.DirSegments)
+	mergeOK := false
+
+	// Cleanup partially written output segments on any error path.
+	defer func() {
+		if mergeOK {
+			return
+		}
+		if cur.builder != nil {
+			segDir := filepath.Join(segmentsDir, fmt.Sprintf("%016d", cur.id))
+			_ = os.RemoveAll(segDir)
+			cur.builder = nil
+		}
+		for _, outID := range outputs {
+			segDir := filepath.Join(segmentsDir, fmt.Sprintf("%016d", outID))
+			_ = os.RemoveAll(segDir)
+		}
+	}()
 
 	ensureBuilder := func() {
 		if cur.builder != nil {
@@ -346,8 +389,8 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 			cur.id = c.alloc()
 		}
 		cur.builder = segment.NewBuilder(cur.id, targetLevel, segmentsDir, c.logger)
-		if c.configureBuilder != nil {
-			c.configureBuilder(cur.builder)
+		if configureFn != nil {
+			configureFn(cur.builder)
 		}
 		// Compaction produces keys in strictly sorted order; enable fast-paths.
 		cur.builder.MarkAlreadySorted()
@@ -530,7 +573,7 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 	// This holds file handles open, preventing RCU cleanup from removing segments while we're adding them to manifest
 	newReaders := make([]*segment.Reader, 0, len(outputs))
 	for i, outID := range outputs {
-		reader, err := segment.NewReaderWithCache(outID, segmentsDir, c.logger, true, c.mmapCache) // Verify checksums on new segments
+		reader, err := segment.NewReaderWithCache(outID, segmentsDir, c.logger, true, mmapCache) // Verify checksums on new segments
 		if err != nil {
 			// Clean up already created readers
 			for _, r := range newReaders {
@@ -619,6 +662,7 @@ func (c *Compactor) mergeSegments(readers []*segment.Reader, inputIDs []uint64, 
 
 	c.logger.Info("compaction completed", "reason", plan.Reason, "duration", time.Since(startTime), "outputs", len(outputs))
 
+	mergeOK = true
 	return newReaders, nil
 }
 
@@ -646,7 +690,20 @@ func (c *Compactor) TriggerCompaction() {
 }
 
 // SetBuilderConfigurator sets a callback that configures each new segment.Builder the compactor creates.
-func (c *Compactor) SetBuilderConfigurator(fn func(*segment.Builder)) { c.configureBuilder = fn }
+func (c *Compactor) SetBuilderConfigurator(fn func(*segment.Builder)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.configureBuilder = fn
+}
+
+// IsExecuteIdle returns true after ensuring no in-flight Execute() is running.
+// It acquires execMu to block until any running Execute completes, then releases it.
+func (c *Compactor) IsExecuteIdle() bool {
+	c.execMu.Lock()
+	idle := true
+	c.execMu.Unlock()
+	return idle
+}
 
 // Helper functions
 
@@ -657,9 +714,13 @@ func findOverlaps(inputs []manifest.SegmentInfo, candidates []manifest.SegmentIn
 
 	// Get min/max key range for the input set
 	var minKey, maxKey []byte
+	inputsWithRange := 0
 	for _, s := range inputs {
 		minB, _ := hex.DecodeString(s.MinKeyHex)
 		maxB, _ := hex.DecodeString(s.MaxKeyHex)
+		if len(minB) > 0 && len(maxB) > 0 {
+			inputsWithRange++
+		}
 		if len(minB) > 0 && (minKey == nil || bytes.Compare(minB, minKey) < 0) {
 			minKey = minB
 		}
@@ -669,7 +730,17 @@ func findOverlaps(inputs []manifest.SegmentInfo, candidates []manifest.SegmentIn
 	}
 
 	if minKey == nil || maxKey == nil {
-		return candidates // No range info, assume all overlap
+		// Cannot determine key range: conservatively include only candidates
+		// that also lack range info instead of pulling in ALL candidates.
+		var noRange []manifest.SegmentInfo
+		for _, cand := range candidates {
+			candMin, _ := hex.DecodeString(cand.MinKeyHex)
+			candMax, _ := hex.DecodeString(cand.MaxKeyHex)
+			if len(candMin) == 0 || len(candMax) == 0 {
+				noRange = append(noRange, cand)
+			}
+		}
+		return noRange
 	}
 
 	var overlaps []manifest.SegmentInfo
@@ -677,7 +748,7 @@ func findOverlaps(inputs []manifest.SegmentInfo, candidates []manifest.SegmentIn
 		candMin, _ := hex.DecodeString(cand.MinKeyHex)
 		candMax, _ := hex.DecodeString(cand.MaxKeyHex)
 		if len(candMin) == 0 || len(candMax) == 0 {
-			overlaps = append(overlaps, cand) // No range info, assume overlap
+			overlaps = append(overlaps, cand)
 			continue
 		}
 
